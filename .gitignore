@@ -1,0 +1,57 @@
+# Pastas de referência / softwares de exemplo (não fazem parte do app)
+AstroBox-NG-main/
+gadgetbridge/
+
+# CHECKPOINT e brief de design — documentos de sessão, não de código
+CHECKPOINT.md
+CLAUDE_DESIGN_BRIEF.md
+
+# Xcode
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+xcuserdata/
+DerivedData/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v2
+!default.mode1v2
+*.mode2v2
+!default.mode2v2
+*.perspectivev3
+!default.perspectivev3
+*.xccheckout
+*.xcscmblueprint
+
+# Build output
+build/
+*.o
+*.d
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods (não usado, mas por precaução)
+Pods/
+Podfile.lock
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Xcode Previews
+PreviewContent/
+
+# Arquivos sensíveis (nunca devem sair da máquina)
+*.p12
+*.mobileprovision
+*.provisionprofile
+AuthKey_*.p8

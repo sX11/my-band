@@ -1,32 +1,56 @@
-//
-//  My_BandApp.swift
-//  My Band
-//
-//  Created by Matheus José on 07/06/26.
-//
-
 import SwiftUI
 import SwiftData
 
 @main
 struct My_BandApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
+    // static: garantia de única inicialização por processo.
+    // App structs do SwiftUI podem ser recriadas durante setup de cena,
+    // o que faria um `var` recriar o container (e o store SQLite) a cada vez.
+    static let sharedModelContainer: ModelContainer = {
+        let schema = Schema([
+            BandDevice.self,
+            SleepSession.self,
+            ActivityDay.self,
+        ])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
         do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
+            return try ModelContainer(for: schema, configurations: [config])
         } catch {
-            fatalError("Could not create ModelContainer: \(error)")
+            // Store corrompido (ex: watchdog kill durante gravação).
+            // Em dev: apaga e recria. Em prod isso perderia dados — trocar por migração adequada.
+            let storeURL = config.url
+            try? FileManager.default.removeItem(at: storeURL)
+            try? FileManager.default.removeItem(at: storeURL.deletingPathExtension().appendingPathExtension("store-shm"))
+            try? FileManager.default.removeItem(at: storeURL.deletingPathExtension().appendingPathExtension("store-wal"))
+            do {
+                return try ModelContainer(for: schema, configurations: [config])
+            } catch let secondError {
+                fatalError("Could not create ModelContainer even after store reset: \(secondError)")
+            }
         }
     }()
+
+    @State private var bandManager = BandManager()
+    @State private var bandSyncer  = BandSyncer()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environment(bandManager)
+                .environment(bandSyncer)
+                .onAppear {
+                    bandSyncer.setup(
+                        manager: bandManager,
+                        context: Self.sharedModelContainer.mainContext
+                    )
+                    bandSyncer.loadStoredDevice()
+                    // ── TEMPORÁRIO — remover antes da UI ──────────────────────
+                    try? AuthKeyStore.saveHex("eed4d315c2217fa12e7b11a6caf3f743")
+                    bandManager.startScan()
+                    // ─────────────────────────────────────────────────────────
+                }
         }
-        .modelContainer(sharedModelContainer)
+        .modelContainer(Self.sharedModelContainer)
     }
 }
