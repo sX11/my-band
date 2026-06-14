@@ -19,20 +19,64 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-#### Protocolo BLE — Correção completa para Mi Band 10 V2
+#### Protocolo BLE — Reescrita completa baseada no GadgetBridge (análise direta do código-fonte)
 
-- `MiBandUUID` — UUIDs substituídos pelos corretos do protocolo V2 (GadgetBridge): service `0000FE95`, TX `0000005E`, RX `0000005F`. UUIDs legados FEE0/FEE1 removidos.
-- `BandProtocol` — Reescrito com formato `XiaomiSppPacketV2`: preamble `[0xA5, 0xA5]`, header 8 bytes (type, channel, seqNum, payloadLen LE, flags, CRC-16/ARC), canais COMMAND(1)/DATA(2)/ACTIVITY(5). Comandos de fetch e session config agora corretos.
-- `BandAuthenticator` — Substituído AES-128-ECB pelo protocolo HMAC-SHA256 V2 confirmado (GadgetBridge `XiaomiAuthService`): `CMD_NONCE` (type=1, sub=26) com nonce aleatório de 16 bytes → banda retorna `watchNonce+HMAC` → `HKDF-expand("miwear-auth", 64)` deriva 4 chaves de sessão → `CMD_AUTH` (type=1, sub=27) com confirmação cifrada em AES-CTR.
-- `BandScanner` — Nome de dispositivo atualizado para `"Xiaomi Smart Band 10"` (padrão confirmado no GadgetBridge `MiBand10Coordinator`).
-- `BandManager` — Fluxo de autenticação refatorado para V2: session config → troca de nonce → derivação de chaves → confirmação. Gerenciamento de `seqNum` por canal. Novo estado `sessionConfig` na máquina de estados.
-- `SleepPacketParser` — Entradas reescritas para formato 2 bytes UInt16 BE (bits 15–12 = stage, bits 11–0 = offset_minutes). Adicionado suporte ao header de detalhes (Type 16) com bedtime/waketime/durações por fase.
-- `BandSyncer` — Comando de fetch substituído por `XiaomiSyncCmd` (type=8, sub=2) via `XiaomiProto.command`. `ChunkedReceiver` substituído por `DataChannelReceiver` compatível com payloads V2.
+Todos os arquivos da camada BLE foram reescritos com base na análise completa do repositório GadgetBridge
+(`XiaomiSppPacketV2`, `XiaomiAuthService`, `MiBand10Coordinator`, `XiaomiHealthService`,
+`XiaomiActivityFileFetcher`, `SleepDetailsParser`). A implementação anterior era baseada no protocolo
+Mi Band 5/6 (AES-128-ECB + UUIDs FEE0/FEE1) e não funcionava com a Mi Band 10.
+
+- **`MiBandUUID`** — UUIDs corrigidos para o protocolo V2 confirmado: `0051` (cmd notify), `0052` (cmd write), `0053` (activity notify). Serviço de Heart Rate GATT padrão removido (não é assim que a Mi Band 10 reporta HR). UUIDs legados `005E`/`005F` eliminados.
+
+- **`BandProtocol` / `XiaomiSppPacket`** — Reescrito para `XiaomiSppPacketV2`:
+  - Header reduzido de 10 para **8 bytes**: `[0xA5][0xA5][type][seqNum][lenLo][lenHi][crcLo][crcHi]`
+  - CRC-16/ARC calculado **apenas sobre o payload** (não sobre o frame inteiro)
+  - Algoritmo CRC exato do GadgetBridge: processamento bit-a-bit com intermediário 32-bit e bit-reversal
+  - Tipos de pacote corrigidos: `ACK=1`, `SESSION_CONFIG=2`, `DATA=3` (eram 0/1/2)
+  - Estrutura interna do DATA packet: `[rawChannel & 0xf][opCode][dados]` — canal estava incorretamente no header externo
+  - Session config: payload binário fixo (não protobuf), tipo `SESSION_CONFIG`, com resposta `OPCODE_START_SESSION_RESPONSE=2` antes de iniciar auth
+
+- **`BandAuthenticator`** — Reescrito para o protocolo HMAC-SHA256 V2:
+  - `CMD_NONCE` (type=1, sub=26): nonce do phone como `Command { auth { phoneNonce { nonce } } }` (proto aninhado)
+  - Parsing da resposta da banda: `Command.auth(3).watchNonce(31).nonce(1)` e `.hmac(2)`
+  - Verificação do HMAC usando `decryptionKey` derivada (não o `secretKey` bruto)
+  - `CMD_AUTH` (type=1, sub=27): `AuthStep3 { encryptedNonces, encryptedDeviceInfo }` — `encryptedNonces` é HMAC-SHA256(encKey, phoneNonce||watchNonce); `encryptedDeviceInfo` é AES-128-CCM(AuthDeviceInfo proto)
+
+- **`XiaomiCrypto`** — Corrigida a derivação PRK:
+  - **Antes (errado):** `HMAC-SHA256(key=secretKey, data=phoneNonce||watchNonce)`
+  - **Depois (correto):** `HMAC-SHA256(key=phoneNonce||watchNonce, data=secretKey)` — key/data invertidos vs RFC 5869
+  - Adicionada implementação de AES-128-CCM manual via AES-ECB (CommonCrypto não expõe CCM): CBC-MAC sobre B₀ + plaintext em blocos de 16, seguido de encrypt-then-tag com blocos contador; tag de 4 bytes, nonce de 12 bytes, sem AAD
+
+- **`XiaomiProto`** — Adicionados builders de comandos de auth com proto aninhado correto:
+  - `phoneNonceCommand`: `Command { auth { phoneNonce(field 30) { nonce(1) } } }`
+  - `authStep3Command`: `Command { auth { authStep3(field 32) { encryptedNonces(1), encryptedDeviceInfo(2) } } }`
+  - `healthCommand`: `Command { type=8, subtype, health(field 10) { activityRequestFileIds(field 7) } }`
+  - Removido `import Foundation` duplicado e extensão `Locale` morta no final do arquivo
+
+- **`BandManager`** — Máquina de estados atualizada para o fluxo V2:
+  - Características corretas: `0051` (notify), `0052` (write), `0053` (activity notify)
+  - Novo estado `sessionConfig`: envia config binária, aguarda `OPCODE_START_SESSION_RESPONSE` antes de iniciar nonce
+  - Roteamento de DATA packets via `rawChannel` + `opCode` do payload interno
+  - Descriptografia AES-CTR com `decryptionKey` para pacotes `opCode=ENCRYPTED`
+  - Callbacks adicionados: `onProtoCommandReceived` (respostas proto pós-auth em 0051) e `onActivityChunkReceived` (chunks de atividade em 0053)
+  - `handleProtoCommand`: respostas não-auth encaminhadas via `onProtoCommandReceived`
+
+- **`BandSyncer`** — Fluxo de sincronização de atividade reescrito:
+  - Receptor de chunks (`ActivityFileReceiver`): formato `[totalChunks:2LE][currentChunk:2LE][data...]`, CRC-32 nos últimos 4 bytes do arquivo remontado
+  - Fluxo correto: `subtype=1` (fetchToday) → IDs de arquivo em proto no `onProtoCommandReceived` → `subtype=3` (fetchRequest, por arquivo) → chunks em `onActivityChunkReceived` → `subtype=5` (fetchAck)
+  - `fetchFileIds` corrigido para usar `onProtoCommandReceived` (IDs chegam como proto Command em 0051, não como chunks de atividade em 0053)
+  - `XiaomiActivityFileId`: helper que identifica arquivos de sono por flags (`subtype==0x03||0x08`)
+
+- **`SleepDetailsParser`** (era `SleepPacketParser`) — Reescrito para o formato real de arquivo de atividade:
+  - Lê `bedTime`/`wakeupTime` do header fixo (offsets 10/14, UInt32 LE)
+  - Varre o arquivo buscando magic `0xFFFC FAFB`, parseia header de 17 bytes dos stage packets
+  - Tipo `0x11`: entradas UInt16 BE onde `bits[15:12]=stage`, `bits[11:0]=offset_minutes`
+  - Tipo `0x10`: resumo com durações (deep/light/rem/wake) em minutos, usado como fallback
 
 ### Added
 
-- `BLE/Crypto/XiaomiCrypto.swift` — Primitivas criptográficas: HMAC-SHA256 (CommonCrypto), HKDF-expand (RFC 5869 §2.3), AES-CTR manual via blocos AES-ECB (IV=key, peculiaridade V2), derivação de `SessionKeys`.
-- `BLE/Protocol/XiaomiProto.swift` — Encoder/decoder protobuf mínimo in-house (zero dependências SPM): varint, tags, fields uint32/bytes, builder de `Command{type, subtype, payload}`, leitor de campo bytes para parsing de respostas da banda.
+- `BLE/Crypto/XiaomiCrypto.swift` — Primitivas criptográficas sem dependências externas (CommonCrypto apenas): HMAC-SHA256, HKDF-expand (RFC 5869 §2.3), AES-ECB (bloco único), AES-CTR manual com IV=key (peculiaridade V2 — "I wish I was kidding"), AES-128-CCM manual com CBC-MAC + encrypt-then-tag, derivação de `SessionKeys`.
+- `BLE/Protocol/XiaomiProto.swift` — Encoder/decoder protobuf mínimo in-house: varint encode/decode, campos uint32/string/bytes/message, builders para comandos de auth e health, leitor de campos para parsing de respostas da banda.
 
 ---
 
