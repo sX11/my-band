@@ -3,21 +3,25 @@ import CommonCrypto
 
 // MARK: - BandAuthenticator
 //
-// Mi Band 10 BLE V2 authentication protocol (HMAC-SHA256).
-// Confirmed via GadgetBridge XiaomiAuthService.java.
+// Mi Band 10 BLE V2 authentication protocol (confirmed via GadgetBridge XiaomiAuthService.java).
 //
 // Flow:
-//   1. Phone generates 16-byte random nonce (phoneNonce)
-//   2. Phone sends CMD_NONCE (type=1, sub=26) with phoneNonce wrapped in XiaomiSppPacket
-//   3. Band responds with watchNonce(16) + hmac(32) — hmac = HMAC-SHA256(watchNonce+phoneNonce, secretKey)
-//   4. Phone verifies band's HMAC
-//   5. Phone derives session keys: HKDF-expand(HMAC-SHA256(phoneNonce+watchNonce, secretKey), "miwear-auth", 64)
-//   6. Phone sends CMD_AUTH (type=1, sub=27) with AES-CTR encrypted confirmation
-//   7. Band confirms success
+//  1. Phone generates 16-byte nonce
+//  2. Send CMD_NONCE (type=1, sub=26) with Command { auth { phoneNonce { nonce } } }
+//  3. Band responds: Command { auth { watchNonce { nonce(16), hmac(32) } } }
+//       hmac = HMAC-SHA256(key=decryptionKey, data=watchNonce||phoneNonce)
+//  4. Compute session keys:
+//       prk = HMAC-SHA256(key=phoneNonce||watchNonce, message=secretKey)
+//       [dec_key(16) | enc_key(16) | dec_nonce(4) | enc_nonce(4)] = HKDF-expand(prk, "miwear-auth", 64)
+//  5. Verify band HMAC using decryptionKey
+//  6. Send CMD_AUTH (type=1, sub=27): Command { auth { authStep3 { encryptedNonces, encryptedDeviceInfo } } }
+//       encryptedNonces     = HMAC-SHA256(key=encryptionKey, data=phoneNonce||watchNonce)
+//       encryptedDeviceInfo = AES-128-CCM(key=encryptionKey, nonce=[encryptionNonce(4)||zeros(4)||0(4)], AuthDeviceInfo)
+//  7. Band responds: Command { type=1, sub=27 } — auth success, switch to encrypted comms
 
 enum BandAuthenticator {
 
-    // MARK: - Step 1: Build phone nonce packet
+    // MARK: - Step 1: Random phone nonce
 
     static func phoneNonce() -> Data {
         var nonce = Data(count: 16)
@@ -25,109 +29,115 @@ enum BandAuthenticator {
         return nonce
     }
 
+    // MARK: - Step 2: Build CMD_NONCE packet
+    //
+    // Sends as plaintext DATA packet on the PROTOBUF channel (Authentication mode).
+
     static func noncePacket(phoneNonce: Data, seqNum: UInt8) -> Data {
-        let payload = XiaomiProto.command(
-            type: XiaomiAuthCmd.cmdType,
-            subtype: XiaomiAuthCmd.nonce,
-            payload: phoneNonce
-        )
-        return XiaomiSppPacket.build(type: .command, channel: .command, seqNum: seqNum, payload: payload)
+        let protoBytes = XiaomiProto.phoneNonceCommand(nonce: phoneNonce)
+        return XiaomiSppPacket.buildAuthCommand(protoBytes: protoBytes, seqNum: seqNum)
     }
 
-    // MARK: - Step 3: Parse band nonce response
+    // MARK: - Step 3: Parse band WatchNonce response
+    //
+    // The response is a DATA packet (PLAINTEXT, channel=PROTOBUF) containing a proto Command:
+    //   Command { type=1, subtype=26, auth { watchNonce { nonce(16), hmac(32) } } }
 
-    struct BandNonceResponse {
-        let watchNonce: Data   // bytes 0–15
-        let bandHMAC:   Data   // bytes 16–47
+    struct WatchNonceResponse {
+        let watchNonce: Data   // 16 bytes
+        let bandHMAC:   Data   // 32 bytes
     }
 
-    /// Parses the payload of the band's CMD_NONCE response.
-    /// Expected: 48 bytes raw (16 nonce + 32 HMAC) or proto-wrapped in field 3.
-    static func parseBandNonce(payload: Data) -> BandNonceResponse? {
-        // Try raw format first (GadgetBridge sends watchNonce+hmac as raw bytes in payload)
-        if payload.count >= 48 {
-            return BandNonceResponse(
-                watchNonce: payload[0..<16],
-                bandHMAC:   payload[16..<48]
-            )
-        }
-        // Try proto-wrapped (field 3 = bytes)
-        if let inner = XiaomiProto.bytesField(3, from: payload), inner.count >= 48 {
-            return BandNonceResponse(
-                watchNonce: inner[0..<16],
-                bandHMAC:   inner[16..<48]
-            )
-        }
-        return nil
+    static func parseWatchNonce(from protoBytes: Data) -> WatchNonceResponse? {
+        // Decode Command.auth (field 3) → Auth bytes
+        guard let authBytes = XiaomiProto.bytesField(3, from: protoBytes) else { return nil }
+        // Decode Auth.watchNonce (field 31) → WatchNonce bytes
+        guard let wnBytes = XiaomiProto.bytesField(31, from: authBytes) else { return nil }
+        // Decode WatchNonce.nonce (field 1) and WatchNonce.hmac (field 2)
+        guard let nonce = XiaomiProto.bytesField(1, from: wnBytes),
+              let hmac  = XiaomiProto.bytesField(2, from: wnBytes),
+              nonce.count == 16, hmac.count == 32 else { return nil }
+        return WatchNonceResponse(watchNonce: nonce, bandHMAC: hmac)
     }
 
-    // MARK: - Step 4: Verify band HMAC
-
-    /// Returns true if the band's HMAC matches HMAC-SHA256(watchNonce+phoneNonce, secretKey).
-    static func verifyBandHMAC(
-        bandHMAC: Data,
-        phoneNonce: Data,
-        watchNonce: Data,
-        secretKey: Data
-    ) -> Bool {
-        let expected = XiaomiCrypto.hmacSHA256(message: watchNonce + phoneNonce, key: secretKey)
-        return expected == bandHMAC
-    }
-
-    // MARK: - Step 5: Derive session keys
+    // MARK: - Step 4: Derive session keys (from phone nonce, watch nonce, secret key)
 
     static func deriveKeys(
         phoneNonce: Data,
         watchNonce: Data,
-        secretKey: Data
+        secretKey:  Data
     ) -> XiaomiCrypto.SessionKeys {
         XiaomiCrypto.deriveSessionKeys(
             phoneNonce: phoneNonce,
             watchNonce: watchNonce,
-            secretKey: secretKey
+            secretKey:  secretKey
         )
     }
 
-    // MARK: - Step 6: Build CMD_AUTH confirmation packet
+    // MARK: - Step 5: Verify band HMAC
+    //
+    // expected = HMAC-SHA256(key=decryptionKey, data=watchNonce||phoneNonce)
+    // Note: GadgetBridge verifies against decryptionKey (derived key), NOT the raw secretKey.
 
-    /// Encrypts the phone's HMAC of (phoneNonce+watchNonce) with the encryptionKey
-    /// and wraps it in a CMD_AUTH XiaomiSppPacket.
+    static func verifyBandHMAC(
+        bandHMAC:       Data,
+        phoneNonce:     Data,
+        watchNonce:     Data,
+        sessionKeys:    XiaomiCrypto.SessionKeys
+    ) -> Bool {
+        let expected = XiaomiCrypto.hmacSHA256(
+            message: watchNonce + phoneNonce,
+            key:     sessionKeys.decryptionKey
+        )
+        return expected == bandHMAC
+    }
+
+    // MARK: - Step 6: Build CMD_AUTH packet
+    //
+    // Sends as plaintext DATA packet (auth not yet established at this point).
+    //   encryptedNonces    = HMAC-SHA256(key=encryptionKey, data=phoneNonce||watchNonce)
+    //   encryptedDeviceInfo = AES-CCM(key=encKey, nonce=[encNonce(4)||0(4)||0(4)], AuthDeviceInfo)
+
     static func authPacket(
-        phoneNonce: Data,
-        watchNonce: Data,
+        phoneNonce:  Data,
+        watchNonce:  Data,
         sessionKeys: XiaomiCrypto.SessionKeys,
-        seqNum: UInt8
+        seqNum:      UInt8
     ) throws -> Data {
-        // The confirmation payload: HMAC-SHA256(phoneNonce+watchNonce, encryptionKey)
-        // Encrypt it with AES-CTR (V2 mode) before sending.
-        let confirmationMsg = XiaomiCrypto.hmacSHA256(
+        // encryptedNonces: HMAC-SHA256(encryptionKey, phoneNonce||watchNonce) — NOT encrypted despite name
+        let encryptedNonces = XiaomiCrypto.hmacSHA256(
             message: phoneNonce + watchNonce,
-            key: sessionKeys.encryptionKey
+            key:     sessionKeys.encryptionKey
         )
-        let encrypted = try XiaomiCrypto.aesCTR(data: confirmationMsg, key: sessionKeys.encryptionKey)
 
-        let payload = XiaomiProto.command(
-            type: XiaomiAuthCmd.cmdType,
-            subtype: XiaomiAuthCmd.auth,
-            payload: encrypted
+        // encryptedDeviceInfo: AES-CCM with nonce=[encryptionNonce(4) || zeros(4) || counter=0(4 LE)]
+        let ccmNonce: Data = {
+            var n = Data()
+            n.append(sessionKeys.encryptionNonce)   // 4 bytes
+            n.append(contentsOf: [UInt8](repeating: 0, count: 4))  // zeros
+            n.append(contentsOf: [UInt8](repeating: 0, count: 4))  // counter = 0, LE
+            return n
+        }()
+        let deviceInfoProto    = XiaomiProto.authDeviceInfo()
+        let encryptedDeviceInfo = try XiaomiCrypto.aesCCMEncrypt(
+            key:       sessionKeys.encryptionKey,
+            nonce:     ccmNonce,
+            plaintext: deviceInfoProto
         )
-        return XiaomiSppPacket.build(type: .command, channel: .command, seqNum: seqNum, payload: payload)
+
+        let protoBytes = XiaomiProto.authStep3Command(
+            encryptedNonces:     encryptedNonces,
+            encryptedDeviceInfo: encryptedDeviceInfo
+        )
+        return XiaomiSppPacket.buildAuthCommand(protoBytes: protoBytes, seqNum: seqNum)
     }
-}
-
-// MARK: - Auth handler result
-
-enum AuthHandlerResult {
-    case sendPacket(Data)
-    case authenticated(sessionKeys: XiaomiCrypto.SessionKeys)
-    case failed(Error)
-    case ignored
 }
 
 // MARK: - Auth errors
 
 enum AuthError: LocalizedError {
     case noAuthKey
+    case noCharacteristics
     case unexpectedPayload(Int)
     case badHMAC
     case timeout
@@ -135,11 +145,12 @@ enum AuthError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .noAuthKey:             return "AuthKey não encontrado no Keychain."
-        case .unexpectedPayload(let n): return "Resposta da pulseira com tamanho inesperado: \(n) bytes."
-        case .badHMAC:               return "HMAC da pulseira inválido — AuthKey incorreto ou adulteração."
-        case .timeout:               return "Tempo esgotado durante a autenticação."
-        case .wrongAuthKey:          return "AuthKey incorreto. Verifique a chave da pulseira."
+        case .noAuthKey:                  return "AuthKey não encontrado no Keychain."
+        case .noCharacteristics:          return "Características BLE não descobertas ainda."
+        case .unexpectedPayload(let n):   return "Resposta da pulseira inesperada: \(n) bytes."
+        case .badHMAC:                    return "HMAC da pulseira inválido — AuthKey incorreto."
+        case .timeout:                    return "Tempo esgotado durante autenticação."
+        case .wrongAuthKey:               return "AuthKey incorreto. Verifique a chave."
         }
     }
 }

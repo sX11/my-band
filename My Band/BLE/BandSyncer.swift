@@ -10,60 +10,113 @@ enum SyncError: LocalizedError {
     case timeout
     case emptyPayload
     case unexpectedResponse
+    case crcMismatch
 
     var errorDescription: String? {
         switch self {
-        case .notConnected:       return "Pulseira não conectada. Conecte antes de sincronizar."
+        case .notConnected:       return "Pulseira não conectada."
         case .noDeviceRecord:     return "Dispositivo não registrado. Autentique primeiro."
-        case .timeout:            return "Tempo esgotado durante a sincronização."
+        case .timeout:            return "Tempo esgotado durante sincronização."
         case .emptyPayload:       return "Nenhum dado recebido da pulseira."
-        case .unexpectedResponse: return "Resposta inesperada da pulseira durante sync."
+        case .unexpectedResponse: return "Resposta inesperada da pulseira."
+        case .crcMismatch:        return "CRC-32 inválido no arquivo de atividade."
         }
     }
 }
 
-// MARK: - Data channel receiver
+// MARK: - Activity file receiver
 //
-// Accumulates XiaomiSppPacketV2 data/activity channel payloads.
-// The band sends multiple packets; completion is detected when no new data
-// arrives for 2 seconds (GadgetBridge uses an idle-timeout approach).
-// ⚠️ Verify completion signalling on real hardware — some firmware may send
-//    an explicit empty frame or a COMMAND-channel ACK to mark the end.
+// Reassembles chunked activity data sent by the band on characteristic 0053.
+// Each chunk: [totalChunks: UInt16 LE][currentChunk: UInt16 LE][data...]
+// The complete file has a CRC-32 in its last 4 bytes.
 
-private final class DataChannelReceiver {
+private final class ActivityFileReceiver {
 
     private var buffer = Data()
+    private(set) var expectedTotal: Int = 0
+    private(set) var receivedCount: Int = 0
 
-    func append(_ payload: Data) {
-        buffer.append(payload)
+    var isComplete: Bool { expectedTotal > 0 && receivedCount == expectedTotal }
+
+    func addChunk(_ payload: Data) {
+        guard payload.count >= 4 else { return }
+        let total   = Int(payload[0]) | (Int(payload[1]) << 8)
+        let current = Int(payload[2]) | (Int(payload[3]) << 8)
+
+        if current == 1 {
+            buffer = Data()
+            expectedTotal = total
+            receivedCount = 0
+        }
+
+        buffer.append(payload.dropFirst(4))
+        receivedCount += 1
     }
 
     func assembled() -> Data { buffer }
 
-    func reset() { buffer = Data() }
+    func reset() {
+        buffer = Data()
+        expectedTotal = 0
+        receivedCount = 0
+    }
+
+    // CRC-32 validation (last 4 bytes of assembled file)
+    func validateCRC() -> Bool {
+        let data = buffer
+        guard data.count >= 4 else { return false }
+        let body      = data.dropLast(4)
+        let storedCRC = UInt32(data[data.count - 4]) |
+                       (UInt32(data[data.count - 3]) << 8) |
+                       (UInt32(data[data.count - 2]) << 16) |
+                       (UInt32(data[data.count - 1]) << 24)
+        return crc32(body) == storedCRC
+    }
+
+    private func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xFFFF_FFFF
+        let table = Self.crc32Table
+        for byte in data {
+            let index = Int((crc ^ UInt32(byte)) & 0xFF)
+            crc = table[index] ^ (crc >> 8)
+        }
+        return crc ^ 0xFFFF_FFFF
+    }
+
+    private static let crc32Table: [UInt32] = {
+        (0..<256).map { i -> UInt32 in
+            var crc = UInt32(i)
+            for _ in 0..<8 {
+                crc = (crc & 1) != 0 ? 0xEDB88320 ^ (crc >> 1) : crc >> 1
+            }
+            return crc
+        }
+    }()
 }
 
 // MARK: - BandSyncer
+//
+// Health data synchronisation with Mi Band 10.
+//
+// Fetch flow (from GadgetBridge XiaomiHealthService):
+//   1. Send health cmd type=8 subtype=1 (CMD_ACTIVITY_FETCH_TODAY)
+//   2. Band responds: Command { health { activityRequestFileIds: <7-byte IDs concatenated> } }
+//   3. For each 7-byte file ID, send health cmd type=8 subtype=3 (CMD_ACTIVITY_FETCH_REQUEST)
+//   4. Band streams chunks to activity characteristic (0053)
+//   5. Reassemble, CRC-32 validate, parse sleep/HR/steps
+//   6. Send ACK: health cmd type=8 subtype=5 (CMD_ACTIVITY_FETCH_ACK) with file ID
 
-/// Orchestrates Mi Band 10 data synchronisation: sends requests via BandManager,
-/// accumulates XiaomiSppPacketV2 data-channel payloads, parses binary results,
-/// and persists to SwiftData.
 @Observable
 @MainActor
 final class BandSyncer {
-
-    // MARK: - State
 
     private(set) var isSyncing = false
     private(set) var lastSyncDate: Date?
     private(set) var lastError: Error?
     private(set) var currentDevice: BandDevice?
 
-    // MARK: - Dependencies
-
     private weak var bandManager: BandManager?
     private var modelContext: ModelContext?
-
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Sync")
 
     // MARK: - Setup
@@ -93,7 +146,7 @@ final class BandSyncer {
             currentDevice = device
         }
         try? context.save()
-        log.info("Device persisted: \(name) (\(peripheralIdentifier))")
+        log.info("Device persisted: \(name)")
     }
 
     func loadStoredDevice() {
@@ -106,7 +159,6 @@ final class BandSyncer {
 
     // MARK: - Sleep sync
 
-    /// Requests sleep history from the band, parses and stores new sessions.
     @discardableResult
     func syncSleep() async throws -> [SleepSession] {
         guard let manager = bandManager, manager.connectionState.isConnected else {
@@ -118,56 +170,37 @@ final class BandSyncer {
         lastError = nil
         defer { isSyncing = false }
 
-        log.info("Starting sleep sync (XiaomiSyncCmd type=8, sub=2)")
+        log.info("Starting sleep sync (type=8 subtype=1 → today's file IDs)")
 
-        let (stream, continuation) = AsyncStream<Data>.makeStream()
-        manager.onRawChunkReceived = { data in continuation.yield(data) }
-        defer {
-            manager.onRawChunkReceived = nil
-            continuation.finish()
-        }
+        // 1. Request today's activity file IDs
+        let fileIds = try await fetchFileIds(manager: manager)
+        guard !fileIds.isEmpty else { throw SyncError.emptyPayload }
+        log.info("Received \(fileIds.count) file ID(s)")
 
-        // Send protobuf-encoded fetch-sleep command on the command channel
-        manager.sendCommand(type: XiaomiSyncCmd.cmdType, subtype: XiaomiSyncCmd.fetchSleep)
-
-        // Accumulate data-channel payloads with a 30-second overall timeout
-        // and a 2-second idle timeout to detect stream completion
-        let payload = try await withThrowingTaskGroup(of: Data.self) { group in
-            group.addTask {
-                let receiver = DataChannelReceiver()
-                var idleDeadline = Date().addingTimeInterval(2)
-
-                for await frame in stream {
-                    receiver.append(frame)
-                    idleDeadline = Date().addingTimeInterval(2)
-                }
-                // Stream finished (continuation.finish() called on disconnect/timeout)
-                return receiver.assembled()
-            }
-            group.addTask {
-                // Hard 30-second timeout
-                try await Task.sleep(for: .seconds(30))
-                throw SyncError.timeout
-            }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
-        }
-
-        guard !payload.isEmpty else { throw SyncError.emptyPayload }
-        log.info("Sleep payload received: \(payload.count) bytes")
-
-        let sessions = SleepPacketParser.parse(payload)
-        log.info("Parsed \(sessions.count) sleep session(s)")
-
+        // 2. Fetch and parse each sleep file
         var inserted: [SleepSession] = []
-        for session in sessions {
-            let hash = session.rawDataHash
-            let dup = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.rawDataHash == hash })
-            guard (try? context.fetch(dup))?.isEmpty ?? true else { continue }
-            session.device = currentDevice
-            context.insert(session)
-            inserted.append(session)
+        for fileId in fileIds where XiaomiActivityFileId.isSleepFile(fileId) {
+            log.debug("Fetching sleep file: \(fileId.hexString)")
+
+            do {
+                let fileData = try await fetchActivityFile(fileId: fileId, manager: manager)
+                let sessions = SleepDetailsParser.parse(fileData)
+                log.info("Parsed \(sessions.count) session(s) from file")
+
+                for session in sessions {
+                    let hash = session.rawDataHash
+                    let dup  = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.rawDataHash == hash })
+                    guard (try? context.fetch(dup))?.isEmpty ?? true else { continue }
+                    session.device = currentDevice
+                    context.insert(session)
+                    inserted.append(session)
+                }
+
+                // 3. ACK the file
+                sendAck(fileId: fileId, manager: manager)
+            } catch {
+                log.error("Failed to fetch/parse file \(fileId.hexString): \(error)")
+            }
         }
 
         if !inserted.isEmpty {
@@ -179,5 +212,126 @@ final class BandSyncer {
         lastSyncDate = Date()
         log.info("Sync complete — \(inserted.count) new session(s) saved")
         return inserted
+    }
+
+    // MARK: - Private: request file IDs
+
+    private func fetchFileIds(manager: BandManager) async throws -> [Data] {
+        let proto = XiaomiProto.healthCommand(subtype: XiaomiHealthCmd.fetchToday)
+
+        return try await withThrowingTaskGroup(of: [Data].self) { group in
+            let (stream, cont) = AsyncStream<Data>.makeStream()
+
+            // File IDs come back as a proto Command on 0051, not as activity chunks on 0053
+            manager.onProtoCommandReceived = { data in cont.yield(data) }
+            defer {
+                manager.onProtoCommandReceived = nil
+                cont.finish()
+            }
+
+            manager.sendEncryptedCommand(protoBytes: proto)
+
+            group.addTask {
+                // Wait for the response on the command channel (proto Command with fileIds)
+                // The band responds with Command.health.activityRequestFileIds (field 10 → field 7)
+                for await chunk in stream {
+                    if let ids = self.extractFileIds(from: chunk) { return ids }
+                }
+                return []
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(10))
+                throw SyncError.timeout
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result ?? []
+        }
+    }
+
+    private func extractFileIds(from protoBytes: Data) -> [Data]? {
+        // Expect Command { type=8, subtype=1, health { activityRequestFileIds } }
+        guard let type = XiaomiProto.uint32Field(1, from: protoBytes),
+              type == XiaomiHealthCmd.cmdType else { return nil }
+        guard let healthBytes = XiaomiProto.bytesField(10, from: protoBytes) else { return nil }
+        guard let fileIdsRaw  = XiaomiProto.bytesField(7, from: healthBytes),
+              fileIdsRaw.count > 0,
+              fileIdsRaw.count % 7 == 0 else { return nil }
+
+        return stride(from: 0, to: fileIdsRaw.count, by: 7).map {
+            fileIdsRaw[$0 ..< $0 + 7]
+        }
+    }
+
+    // MARK: - Private: fetch individual activity file
+
+    private func fetchActivityFile(fileId: Data, manager: BandManager) async throws -> Data {
+        let proto = XiaomiProto.healthCommand(subtype: XiaomiHealthCmd.fetchRequest, fileIds: fileId)
+
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            let receiver = ActivityFileReceiver()
+            let (stream, cont) = AsyncStream<Data>.makeStream()
+
+            manager.onActivityChunkReceived = { data in cont.yield(data) }
+            defer {
+                manager.onActivityChunkReceived = nil
+                cont.finish()
+            }
+
+            manager.sendEncryptedCommand(protoBytes: proto)
+
+            group.addTask {
+                for await chunk in stream {
+                    receiver.addChunk(chunk)
+                    if receiver.isComplete {
+                        guard receiver.validateCRC() else { throw SyncError.crcMismatch }
+                        return receiver.assembled()
+                    }
+                }
+                throw SyncError.emptyPayload
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(30))
+                throw SyncError.timeout
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
+    // MARK: - Private: ACK file
+
+    private func sendAck(fileId: Data, manager: BandManager) {
+        let proto = XiaomiProto.healthCommand(subtype: XiaomiHealthCmd.fetchAck, fileIds: fileId)
+        manager.sendEncryptedCommand(protoBytes: proto)
+        log.debug("ACK sent for file \(fileId.hexString)")
+    }
+}
+
+// MARK: - XiaomiActivityFileId helpers
+
+enum XiaomiActivityFileId {
+    // 7-byte file ID:
+    //   [0..3] timestamp (UInt32 LE, unix seconds)
+    //   [4]    timezone (Int8, blocks of 15 min)
+    //   [5]    version (UInt8)
+    //   [6]    flags: bit7=type (0=ACTIVITY), bits6:2=subtype, bits1:0=detailType
+
+    static func isSleepFile(_ fileId: Data) -> Bool {
+        guard fileId.count == 7 else { return false }
+        let flags   = fileId[6]
+        let type    = (flags >> 7) & 1       // 0 = ACTIVITY
+        let subtype = (flags >> 2) & 0x1F    // 0x03 = ACTIVITY_SLEEP_STAGES, 0x08 = ACTIVITY_SLEEP
+        return type == 0 && (subtype == 0x03 || subtype == 0x08)
+    }
+
+    static func timestamp(_ fileId: Data) -> Date? {
+        guard fileId.count == 7 else { return nil }
+        let ts = UInt32(fileId[0]) | (UInt32(fileId[1]) << 8) |
+                 (UInt32(fileId[2]) << 16) | (UInt32(fileId[3]) << 24)
+        return Date(timeIntervalSince1970: TimeInterval(ts))
     }
 }

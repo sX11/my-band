@@ -1,184 +1,217 @@
 import Foundation
 
-// MARK: - SleepPacketParser
+// MARK: - SleepDetailsParser
 //
-// Parses the binary sleep payload returned by Mi Band 10 via the XiaomiSppPacketV2 protocol.
+// Parses the binary sleep file returned by Mi Band 10 (confirmed from GadgetBridge
+// SleepDetailsParser.java and XiaomiActivityFileFetcher.java).
 //
-// Format confirmed from GadgetBridge XiaomiSleepService.java:
+// File layout (received from activity characteristic 0053 after CRC-32 validation):
 //
-//   Sleep stage entries (2 bytes each, big-endian UInt16):
-//     bits 15–12 (top nibble): sleep stage
-//       0 = awake
-//       1 = light (core)
-//       2 = deep
-//       3 = REM
-//     bits 11–0: offset in minutes from the session base timestamp
+//   [0..6]   XiaomiActivityFileId (7 bytes)
+//   [7]      padding (expect 0x00)
+//   [8]      header bitmask (bit5=hasHR, bit4=hasSpO2, bit3=hasSnore[v3+])
+//   [9]      isAwake (0=sleeping, 1=awake/not finished)
+//   [10..13] bedTime (UInt32 LE, Unix seconds)
+//   [14..17] wakeupTime (UInt32 LE, Unix seconds)
+//   [18]     sleepQuality (if version >= 4)
+//   ... optional HR/SpO2/snore sections (skipped here)
 //
-//   The payload may include a details header (Type 16) at a known byte offset:
-//     bytes 18–19: total duration (UInt16, minutes)
-//     bytes 20–23: bedtime (UInt32 BE, Unix seconds)
-//     bytes 24–27: waketime (UInt32 BE, Unix seconds)
-//     bytes 31–32: deep duration (UInt16, minutes)
-//     bytes 33–34: light duration (UInt16, minutes)
-//     bytes 35–36: REM duration (UInt16, minutes)
-//     bytes 37–38: awake duration (UInt16, minutes)
+// After the header sections, stage packets appear interleaved, each preceded by:
+//   MAGIC = 0xfffcfafb (UInt32 BE) → bytes [0xFF, 0xFC, 0xFA, 0xFB]
 //
-// ⚠️ Byte layout and stage codes must be verified against a real Mi Band 10 capture.
-//    Use a BLE sniffer or raw-logging mode to obtain a fixture.
-//    Update kStageMap and header offsets below if needed.
+// Stage packet header (17 bytes total):
+//   [0..3]   magic = 0xfffcfafb
+//   [4]      headerLen (= 17)
+//   [5..12]  ts (Int64, seconds)
+//   [13]     parity
+//   [14]     type
+//   [15..16] dataLen (UInt16 BE: (byte15 << 8) | byte16)
+//
+// Known types:
+//   0x10 (16) — Sleep summary:   total/deep/light/rem/wake durations (minutes, UInt16 BE)
+//   0x11 (17) — Sleep stages:    array of UInt16 BE entries
+//                                 bits[15:12] = stage, bits[11:0] = offset_minutes
+//
+// Stage codes (type 17):
+//   0 → awake
+//   1 → light sleep
+//   2 → deep sleep
+//   3 → REM sleep
+//   4 → not sleeping
 
-enum SleepPacketParser {
+enum SleepDetailsParser {
 
-    // MARK: - Calibration constants
-
-    private static let kEntrySize = 2   // 2 bytes per stage entry (UInt16 BE)
-    private static let kSessionGapThreshold: Double = 30   // minutes
-
-    private static let kStageMap: [UInt8: SleepPhaseType] = [
-        0: .awake,
-        1: .light,
-        2: .deep,
-        3: .rem,
-    ]
+    private static let stageMagic: [UInt8] = [0xFF, 0xFC, 0xFA, 0xFB]
+    private static let headerLen = 17
 
     // MARK: - Public API
 
-    /// Parses a raw payload into SleepSession objects.
-    /// Returns an empty array if the payload is malformed or unrecognized — never throws.
+    /// Parses a complete, CRC-validated activity file into SleepSession objects.
     static func parse(_ data: Data) -> [SleepSession] {
-        // Try the details-header format first (has bedtime/waketime embedded)
-        if let sessions = parseDetailsFormat(data), !sessions.isEmpty { return sessions }
-        // Fallback: raw entry-only format
-        return parseRawEntries(data)
-    }
+        guard data.count >= 18 else { return [] }
 
-    // MARK: - Details header format (Type 16)
+        // Extract bedTime and wakeupTime from fixed header offsets
+        let bedTime    = data.readUInt32LE(at: 10)
+        let wakeupTime = data.readUInt32LE(at: 14)
+        guard bedTime > 0, wakeupTime > bedTime else { return [] }
 
-    private static func parseDetailsFormat(_ data: Data) -> [SleepSession]? {
-        guard data.count >= 38 else { return nil }
+        let sessionStart = Date(timeIntervalSince1970: TimeInterval(bedTime))
+        let sessionEnd   = Date(timeIntervalSince1970: TimeInterval(wakeupTime))
 
-        let bedtime  = data.readUInt32BE(at: 20)
-        let waketime = data.readUInt32BE(at: 24)
-        guard bedtime > 0, waketime > bedtime else { return nil }
+        // Scan for stage packets
+        var stages: [SleepPhase] = []
+        var summaryMinutes: (deep: Int, light: Int, rem: Int, wake: Int)?
 
-        let base = Date(timeIntervalSince1970: TimeInterval(bedtime))
-        let end  = Date(timeIntervalSince1970: TimeInterval(waketime))
+        var i = 18  // start after fixed header (conservative; real start depends on header bitmask)
+        while i <= data.count - headerLen {
+            guard let magic = findMagic(in: data, from: i) else { break }
+            i = magic
 
-        // Entries start after the 38-byte header
-        let entriesStart = 38
-        guard data.count > entriesStart else {
-            // No entries — construct a single session from header data only
-            let totalMinutes = Int(data.readUInt16BE(at: 18))
-            let deepMin  = Int(data.readUInt16BE(at: 31))
-            let lightMin = Int(data.readUInt16BE(at: 33))
-            let remMin   = Int(data.readUInt16BE(at: 35))
-            let awakeMin = Int(data.readUInt16BE(at: 37))
-            let phases = buildPhasesFromSummary(
-                base: base, totalMinutes: totalMinutes,
-                deepMin: deepMin, lightMin: lightMin, remMin: remMin, awakeMin: awakeMin
-            )
-            return [makeSession(phases: phases, start: base, end: end)]
+            let type    = data[i + 14]
+            let dataLen = Int(data[i + 15]) << 8 | Int(data[i + 16])
+            let dataStart = i + headerLen
+            let dataEnd   = dataStart + dataLen
+            guard dataEnd <= data.count else { i += headerLen; continue }
+
+            let ts = data.readInt64BE(at: i + 5)  // seconds
+
+            switch type {
+            case 0x11:  // Sleep stages
+                let stagePhases = parseSleepStages(
+                    data.subdata(in: dataStart ..< dataEnd),
+                    baseTimestamp: TimeInterval(ts)
+                )
+                stages.append(contentsOf: stagePhases)
+
+            case 0x10:  // Sleep summary
+                summaryMinutes = parseSleepSummary(data.subdata(in: dataStart ..< dataEnd))
+
+            default:
+                break
+            }
+
+            i = dataEnd
         }
 
-        let entryData = data.subdata(in: entriesStart..<data.count)
-        let phases = decodeEntries(entryData, base: base)
-        guard !phases.isEmpty else { return nil }
-        return [makeSession(phases: phases, start: base, end: end)]
-    }
+        if !stages.isEmpty {
+            return [SleepSession(startDate: sessionStart, endDate: sessionEnd,
+                                 phases: stages, rawDataHash: hashOf(data))]
+        }
 
-    // MARK: - Raw entries format
-
-    private static func parseRawEntries(_ data: Data) -> [SleepSession] {
-        guard data.count >= kEntrySize else { return [] }
-        guard data.count % kEntrySize == 0 else { return [] }
-
-        // First entry's offset anchors the base timestamp.
-        // Without an absolute timestamp we use a relative epoch and note the limitation.
-        // ⚠️ When real capture is available, determine the actual base timestamp source.
-        let base = Date()   // placeholder — replace with actual session timestamp from sync command response
-
-        let phases = decodeEntries(data, base: base)
-        return assembleSessions(from: phases)
-    }
-
-    // MARK: - Entry decoder
-
-    private static func decodeEntries(_ data: Data, base: Date) -> [SleepPhase] {
-        var phases: [SleepPhase] = []
-        let count = data.count / kEntrySize
-
-        for i in 0..<count {
-            let word = data.readUInt16BE(at: i * kEntrySize)
-            let stageRaw   = UInt8(word >> 12)          // bits 15–12
-            let offsetMin  = Int(word & 0x0FFF)         // bits 11–0
-            let stage = kStageMap[stageRaw] ?? .awake
-
-            let start = base.addingTimeInterval(TimeInterval(offsetMin * 60))
-            // Duration: inferred as gap to next entry (or a default for the last entry)
-            let nextOffset: Int
-            if i + 1 < count {
-                let nextWord = data.readUInt16BE(at: (i + 1) * kEntrySize)
-                nextOffset = Int(nextWord & 0x0FFF)
-            } else {
-                nextOffset = offsetMin + 1  // 1-minute stub for last entry
+        // Fallback: build from summary if no stage detail available
+        if let summary = summaryMinutes {
+            let phases = buildPhasesFromSummary(
+                start:    sessionStart,
+                deepMin:  summary.deep,
+                lightMin: summary.light,
+                remMin:   summary.rem,
+                wakeMin:  summary.wake
+            )
+            if !phases.isEmpty {
+                return [SleepSession(startDate: sessionStart, endDate: sessionEnd,
+                                     phases: phases, rawDataHash: hashOf(data))]
             }
-            let durationMin = max(1, nextOffset - offsetMin)
-            let end = start.addingTimeInterval(TimeInterval(durationMin * 60))
+        }
 
-            phases.append(SleepPhase(startDate: start, endDate: end, type: stage))
+        return []
+    }
+
+    // MARK: - Stage packet magic finder
+
+    private static func findMagic(in data: Data, from start: Int) -> Int? {
+        for i in start ... (data.count - stageMagic.count) {
+            if data[i] == 0xFF && data[i+1] == 0xFC && data[i+2] == 0xFA && data[i+3] == 0xFB {
+                return i
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Type 0x11: Sleep stages
+
+    private static func parseSleepStages(_ data: Data, baseTimestamp: TimeInterval) -> [SleepPhase] {
+        guard data.count >= 2 else { return [] }
+        var phases: [SleepPhase] = []
+        let count = data.count / 2
+
+        for idx in 0 ..< count {
+            let word      = data.readUInt16BE(at: idx * 2)
+            let stageRaw  = UInt8(word >> 12)      // bits [15:12]
+            let offsetMin = Int(word & 0x0FFF)     // bits [11:0]
+
+            let stage: SleepPhaseType
+            switch stageRaw {
+            case 0: stage = .awake
+            case 1: stage = .light
+            case 2: stage = .deep
+            case 3: stage = .rem
+            default: continue   // 4=notSleep, others — skip
+            }
+
+            let phaseStart = Date(timeIntervalSince1970: baseTimestamp + TimeInterval(offsetMin * 60))
+            // Duration = gap to next entry (or 1 minute stub for last)
+            let nextOffsetMin: Int
+            if idx + 1 < count {
+                let nextWord = data.readUInt16BE(at: (idx + 1) * 2)
+                nextOffsetMin = Int(nextWord & 0x0FFF)
+            } else {
+                nextOffsetMin = offsetMin + 1
+            }
+            let durationMin = max(1, nextOffsetMin - offsetMin)
+            let phaseEnd = phaseStart.addingTimeInterval(TimeInterval(durationMin * 60))
+
+            phases.append(SleepPhase(startDate: phaseStart, endDate: phaseEnd, type: stage))
         }
         return phases
     }
 
-    // MARK: - Session assembly
+    // MARK: - Type 0x10: Sleep summary
+    //
+    // Data layout (UInt16 BE each unless noted):
+    //   byte[0]:   (sleep_index << 4) | wake_count
+    //   [1..2]:    sleep_duration (minutes)
+    //   [3..4]:    wake_duration
+    //   [5..6]:    light_duration
+    //   [7..8]:    rem_duration
+    //   [9..10]:   deep_duration
 
-    private static func assembleSessions(from phases: [SleepPhase]) -> [SleepSession] {
-        guard !phases.isEmpty else { return [] }
-        var sessions: [SleepSession] = []
-        var current: [SleepPhase] = []
-
-        for phase in phases {
-            if !current.isEmpty, phase.type == .awake {
-                let gap = phase.startDate.timeIntervalSince(current.last!.endDate) / 60
-                if gap >= kSessionGapThreshold {
-                    sessions.append(makeSession(phases: current, start: current.first!.startDate, end: current.last!.endDate))
-                    current = []
-                }
-            }
-            current.append(phase)
-        }
-        if !current.isEmpty {
-            sessions.append(makeSession(phases: current, start: current.first!.startDate, end: current.last!.endDate))
-        }
-        return sessions
+    private static func parseSleepSummary(_ data: Data) -> (deep: Int, light: Int, rem: Int, wake: Int)? {
+        guard data.count >= 11 else { return nil }
+        return (
+            deep:  Int(data.readUInt16BE(at: 9)),
+            light: Int(data.readUInt16BE(at: 5)),
+            rem:   Int(data.readUInt16BE(at: 7)),
+            wake:  Int(data.readUInt16BE(at: 3))
+        )
     }
 
-    private static func makeSession(phases: [SleepPhase], start: Date, end: Date) -> SleepSession {
-        let hash = phases.reduce(into: 0) { $0 ^= $1.startDate.hashValue ^ $1.type.hashValue }
-        return SleepSession(startDate: start, endDate: end, phases: phases, rawDataHash: hash)
-    }
-
-    // MARK: - Phase builder from summary (no individual entries)
+    // MARK: - Fallback: build phases from summary (no detail stages)
 
     private static func buildPhasesFromSummary(
-        base: Date, totalMinutes: Int,
-        deepMin: Int, lightMin: Int, remMin: Int, awakeMin: Int
+        start: Date,
+        deepMin: Int, lightMin: Int, remMin: Int, wakeMin: Int
     ) -> [SleepPhase] {
         var phases: [SleepPhase] = []
-        var cursor = base
+        var cursor = start
 
-        func addPhase(_ type: SleepPhaseType, minutes: Int) {
+        func add(_ type: SleepPhaseType, minutes: Int) {
             guard minutes > 0 else { return }
             let end = cursor.addingTimeInterval(TimeInterval(minutes * 60))
             phases.append(SleepPhase(startDate: cursor, endDate: end, type: type))
             cursor = end
         }
 
-        addPhase(.light, minutes: lightMin)
-        addPhase(.deep,  minutes: deepMin)
-        addPhase(.rem,   minutes: remMin)
-        addPhase(.awake, minutes: awakeMin)
+        add(.light, minutes: lightMin)
+        add(.deep,  minutes: deepMin)
+        add(.rem,   minutes: remMin)
+        add(.awake, minutes: wakeMin)
         return phases
+    }
+
+    // MARK: - Dedup hash
+
+    private static func hashOf(_ data: Data) -> Int {
+        data.prefix(64).reduce(into: 0) { $0 ^= Int($1) }
     }
 }
 
@@ -190,11 +223,20 @@ private extension Data {
         return (UInt16(self[offset]) << 8) | UInt16(self[offset + 1])
     }
 
-    func readUInt32BE(at offset: Int) -> UInt32 {
+    func readUInt32LE(at offset: Int) -> UInt32 {
         guard offset + 3 < count else { return 0 }
-        return (UInt32(self[offset])     << 24)
-             | (UInt32(self[offset + 1]) << 16)
-             | (UInt32(self[offset + 2]) <<  8)
-             |  UInt32(self[offset + 3])
+        return UInt32(self[offset])
+             | (UInt32(self[offset + 1]) << 8)
+             | (UInt32(self[offset + 2]) << 16)
+             | (UInt32(self[offset + 3]) << 24)
+    }
+
+    func readInt64BE(at offset: Int) -> Int64 {
+        guard offset + 7 < count else { return 0 }
+        var result: Int64 = 0
+        for i in 0 ..< 8 {
+            result = (result << 8) | Int64(self[offset + i])
+        }
+        return result
     }
 }
