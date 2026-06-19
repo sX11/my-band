@@ -2,7 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Bundle identity -->
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleExecutable</key>
@@ -19,23 +18,12 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-
-	<!-- Privacy usage descriptions -->
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>O My Band usa Bluetooth para se conectar à Mi Band 10 e sincronizar dados de atividade e sono em segundo plano.</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>O My Band lê dados de saúde para exibir seu histórico de atividades e sono.</string>
+	<string>O My Band consulta amostras já existentes no Apple Health para evitar gravar dados duplicados da sua Mi Band 10.</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>O My Band grava dados de sono, frequência cardíaca, passos e SpO2 no Apple Health com base nas medições da Mi Band.</string>
-
-	<!-- Background modes: must be <array>, not <string>.
-	     INFOPLIST_KEY_UIBackgroundModes generates a string — unusable for CBCentralManager state restoration. -->
-	<key>UIBackgroundModes</key>
-	<array>
-		<string>bluetooth-central</string>
-	</array>
-
-	<!-- Scene lifecycle (required for SwiftUI @main) -->
+	<string>O My Band grava no Apple Health os dados de sono, frequência cardíaca, passos, SpO₂, calorias e distância sincronizados da sua Mi Band 10.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -43,10 +31,12 @@
 		<key>UISceneConfigurations</key>
 		<dict/>
 	</dict>
-
-	<!-- UI -->
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations~ipad</key>

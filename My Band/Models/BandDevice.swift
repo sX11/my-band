@@ -9,7 +9,10 @@ final class BandDevice {
     /// CBPeripheral.identifier.uuidString — used to retrieve a known peripheral after app relaunch
     var peripheralIdentifier: String
     var addedDate: Date
+    /// Last time activity data was fetched from the band over BLE.
     var lastSyncDate: Date?
+    /// Last time data was successfully written to Apple Health.
+    var lastHealthSyncDate: Date?
 
     // MARK: - Relationships
 

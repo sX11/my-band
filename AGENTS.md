@@ -134,7 +134,9 @@ A Mi Band 10 suporta mini apps via protocolo proprietário ainda em processo de 
 - [x] **Persistência base** — `BandDevice`, `SleepSession`, `ActivityDay` SwiftData; `BandSyncer`; `SleepPacketParser` (2-byte entries V2)
 - [x] **Info.plist manual** — corrige crash `NSInternalInconsistencyException` do CBCentralManager (UIBackgroundModes como `<array>`)
 - [x] **Teste em hardware real (2026-06-19)** — auth completa na Mi Band 10: handshake HMAC-SHA256, retry de primeiro pareamento, ACK de transporte, init pós-auth, comunicação cifrada estável. AuthKey validado.
-- [ ] **UI: Setup (AuthKey) + Dashboard + Sleep + Settings** → recriar o handoff do Claude Design em SwiftUI (`UI/`) — **próxima fase, em andamento**
+- [x] **UI: design system + Setup (2026-06-19)** — tokens e componentes (`MBButton`/`MBIconButton`/`MBTextField`/`MBStatusPill`), `SetupView` (intro + AuthKey) e `ConnectingView` ligados ao `BandManager` real; `RootView` roteando os estados
+- [x] **HealthKit + Dashboard (2026-06-19)** — `HealthKitManager` (sono/passos/calorias/distância/HR/SpO₂ com dedup), parsers `DailySummary`/`DailyDetails`, `BandSyncer.syncToHealth()`, bateria no `BandManager` e `DashboardView` (bateria + última sync + botão). **Pendente validação em hardware** (formato dos arquivos de atividade, passos cumulativo vs delta).
+- [ ] **UI: SleepDetail + Settings** → próximas telas do handoff do Claude Design
 - [ ] **Parsers de device info / bateria** → `Proto command type=2` ainda só logados; parsear para alimentar o Dashboard
 - [ ] **HealthKit** → `HealthKitManager` + `HealthSyncService` + deduplicação
 - [ ] **Home Assistant** → `HAClient` + `HATriggers` + configuração em Settings

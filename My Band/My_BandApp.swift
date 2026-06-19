@@ -36,7 +36,7 @@ struct My_BandApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
                 .environment(bandManager)
                 .environment(bandSyncer)
                 .onAppear {
@@ -45,12 +45,7 @@ struct My_BandApp: App {
                         context: Self.sharedModelContainer.mainContext
                     )
                     bandSyncer.loadStoredDevice()
-                    // ── TEMPORÁRIO — remover antes da UI ──────────────────────
-                    // Force-overwrite: seedIfNeeded() skips if any key exists, which
-                    // would leave the old placeholder (eed4d315...) in the Keychain.
-                    try? AuthKeyStore.saveHex("***REMOVED***")
-                    bandManager.startScan()
-                    // ─────────────────────────────────────────────────────────
+                    // O scan/conexão agora é disparado pela UI (RootView/SetupView).
                 }
         }
         .modelContainer(Self.sharedModelContainer)

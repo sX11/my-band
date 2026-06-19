@@ -1,0 +1,105 @@
+import Foundation
+
+// MARK: - DailySummary
+//
+// Daily aggregate metrics for one day. Ported from GadgetBridge DailySummaryParser.java
+// (versions 3 and 5). Timestamps are unix seconds; a 0 timestamp / 0 value means "not
+// measured" and is exposed as nil.
+
+struct DailySummary {
+    let date: Date
+    var steps: Int
+    var caloriesKcal: Int
+    var restingHR: Int?
+    var avgHR: Int?
+    var maxHR: (bpm: Int, at: Date)?
+    var minHR: (bpm: Int, at: Date)?
+    var avgStress: Int?
+    var spo2Max: (pct: Int, at: Date)?
+    var spo2Min: (pct: Int, at: Date)?
+    var spo2Avg: Int?
+}
+
+enum DailySummaryParser {
+
+    /// Parses a CRC-validated daily-summary activity file (fileId stripped of trailing CRC by caller
+    /// is NOT required — we skip the leading 7 id bytes + padding ourselves).
+    static func parse(_ data: Data, meta: XiaomiActivityFileMeta) -> DailySummary? {
+        let headerSize: Int
+        switch meta.version {
+        case 3: headerSize = 3
+        case 5: headerSize = 4
+        default: return nil      // unknown layout — let the caller fall back to details
+        }
+
+        let r = LEReader(data)
+        r.skip(7)                // fileId
+        guard r.u8() == 0 else { return nil }  // padding must be 0
+        r.skip(headerSize)       // header bitmask (unused here)
+
+        guard r.remaining >= 30 else { return nil }
+
+        let steps = Int(r.i32())
+        r.skip(3)                            // unk1..3
+        let hrResting = r.u8()
+        let hrMax     = r.u8()
+        let hrMaxTs   = r.u32()
+        let hrMin     = r.u8()
+        let hrMinTs   = r.u32()
+        let hrAvg     = r.u8()
+        let stressAvg = r.u8()
+        _ = r.u8()                           // stressMax
+        _ = r.u8()                           // stressMin
+        r.skip(3)                            // standing bitmask
+        let calories  = Int(r.i16())
+        r.skip(3)                            // unk7..9
+        let spo2Max   = r.u8()
+        let spo2MaxTs = r.u32()
+        let spo2Min   = r.u8()
+        let spo2MinTs = r.u32()
+        let spo2Avg   = r.u8()
+
+        var s = DailySummary(date: meta.timestamp, steps: max(0, steps),
+                             caloriesKcal: max(0, calories))
+        s.restingHR = hrResting > 0 ? Int(hrResting) : nil
+        s.avgHR     = hrAvg > 0 ? Int(hrAvg) : nil
+        s.avgStress = stressAvg > 0 && stressAvg != 255 ? Int(stressAvg) : nil
+        if hrMax > 0, hrMaxTs > 0 { s.maxHR = (Int(hrMax), Date(timeIntervalSince1970: TimeInterval(hrMaxTs))) }
+        if hrMin > 0, hrMinTs > 0 { s.minHR = (Int(hrMin), Date(timeIntervalSince1970: TimeInterval(hrMinTs))) }
+        if spo2Max > 0, spo2MaxTs > 0 { s.spo2Max = (Int(spo2Max), Date(timeIntervalSince1970: TimeInterval(spo2MaxTs))) }
+        if spo2Min > 0, spo2MinTs > 0 { s.spo2Min = (Int(spo2Min), Date(timeIntervalSince1970: TimeInterval(spo2MinTs))) }
+        s.spo2Avg = spo2Avg > 0 ? Int(spo2Avg) : nil
+        return s
+    }
+}
+
+// MARK: - Little-endian byte cursor
+//
+// A class (reference semantics) so a single cursor can be shared between an outer
+// loop and the bit-group parser in DailyDetailsParser.
+
+final class LEReader {
+    private let data: Data
+    private var pos: Int
+    init(_ data: Data) { self.data = data; self.pos = data.startIndex }
+
+    var remaining: Int { data.endIndex - pos }
+    var offset: Int { pos - data.startIndex }
+    func skip(_ n: Int) { pos += n }
+
+    func u8() -> UInt8 {
+        guard pos < data.endIndex else { return 0 }
+        defer { pos += 1 }
+        return data[pos]
+    }
+    func u16() -> UInt16 {
+        let lo = UInt16(u8()), hi = UInt16(u8())
+        return lo | (hi << 8)
+    }
+    func i16() -> Int16 { Int16(bitPattern: u16()) }
+    func u32() -> UInt32 {
+        let b0 = UInt32(u8()), b1 = UInt32(u8()), b2 = UInt32(u8()), b3 = UInt32(u8())
+        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    }
+    func i32() -> Int32 { Int32(bitPattern: u32()) }
+}

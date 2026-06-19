@@ -11,8 +11,20 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Sincronização com Apple Health** (`Health/HealthKitManager.swift`) — autorização + escrita de sono (`sleepAnalysis`), passos, calorias ativas, distância, frequência cardíaca e SpO₂. Deduplicação via `HKMetadataKeySyncIdentifier`/`SyncVersion` (re-sync substitui em vez de duplicar). Capability HealthKit + `NSHealth{Update,Share}UsageDescription` adicionados.
+- **Parsers de atividade** (`BLE/PacketParser/`) — `DailySummaryParser` (totais do dia: passos, calorias, HR máx/mín/médio, SpO₂ máx/mín, ports do GadgetBridge v3/v5), `DailyDetailsParser` + `XiaomiBitGroupReader` (séries por minuto de HR/SpO₂/distância via parser de grupos de bits) e `XiaomiActivityFileMeta` (parsing do id de 7 bytes: versão/subtipo/detailType).
+- **`BandSyncer.syncToHealth()`** — busca os arquivos de atividade do dia, roteia por tipo (sono/summary/details) → SwiftData + HealthKit, faz ACK de cada arquivo e atualiza `lastHealthSyncDate`.
+- **Bateria** — `BandManager` parseia `System.power.battery` (nível + carregando) das respostas do dispositivo e publica `batteryLevel`/`batteryCharging`.
+- **Dashboard** (`UI/Dashboard/DashboardView.swift`) — status da pulseira, bateria, última sincronização com o Apple Health e botão "Sincronizar com Apple Health". Componentes `MBCard`/`MBMetricTile`. `RootView` passou a abrir o Dashboard no estado conectado.
+- **Design system em SwiftUI** (`UI/DesignSystem/`) — port dos tokens do handoff do Claude Design: `Theme.swift` (paleta midnight, accent Aurora, cores de saúde/sono/status, tipografia iOS, spacing 4-pt, radii contínuos) + componentes `MBButton`, `MBIconButton`, `MBTextField`, `MBStatusPill`.
+- **Fluxo de Setup** (`UI/Setup/`) — `SetupView` (intro + entrada de AuthKey com campo mono/mascarado e validação 32-hex) e `ConnectingView` (handshake animado dirigido pelo `BandManager.connectionState` real, com retry em erro). `RootView` roteia Setup → Connecting → tela conectada (placeholder até o Dashboard). AuthKey é salvo no Keychain pela UI; o scan/conexão deixou de ser disparado no `onAppear` do App.
+- **`ConnectionState` → UI** (`UI/ConnectionStatus+UI.swift`) — rótulos/tom de pill e passos do handshake em pt-BR.
 - **SwiftProtobuf 1.38** adicionado como dependência SPM (`apple/swift-protobuf`). Vinculado ao target "My Band" via `XCRemoteSwiftPackageReference` no `project.pbxproj`.
 - **`xiaomi.pb.swift`** — 129 tipos Swift gerados automaticamente a partir do `xiaomi.proto` do GadgetBridge (protoc 29.3 + protoc-gen-swift 1.38). Cobre toda a hierarquia de mensagens do protocolo Xiaomi: `Xiaomi_Command`, `Xiaomi_Auth`, `Xiaomi_Health`, `Xiaomi_System`, `Xiaomi_Clock`, `Xiaomi_AuthDeviceInfo`, `Xiaomi_WatchNonce`, etc.
+
+### Removed
+
+- **`ContentView.swift` e `Item.swift`** — boilerplate do template Xcode, substituídos por `RootView` e pelos modelos SwiftData reais.
 
 ### Changed
 
@@ -23,6 +35,7 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Reassembly de frames BLE fragmentados (arquivos de atividade grandes)**: `005E` é um *byte stream* — um frame SPP V2 pode exceder o MTU e chegar dividido em várias notificações (ex.: arquivo de daily details de 912 B chegando como 495 + 417). O código tratava 1 notificação = 1 frame, rejeitava as duas metades como "Malformed", nunca dava ACK no `seq`, e a banda retransmitia a cada ~6 s indefinidamente — o daily details nunca era montado (timeout). Adicionado buffer de RX em `BandManager.drainFrames()` que acumula bytes e extrai frames completos pelo `payloadLen` (com resync ao preâmbulo `A5 A5`), espelhando `XiaomiSppProtocolV2.processPacket`. `ActivityFileReceiver` agora completa em `num == total` (semântica do GadgetBridge).
 - **`writeSPP` ignora escritas em peripheral fora do estado `.connected`**: evita `API MISUSE: can only accept commands while in the connected state` quando um ACK é enfileirado logo após o disconnect de retry de auth.
 - **Loop de re-autenticação a cada ~6 s: faltava ACK dos frames DATA**: O SPP V2 é um transporte confiável com janela (TX_WIN/seqNum). Toda frame DATA recebida da pulseira precisa ser confirmada com um `AckPacket` carregando o mesmo `seqNum` (GadgetBridge `XiaomiSppProtocolV2.processPacket` → `sendAck`). O app processava os pacotes mas nunca enviava ACK, então a pulseira assumia perda e retransmitia o handshake inteiro (sub=26/sub=27) indefinidamente — mesmo após auth e envio do init. Adicionado `BandManager.sendAck(seqNum:)`, chamado para cada frame DATA recebida.
 - **Primeiro emparelhamento: HMAC da pulseira falhava e travava em `.error`**: No primeiro pareamento a banda envia `sub=16` e o primeiro watch nonce produz um HMAC que não bate; só uma reconexão limpa gera um handshake verificável. Antes o app ia para `.error` permanente (só recuperava se a própria banda derrubasse o link). Agora `retryAuthAfterReconnect()` derruba e reconecta automaticamente (até `maxAuthRetries=4`) ao detectar HMAC inválido, replicando o caminho que comprovadamente autentica. `didDisconnectPeripheral` honra o flag `retryAuthOnDisconnect` para reconectar mesmo em desconexão "limpa".

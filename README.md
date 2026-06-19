@@ -17,9 +17,11 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 | ✅ | State restoration do CBCentralManager após suspensão pelo sistema |
 | ✅ | Sincronização de dados de sono (parser XiaomiSppPacketV2) |
 | ✅ | Persistência local com SwiftData (BandDevice, SleepSession, ActivityDay) |
-| 🚧 | Interface (Setup + Dashboard + Sleep + Settings) — em construção via Claude Design |
-| 🔜 | Parsers de device info / bateria para o dashboard |
-| 🔜 | Envio de dados ao Apple Health (HealthKit) |
+| ✅ | Reassembly de frames BLE fragmentados (arquivos de atividade > MTU) |
+| ✅ | Leitura de bateria (nível + carregando) |
+| ✅ | UI de Setup (AuthKey + scan/conexão) e Dashboard (bateria, última sync, botão sincronizar) via Claude Design |
+| 🚧 | Envio ao Apple Health (sono, passos, calorias, distância, FC, SpO₂) — implementado, em validação de hardware |
+| 🔜 | Telas SleepDetail (hipnograma) + Settings |
 | 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
 | 🔜 | Integração com Atalhos via App Intents |
 | 🔜 | Extração do AuthKey via Xiaomi Cloud (sem app Xiaomi) |

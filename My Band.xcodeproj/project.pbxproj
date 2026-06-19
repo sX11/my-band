@@ -6,13 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		9371A6672FE501BE00C68E69 /* SwiftProtobuf in Frameworks */ = {isa = PBXBuildFile; productRef = BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		93200F242FD62F9A00E8DC0C /* My Band.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "My Band.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
-
-/* Begin PBXBuildFile section */
-		BB0A1B2C3D4E5F001122AADD /* SwiftProtobuf in Frameworks */ = {isa = PBXBuildFile; productRef = BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */; };
-/* End PBXBuildFile section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		93200F262FD62F9A00E8DC0C /* My Band */ = {
@@ -27,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9371A6672FE501BE00C68E69 /* SwiftProtobuf in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -77,26 +78,6 @@
 		};
 /* End PBXNativeTarget section */
 
-
-/* Begin XCRemoteSwiftPackageReference section */
-		BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/apple/swift-protobuf.git";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 1.28.0;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */;
-			productName = SwiftProtobuf;
-		};
-/* End XCSwiftPackageProductDependency section */
-
 /* Begin PBXProject section */
 		93200F1C2FD62F9A00E8DC0C /* Project object */ = {
 			isa = PBXProject;
@@ -119,11 +100,11 @@
 			);
 			mainGroup = 93200F1B2FD62F9A00E8DC0C;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
-			productRefGroup = 93200F252FD62F9A00E8DC0C /* Products */;
 			packageReferences = (
 				BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */,
 			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 93200F252FD62F9A00E8DC0C /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -279,12 +260,13 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "My Band/My Band.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = Z7KM7R2775;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = "Info.plist";
+				INFOPLIST_FILE = Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -307,12 +289,13 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "My Band/My Band.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = Z7KM7R2775;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = "Info.plist";
+				INFOPLIST_FILE = Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -352,6 +335,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-protobuf.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.28.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */;
+			productName = SwiftProtobuf;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 93200F1C2FD62F9A00E8DC0C /* Project object */;
 }

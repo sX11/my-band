@@ -59,10 +59,18 @@ final class BandManager: NSObject {
     private(set) var connectedPeripheral: CBPeripheral?
     private(set) var lastError: Error?
 
+    /// Latest battery level (0–100) reported by the band, or nil if unknown yet.
+    private(set) var batteryLevel: Int?
+    /// Whether the band reports it is currently charging.
+    private(set) var batteryCharging: Bool = false
+
     // MARK: - BLE objects
 
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
+
+    // Reassembly buffer for the 005E byte stream (frames may span multiple notifications).
+    private var rxBuffer = Data()
 
     // 005F — notify (band → app): ALL SPP V2 frames (commands + activity, differentiated by channel byte)
     private var cmdReadChar:  CBCharacteristic?
@@ -200,12 +208,61 @@ final class BandManager: NSObject {
         return seqNum
     }
 
-    // MARK: - Private: Incoming packet dispatch (from 0051)
+    // MARK: - Private: Incoming byte-stream reassembly (from 005E)
+    //
+    // 005E is a continuous byte stream, NOT one-frame-per-notification. A single SPP V2 frame
+    // can exceed the ATT MTU and arrive split across several notifications (e.g. a 912-byte
+    // activity-file frame as 495 + 417). We accumulate bytes and extract complete frames by
+    // their declared payload length (GadgetBridge XiaomiSppProtocolV2.processPacket).
 
     private func handleCmdReadNotification(_ raw: Data) {
-        log.debug("005E raw (\(raw.count)B): \(raw.map { String(format: "%02x", $0) }.joined(separator: " "))")
+        rxBuffer.append(raw)
+        drainFrames()
+    }
+
+    private func drainFrames() {
+        while true {
+            // Need at least the 8-byte header to know the frame length.
+            guard rxBuffer.count >= XiaomiSppPacket.headerSize else { return }
+
+            // Resync to the 0xA5 0xA5 preamble if we're misaligned.
+            let base = rxBuffer.startIndex
+            if !(rxBuffer[base] == 0xA5 && rxBuffer[base + 1] == 0xA5) {
+                if let next = nextPreambleOffset(in: rxBuffer) {
+                    log.warning("Resyncing RX stream — dropped \(next) byte(s) before preamble")
+                    rxBuffer = Data(rxBuffer.dropFirst(next))
+                    continue
+                }
+                // No preamble found; keep only a trailing byte in case it's a split 0xA5.
+                rxBuffer = Data(rxBuffer.suffix(1))
+                return
+            }
+
+            let payloadLen = Int(rxBuffer[base + 4]) | (Int(rxBuffer[base + 5]) << 8)
+            let frameLen = XiaomiSppPacket.headerSize + payloadLen
+            guard rxBuffer.count >= frameLen else { return }   // wait for the rest of the frame
+
+            let frame = Data(rxBuffer.prefix(frameLen))
+            rxBuffer = Data(rxBuffer.dropFirst(frameLen))
+            handleFrame(frame)
+        }
+    }
+
+    /// Index of the next 0xA5 0xA5 preamble at or after offset 1, or nil if none.
+    private func nextPreambleOffset(in data: Data) -> Int? {
+        guard data.count >= 2 else { return nil }
+        let bytes = Array(data)
+        var i = 1
+        while i < bytes.count - 1 {
+            if bytes[i] == 0xA5 && bytes[i + 1] == 0xA5 { return i }
+            i += 1
+        }
+        return nil
+    }
+
+    private func handleFrame(_ raw: Data) {
         guard let pkt = XiaomiSppPacket.parse(raw) else {
-            log.warning("Malformed SPP frame (\(raw.count) bytes), CRC mismatch or bad preamble — raw: \(raw.map { String(format: "%02x", $0) }.joined(separator: " "))")
+            log.warning("Malformed SPP frame (\(raw.count) bytes), CRC mismatch — raw: \(raw.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "))…")
             return
         }
 
@@ -299,9 +356,25 @@ final class BandManager: NSObject {
         switch cmd.type {
         case XiaomiAuthCmd.cmdType:
             handleAuthCommand(subtype: cmd.subtype, protoBytes: protoBytes)
+        case XiaomiSystemCmd.cmdType:
+            handleSystemCommand(cmd)
+            onProtoCommandReceived?(protoBytes)
         default:
             log.debug("Proto command type=\(cmd.type) subtype=\(cmd.subtype) — \(protoBytes.count) bytes")
             onProtoCommandReceived?(protoBytes)
+        }
+    }
+
+    /// Captures battery info from a System command response (CMD_BATTERY / device state).
+    /// GadgetBridge: cmd.system.power.battery → level + charger state.
+    private func handleSystemCommand(_ cmd: Xiaomi_Command) {
+        guard cmd.hasSystem, cmd.system.hasPower, cmd.system.power.hasBattery else { return }
+        let battery = cmd.system.power.battery
+        if battery.hasLevel {
+            batteryLevel = Int(battery.level)
+            // state: 1 = charging (GadgetBridge convertBatteryStateFromRawValue)
+            batteryCharging = battery.hasState && battery.state == 1
+            log.info("Battery \(self.batteryLevel ?? -1)%\(self.batteryCharging ? " (charging)" : "")")
         }
     }
 
@@ -468,6 +541,7 @@ final class BandManager: NSObject {
         phoneNonce   = nil
         sessionKeys  = nil
         seqNum       = 0
+        rxBuffer     = Data()
         // Only resume the continuation if one is actually waiting — avoids a spurious
         // "Break on All Swift Errors" exception breakpoint hit in Xcode during BLE bonding
         // disconnects, when no continuation is pending.

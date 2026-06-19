@@ -35,30 +35,39 @@ private final class ActivityFileReceiver {
     private var buffer = Data()
     private(set) var expectedTotal: Int = 0
     private(set) var receivedCount: Int = 0
+    private var complete = false
 
-    var isComplete: Bool { expectedTotal > 0 && receivedCount == expectedTotal }
+    /// Completion is signalled by the LAST chunk (num == total), matching GadgetBridge
+    /// XiaomiActivityFileFetcher.addChunk — more robust than counting received chunks.
+    var isComplete: Bool { complete }
 
     func addChunk(_ payload: Data) {
+        // payload (decrypted): [total: UInt16 LE][num: UInt16 LE][data...]
         guard payload.count >= 4 else { return }
-        let total   = Int(payload[0]) | (Int(payload[1]) << 8)
-        let current = Int(payload[2]) | (Int(payload[3]) << 8)
+        let base    = payload.startIndex
+        let total   = Int(payload[base]) | (Int(payload[base + 1]) << 8)
+        let current = Int(payload[base + 2]) | (Int(payload[base + 3]) << 8)
 
         if current == 1 {
             buffer = Data()
             expectedTotal = total
             receivedCount = 0
+            complete = false
         }
 
         buffer.append(payload.dropFirst(4))
         receivedCount += 1
+        if current == total { complete = true }
     }
 
     func assembled() -> Data { buffer }
+    var chunkProgress: String { "\(receivedCount)/\(expectedTotal)" }
 
     func reset() {
         buffer = Data()
         expectedTotal = 0
         receivedCount = 0
+        complete = false
     }
 
     // CRC-32 validation (last 4 bytes of assembled file)
@@ -112,6 +121,7 @@ final class BandSyncer {
 
     private(set) var isSyncing = false
     private(set) var lastSyncDate: Date?
+    private(set) var lastHealthSync: Date?
     private(set) var lastError: Error?
     private(set) var currentDevice: BandDevice?
 
@@ -155,6 +165,112 @@ final class BandSyncer {
             sortBy: [SortDescriptor(\.addedDate, order: .reverse)]
         )
         currentDevice = (try? context.fetch(descriptor))?.first
+        lastHealthSync = currentDevice?.lastHealthSyncDate
+        lastSyncDate = currentDevice?.lastSyncDate
+    }
+
+    // MARK: - Apple Health sync
+    //
+    // Fetches today's activity files and routes each by its file-id metadata:
+    //   sleep         → SleepDetailsParser   → HealthKit sleepAnalysis (+ SwiftData)
+    //   daily summary → DailySummaryParser   → HealthKit steps/calories/HR/SpO₂ (+ ActivityDay)
+    //   daily details → DailyDetailsParser   → HealthKit per-minute HR/SpO₂/distance
+    // Each file is ACKed so the band marks it synced.
+
+    struct HealthSyncOutcome {
+        var sleepSessions = 0
+        var dailySummaries = 0
+        var minuteSamples = 0
+        var healthSamplesWritten = 0
+    }
+
+    @discardableResult
+    func syncToHealth() async throws -> HealthSyncOutcome {
+        guard let manager = bandManager, manager.connectionState.isConnected else {
+            throw SyncError.notConnected
+        }
+        guard let context = modelContext else { throw SyncError.noDeviceRecord }
+
+        isSyncing = true
+        lastError = nil
+        defer { isSyncing = false }
+
+        do {
+            try await HealthKitManager.shared.requestAuthorization()
+        } catch {
+            lastError = error
+            throw error
+        }
+
+        log.info("Health sync started (fetching today's activity files)")
+        let fileIds = try await fetchFileIds(manager: manager)
+        log.info("Received \(fileIds.count) file ID(s)")
+
+        var outcome = HealthSyncOutcome()
+        var sleepToWrite: [SleepSession] = []
+
+        for fileId in fileIds {
+            guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
+            do {
+                let fileData = try await fetchActivityFile(fileId: fileId, manager: manager)
+
+                if meta.isSleep {
+                    for session in SleepDetailsParser.parse(fileData) where persistIfNew(session, context) {
+                        sleepToWrite.append(session)
+                    }
+                } else if meta.isDailySummary {
+                    if let summary = DailySummaryParser.parse(fileData, meta: meta) {
+                        outcome.dailySummaries += 1
+                        persistActivityDay(summary, context)
+                        outcome.healthSamplesWritten += try await HealthKitManager.shared.writeDailySummary(summary)
+                    }
+                } else if meta.isDailyDetails {
+                    let minutes = DailyDetailsParser.parse(fileData, meta: meta)
+                    outcome.minuteSamples += minutes.count
+                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(minutes)
+                }
+
+                sendAck(fileId: fileId, manager: manager)
+            } catch {
+                log.error("Failed file \(fileId.hexString): \(error.localizedDescription)")
+            }
+        }
+
+        if !sleepToWrite.isEmpty {
+            outcome.sleepSessions = sleepToWrite.count
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite)
+        }
+
+        try? context.save()
+        let now = Date()
+        currentDevice?.lastHealthSyncDate = now
+        currentDevice?.lastSyncDate = now
+        lastHealthSync = now
+        lastSyncDate = now
+        try? context.save()
+
+        log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
+        return outcome
+    }
+
+    private func persistIfNew(_ session: SleepSession, _ context: ModelContext) -> Bool {
+        let hash = session.rawDataHash
+        let dup = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.rawDataHash == hash })
+        guard (try? context.fetch(dup))?.isEmpty ?? true else { return false }
+        session.device = currentDevice
+        context.insert(session)
+        return true
+    }
+
+    private func persistActivityDay(_ summary: DailySummary, _ context: ModelContext) {
+        let day = Calendar.current.startOfDay(for: summary.date)
+        let descriptor = FetchDescriptor<ActivityDay>(predicate: #Predicate { $0.date == day })
+        let existing = (try? context.fetch(descriptor))?.first
+        let record = existing ?? ActivityDay(date: summary.date)
+        record.steps = summary.steps
+        record.calories = Double(summary.caloriesKcal)
+        record.device = currentDevice
+        if existing == nil { context.insert(record) }
     }
 
     // MARK: - Sleep sync
@@ -277,9 +393,11 @@ final class BandSyncer {
 
             manager.sendEncryptedCommand(protoBytes: proto)
 
+            let log = self.log
             group.addTask {
                 for await chunk in stream {
                     receiver.addChunk(chunk)
+                    log.debug("Activity chunk \(receiver.chunkProgress) (\(chunk.count)B)")
                     if receiver.isComplete {
                         guard receiver.validateCRC() else { throw SyncError.crcMismatch }
                         return receiver.assembled()
