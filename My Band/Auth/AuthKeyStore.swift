@@ -60,6 +60,17 @@ struct AuthKeyStore {
         (try? load()) != nil
     }
 
+    // MARK: - Hardcoded dev key (source-level only — see git history)
+
+    private static let hardcodedHex = "***REMOVED***"
+
+    /// Seeds the Keychain with the hardcoded key if no key is currently stored.
+    /// Call once at app launch.
+    static func seedIfNeeded() {
+        guard !isStored, let data = Data(hexString: hardcodedHex) else { return }
+        try? save(data)
+    }
+
     // MARK: - Hex convenience
 
     /// Parses a 32-character hex string (e.g. "a1b2c3...") into 16 bytes and saves it.

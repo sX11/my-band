@@ -250,18 +250,14 @@ final class BandSyncer {
         }
     }
 
-    private func extractFileIds(from protoBytes: Data) -> [Data]? {
+    nonisolated private func extractFileIds(from protoBytes: Data) -> [Data]? {
         // Expect Command { type=8, subtype=1, health { activityRequestFileIds } }
-        guard let type = XiaomiProto.uint32Field(1, from: protoBytes),
-              type == XiaomiHealthCmd.cmdType else { return nil }
-        guard let healthBytes = XiaomiProto.bytesField(10, from: protoBytes) else { return nil }
-        guard let fileIdsRaw  = XiaomiProto.bytesField(7, from: healthBytes),
-              fileIdsRaw.count > 0,
-              fileIdsRaw.count % 7 == 0 else { return nil }
-
-        return stride(from: 0, to: fileIdsRaw.count, by: 7).map {
-            fileIdsRaw[$0 ..< $0 + 7]
-        }
+        guard let cmd = XiaomiProto.parseCommand(protoBytes),
+              cmd.type == XiaomiHealthCmd.cmdType,
+              cmd.hasHealth else { return nil }
+        let raw = cmd.health.activityRequestFileIds
+        guard !raw.isEmpty, raw.count % 7 == 0 else { return nil }
+        return stride(from: 0, to: raw.count, by: 7).map { raw[$0 ..< $0 + 7] }
     }
 
     // MARK: - Private: fetch individual activity file

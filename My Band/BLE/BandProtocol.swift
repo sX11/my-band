@@ -59,9 +59,11 @@ struct XiaomiParsedPacket {
     let payload:    Data
 
     // DATA packet conveniences — valid only when packetType == data (3)
-    var rawChannel: UInt8 { payload.count >= 2 ? payload[0] & 0xf : 0 }
-    var opCode:     UInt8 { payload.count >= 2 ? payload[1] : 0 }
-    var innerData:  Data  { payload.count >= 2 ? payload.dropFirst(2) : Data() }
+    var rawChannel: UInt8 { payload.count >= 2 ? payload[payload.startIndex] & 0xf : 0 }
+    var opCode:     UInt8 { payload.count >= 2 ? payload[payload.startIndex + 1] : 0 }
+    // Data(…) forces a copy with startIndex=0 — dropFirst(2) alone returns a slice whose
+    // startIndex is 2, which causes Data.subscript precondition failures in the proto parser.
+    var innerData:  Data  { payload.count >= 2 ? Data(payload.dropFirst(2)) : Data() }
 
     var isData:         Bool { packetType == XiaomiPacketType.data.rawValue }
     var isSessionCfg:   Bool { packetType == XiaomiPacketType.sessionConfig.rawValue }
@@ -97,18 +99,22 @@ enum XiaomiSppPacket {
     // MARK: - Specialised builders
 
     /// Session config START_REQUEST (binary format, from GadgetBridge packet dump of official app).
-    static func buildSessionConfig(seqNum: UInt8) -> Data {
+    /// GadgetBridge always uses seqNum=0 for SESSION_CONFIG via setSequenceNumber(0) — the shared
+    /// DATA packet counter is NOT incremented; it stays at 0 so CMD_NONCE also gets seqNum=0.
+    static func buildSessionConfig() -> Data {
+        let seqNum: UInt8 = 0
         // Layout: opCode | KEY(1B) SIZE(2B LE) VALUE | KEY SIZE VALUE | ...
         // KEY_VERSION=1 → size=3 → [0x01,0x00,0x00]
         // KEY_MAX_PACKET_SIZE=2 → size=2 → [0x00,0xfc] (=64512)
         // KEY_TX_WIN=3 → size=2 → [0x20,0x00] (=32)
         // KEY_SEND_TIMEOUT=4 → (from dump: 0x02, then 0x10, 0x27) → 10000ms
+        // TLV format: KEY(1B) SIZE(2B LE) VALUE(size bytes) — verified against GadgetBridge XiaomiSppPacketV2.java
         let payload: [UInt8] = [
-            0x01,                             // OPCODE_START_SESSION_REQUEST
-            0x01, 0x03, 0x00, 0x01, 0x00, 0x00,  // VERSION
-            0x02, 0x02, 0x00, 0x00, 0xfc,         // MAX_FRAME_SIZE
-            0x03, 0x02, 0x00, 0x20, 0x00,         // TX_WIN
-            0x04, 0x02, 0x10, 0x27,               // SEND_TIMEOUT (as in official app dump)
+            0x01,                                       // OPCODE_START_SESSION_REQUEST
+            0x01, 0x03, 0x00, 0x01, 0x00, 0x00,        // KEY_VERSION=1, size=3, value=[1,0,0]
+            0x02, 0x02, 0x00, 0x00, 0xfc,               // KEY_MAX_PACKET_SIZE=2, size=2, value=0xfc00=64512
+            0x03, 0x02, 0x00, 0x20, 0x00,               // KEY_TX_WIN=3, size=2, value=32
+            0x04, 0x02, 0x00, 0x10, 0x27,               // KEY_SEND_TIMEOUT=4, size=2, value=10000ms
         ]
         return build(type: .sessionConfig, seqNum: seqNum, payload: Data(payload))
     }
@@ -196,6 +202,16 @@ enum XiaomiAuthCmd {
     static let sendUserId:   UInt32 = 5
     static let nonce:        UInt32 = 26   // CMD_NONCE
     static let auth:         UInt32 = 27   // CMD_AUTH
+}
+
+// MARK: - System command IDs (type=2, from GadgetBridge XiaomiSystemService)
+
+enum XiaomiSystemCmd {
+    static let cmdType:        UInt32 = 2
+    static let battery:        UInt32 = 1    // CMD_BATTERY
+    static let deviceInfo:     UInt32 = 2    // CMD_DEVICE_INFO
+    static let clock:          UInt32 = 3    // CMD_CLOCK (set time)
+    static let deviceStateGet: UInt32 = 78   // CMD_DEVICE_STATE_GET
 }
 
 // MARK: - Health command IDs

@@ -8,15 +8,17 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 
 | Status | Funcionalidade |
 |---|---|
-| ✅ | Conexão BLE V2 com autenticação HMAC-SHA256 via AuthKey |
+| ✅ | Conexão BLE V2 com autenticação HMAC-SHA256 via AuthKey — **validada em hardware (Mi Band 10)** |
+| ✅ | Protocolo protobuf via SwiftProtobuf (tipos gerados do GadgetBridge) |
+| ✅ | Transporte confiável com ACK + init pós-auth + retry de primeiro pareamento |
 | ✅ | Armazenamento seguro do AuthKey no Keychain |
 | ✅ | Reconexão automática com backoff exponencial |
 | ✅ | Background BLE (pulseira permanece conectada com app suspenso) |
 | ✅ | State restoration do CBCentralManager após suspensão pelo sistema |
 | ✅ | Sincronização de dados de sono (parser XiaomiSppPacketV2) |
 | ✅ | Persistência local com SwiftData (BandDevice, SleepSession, ActivityDay) |
-| 🔜 | Interface de configuração do AuthKey + dashboard de status |
-| 🔜 | Visualização de dados de sono (fases, eficiência, histórico) |
+| 🚧 | Interface (Setup + Dashboard + Sleep + Settings) — em construção via Claude Design |
+| 🔜 | Parsers de device info / bateria para o dashboard |
 | 🔜 | Envio de dados ao Apple Health (HealthKit) |
 | 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
 | 🔜 | Integração com Atalhos via App Intents |
@@ -31,6 +33,7 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 - **iOS 17+** / **macOS 14+**
 - Apple Developer Program pessoal (sideload — não publicado na App Store)
 - Mi Band 10 com AuthKey conhecido
+- Dependência SPM: **SwiftProtobuf** (`apple/swift-protobuf`) — resolvida automaticamente pelo Xcode
 
 ---
 
@@ -72,9 +75,10 @@ My Band/
 │   ├── BandScanner.swift         # Filtros de descoberta BLE
 │   ├── BandProtocol.swift        # Encoding XiaomiSppPacketV2 + CRC-16/ARC
 │   ├── Crypto/
-│   │   └── XiaomiCrypto.swift    # HMAC-SHA256, HKDF-expand, AES-CTR (CommonCrypto)
+│   │   └── XiaomiCrypto.swift    # HMAC-SHA256, HKDF-expand, AES-CTR/CCM (CommonCrypto)
 │   ├── Protocol/
-│   │   └── XiaomiProto.swift     # Encoder/decoder protobuf mínimo (zero dependências)
+│   │   ├── XiaomiProto.swift     # Builders/parsers (camada fina sobre SwiftProtobuf)
+│   │   └── xiaomi.pb.swift       # Tipos gerados do xiaomi.proto (GadgetBridge)
 │   └── PacketParser/
 │       └── SleepPacketParser.swift  # Parser binário de dados de sono (2-byte entries)
 │
@@ -102,21 +106,30 @@ A Mi Band 10 utiliza o protocolo **XiaomiSppPacketV2** sobre BLE (confirmado via
 
 **Serviço:** `0000FE95` | **TX (write):** `0000005E` | **RX (notify):** `0000005F`
 
-**Frame:**
+**Frame (cabeçalho de 8 bytes; CRC-16/ARC do payload):**
 ```
 [0xA5][0xA5] preamble
-[type][channel][seqNum][lenLo][lenHi][flags][crcLo][crcHi]
-[payload...]
+[type][seqNum][lenLo][lenHi][crcLo][crcHi]
+[payload...]      # DATA: [channel][opCode][bytes]
 ```
 
 **Autenticação (HMAC-SHA256):**
-1. Session config → `Command{type=0, sub=1}`
+1. Session config (binário) → resposta da banda
 2. `CMD_NONCE` (type=1, sub=26) com 16 bytes aleatórios do app
-3. Banda responde: `watchNonce(16) + HMAC-SHA256(watchNonce+phoneNonce, secretKey)(32)`
+3. Banda responde: `watchNonce(16) + HMAC-SHA256(watchNonce+phoneNonce, decKey)(32)`
 4. Verificar HMAC → derivar 4 chaves de sessão via HKDF-expand("miwear-auth", 64)
-5. `CMD_AUTH` (type=1, sub=27) com confirmação cifrada em AES-CTR
+5. `CMD_AUTH` (type=1, sub=27) com `authStep3` (HMAC dos nonces + device info em AES-128-CCM)
+6. Init pós-auth (time + device info/state/battery) — sem isso a banda re-dispara auth
 
+> **Transporte confiável:** toda frame DATA recebida da banda é confirmada com um ACK (mesmo `seqNum`), ou a banda retransmite o handshake a cada ~6 s.
+> **Primeiro pareamento:** o primeiro watch-nonce sempre falha o HMAC; o app reconecta automaticamente e autentica na 2ª tentativa.
 > O AuthKey (secretKey) tem 16 bytes. Fica **apenas no Keychain** — nunca em logs, SwiftData ou UserDefaults.
+
+---
+
+## Interface (UI)
+
+A UI está sendo construída a partir de um **design system dark-mode-first** entregue pelo Claude Design — paleta *midnight* otimizada para OLED, accent Aurora indigo, cores de saúde espelhando o Apple Health e uma rampa de fases de sono. Copy em **pt-BR**, foco em status glanceável e configuração rápida (o app é um gateway em segundo plano). Detalhes de tokens, componentes e telas em [`CLAUDE.md`](CLAUDE.md#ui--design-system).
 
 ---
 

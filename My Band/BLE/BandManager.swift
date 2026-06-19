@@ -64,12 +64,10 @@ final class BandManager: NSObject {
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
 
-    // 0051 — notify (band → app)
-    private var cmdReadChar:    CBCharacteristic?
-    // 0052 — write  (app → band)
-    private var cmdWriteChar:   CBCharacteristic?
-    // 0053 — notify (band → app): activity data
-    private var activityChar:   CBCharacteristic?
+    // 005F — notify (band → app): ALL SPP V2 frames (commands + activity, differentiated by channel byte)
+    private var cmdReadChar:  CBCharacteristic?
+    // 005E — write  (app → band): SPP V2 frames
+    private var cmdWriteChar: CBCharacteristic?
 
     // MARK: - Auth state
 
@@ -85,6 +83,13 @@ final class BandManager: NSObject {
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 5
     private var pendingScan = false
+
+    // First-time pairing: the band's first watch-nonce HMAC reliably fails; only a fresh
+    // reconnect yields a valid handshake. When the HMAC check fails we tear the link down and
+    // reconnect (bounded) rather than dying in .error. Reset to 0 once auth succeeds.
+    private var authRetries = 0
+    private let maxAuthRetries = 4
+    private var retryAuthOnDisconnect = false
 
     // MARK: - Callbacks (consumed by BandSyncer)
 
@@ -145,7 +150,10 @@ final class BandManager: NSObject {
         _ = secretKey  // validated; actual use is inside callbacks
 
         connectionState = .sessionConfig
-        let sessionPkt = XiaomiSppPacket.buildSessionConfig(seqNum: nextSeq())
+        // Session config always uses seqNum=0 (GadgetBridge: setSequenceNumber(0)).
+        // The DATA packet counter is NOT touched here — CMD_NONCE will get seqNum=0 too.
+        seqNum = 0
+        let sessionPkt = XiaomiSppPacket.buildSessionConfig()
         writeSPP(sessionPkt)
         log.debug("Session config sent — waiting for band response")
 
@@ -176,7 +184,15 @@ final class BandManager: NSObject {
 
     private func writeSPP(_ packet: Data) {
         guard let char = cmdWriteChar, let p = peripheral else { return }
-        p.writeValue(packet, for: char, type: .withoutResponse)
+        // Skip writes on a peripheral that's mid-teardown (e.g. an ACK queued right after an
+        // auth-retry disconnect) — otherwise CoreBluetooth logs "API MISUSE: can only accept
+        // commands while in the connected state".
+        guard p.state == .connected else { return }
+        // Use withResponse if the characteristic supports it, otherwise withoutResponse.
+        // 005E on Mi Band 10 V2 supports write without response (confirmed in GadgetBridge).
+        let writeType: CBCharacteristicWriteType = char.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        log.debug("005F write (\(packet.count)B, \(writeType == .withoutResponse ? "noRsp" : "rsp")): \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
+        p.writeValue(packet, for: char, type: writeType)
     }
 
     private func nextSeq() -> UInt8 {
@@ -187,8 +203,9 @@ final class BandManager: NSObject {
     // MARK: - Private: Incoming packet dispatch (from 0051)
 
     private func handleCmdReadNotification(_ raw: Data) {
+        log.debug("005E raw (\(raw.count)B): \(raw.map { String(format: "%02x", $0) }.joined(separator: " "))")
         guard let pkt = XiaomiSppPacket.parse(raw) else {
-            log.warning("Malformed SPP frame (\(raw.count) bytes), CRC mismatch or bad preamble")
+            log.warning("Malformed SPP frame (\(raw.count) bytes), CRC mismatch or bad preamble — raw: \(raw.map { String(format: "%02x", $0) }.joined(separator: " "))")
             return
         }
 
@@ -204,7 +221,18 @@ final class BandManager: NSObject {
 
         if pkt.isData {
             handleDataPacket(pkt)
+            // SPP V2 is a reliable windowed transport: every DATA frame must be ACKed with its own
+            // sequence number (GadgetBridge XiaomiSppProtocolV2.processPacket). Without this the band
+            // assumes its frames were lost and retransmits the whole auth handshake every ~6 s.
+            sendAck(seqNum: pkt.seqNum)
         }
+    }
+
+    /// ACKs a received DATA frame. Uses the *received* packet's sequence number and does NOT
+    /// touch our outgoing counter (matches GadgetBridge's separate ack path).
+    private func sendAck(seqNum: UInt8) {
+        writeSPP(XiaomiSppPacket.buildAck(seqNum: seqNum))
+        log.debug("ACK sent for seq \(seqNum)")
     }
 
     private func handleSessionConfigResponse(_ payload: Data) {
@@ -260,8 +288,7 @@ final class BandManager: NSObject {
     }
 
     private func handleProtoCommand(_ protoBytes: Data) {
-        guard let type    = XiaomiProto.uint32Field(1, from: protoBytes),
-              let subtype = XiaomiProto.uint32Field(2, from: protoBytes) else {
+        guard let cmd = XiaomiProto.parseCommand(protoBytes), cmd.hasType, cmd.hasSubtype else {
             // Fallback during auth: route any proto packet as auth response
             if connectionState == .authenticating {
                 handlePotentialWatchNonce(protoBytes)
@@ -269,16 +296,17 @@ final class BandManager: NSObject {
             return
         }
 
-        switch type {
+        switch cmd.type {
         case XiaomiAuthCmd.cmdType:
-            handleAuthCommand(subtype: subtype, protoBytes: protoBytes)
+            handleAuthCommand(subtype: cmd.subtype, protoBytes: protoBytes)
         default:
-            log.debug("Proto command type=\(type) subtype=\(subtype) — \(protoBytes.count) bytes")
+            log.debug("Proto command type=\(cmd.type) subtype=\(cmd.subtype) — \(protoBytes.count) bytes")
             onProtoCommandReceived?(protoBytes)
         }
     }
 
     private func handleAuthCommand(subtype: UInt32, protoBytes: Data) {
+        log.debug("AUTH cmd subtype=\(subtype) (\(protoBytes.count)B): \(protoBytes.hex)")
         switch subtype {
         case XiaomiAuthCmd.nonce:
             handlePotentialWatchNonce(protoBytes)
@@ -290,8 +318,18 @@ final class BandManager: NSObject {
             // Plaintext auth fallback
             log.info("AUTH response with userId subtype — plaintext mode")
             handleAuthSuccess()
+        case 16:
+            // Band sends subtype=16 during first-time pairing. We don't yet know whether it carries
+            // a usable watch nonce — try to parse one; if it does, the normal path handles it,
+            // otherwise we just wait for sub=26. The hex dump above lets us confirm its contents.
+            if let resp = BandAuthenticator.parseWatchNonce(from: protoBytes) {
+                log.info("sub=16 carries a watch nonce (nonce=\(resp.watchNonce.hex.prefix(8))…) — processing as auth")
+                handlePotentialWatchNonce(protoBytes)
+            } else {
+                log.info("Band pairing packet (sub=16, no watch nonce) — waiting for sub=26")
+            }
         default:
-            log.debug("Unknown auth subtype \(subtype)")
+            log.debug("Unknown auth subtype \(subtype) — \(protoBytes.count) bytes")
         }
     }
 
@@ -319,8 +357,14 @@ final class BandManager: NSObject {
             watchNonce:  resp.watchNonce,
             sessionKeys: keys
         ) else {
-            failAuth(AuthError.badHMAC); return
+            let expected = XiaomiCrypto.hmacSHA256(message: resp.watchNonce + nonce, key: keys.decryptionKey)
+            log.warning("Watch HMAC mismatch — phoneNonce=\(nonce.hex) watchNonce=\(resp.watchNonce.hex)")
+            log.warning("  band HMAC=\(resp.bandHMAC.hex)")
+            log.warning("  ours HMAC=\(expected.hex)")
+            retryAuthAfterReconnect(reason: "watch HMAC mismatch (first-pairing transient)")
+            return
         }
+        log.info("Watch HMAC verified — deriving session, sending CMD_AUTH")
 
         sessionKeys = keys
 
@@ -343,15 +387,37 @@ final class BandManager: NSObject {
     }
 
     private func handleAuthSuccess() {
+        // The band re-sends its CMD_AUTH confirmation every ~6 s until it receives the post-auth
+        // init handshake. If we're already connected, just re-send the init — answering the band's
+        // repeat request is what finally lets it settle.
+        guard connectionState != .connected else {
+            log.debug("Duplicate auth response — re-sending post-auth init")
+            sendPostAuthInit()
+            return
+        }
         connectionState = .connected
         connectedPeripheral = peripheral
         reconnectAttempts = 0
+        authRetries = 0
         log.info("Authentication successful — communication is now encrypted")
         authContinuation?.resume()
         authContinuation = nil
         if let p = peripheral {
             onAuthenticated?(p.name ?? "Mi Band 10", p.identifier.uuidString)
         }
+        sendPostAuthInit()
+    }
+
+    /// Post-auth handshake. Mirrors GadgetBridge XiaomiSupport.onAuthSuccess():
+    /// setCurrentTime() followed by SystemService.initialize() (device info / state / battery).
+    /// Sending only setCurrentTime is NOT enough — the band keeps re-driving auth every ~6 s
+    /// until it receives the device-info request that completes initialization.
+    private func sendPostAuthInit() {
+        sendEncryptedCommand(protoBytes: XiaomiProto.setCurrentTimeCommand())
+        sendEncryptedCommand(protoBytes: XiaomiProto.systemCommand(subtype: XiaomiSystemCmd.deviceInfo))
+        sendEncryptedCommand(protoBytes: XiaomiProto.systemCommand(subtype: XiaomiSystemCmd.deviceStateGet))
+        sendEncryptedCommand(protoBytes: XiaomiProto.systemCommand(subtype: XiaomiSystemCmd.battery))
+        log.debug("Post-auth init sent (time + device info/state/battery)")
     }
 
     private func failAuth(_ error: Error) {
@@ -362,27 +428,18 @@ final class BandManager: NSObject {
         authContinuation = nil
     }
 
-    // MARK: - Private: Activity data (from 0053)
-
-    private func handleActivityNotification(_ raw: Data) {
-        guard let pkt = XiaomiSppPacket.parse(raw) else {
-            log.warning("Malformed activity SPP frame (\(raw.count) bytes)")
+    /// Tear down the link and reconnect to retry authentication. Used for the first-pairing
+    /// HMAC transient: the band only emits a verifiable watch nonce on a fresh connection.
+    private func retryAuthAfterReconnect(reason: String) {
+        guard authRetries < maxAuthRetries, let p = peripheral else {
+            log.error("Auth retry budget exhausted (\(self.authRetries)/\(self.maxAuthRetries)) — giving up")
+            failAuth(AuthError.badHMAC)
             return
         }
-
-        guard pkt.isData else { return }
-
-        var innerData = pkt.innerData
-
-        if pkt.opCode == XiaomiOpCode.encrypted, let keys = sessionKeys {
-            guard let decrypted = try? XiaomiCrypto.aesCTR(data: innerData, key: keys.decryptionKey) else {
-                log.error("Activity chunk decryption failed")
-                return
-            }
-            innerData = decrypted
-        }
-
-        onActivityChunkReceived?(innerData)
+        authRetries += 1
+        log.warning("Retrying auth via reconnect (\(self.authRetries)/\(self.maxAuthRetries)): \(reason)")
+        retryAuthOnDisconnect = true
+        central.cancelPeripheralConnection(p)
     }
 
     // MARK: - Reconnect
@@ -406,13 +463,19 @@ final class BandManager: NSObject {
 
     private func resetState() {
         connectedPeripheral = nil
-        cmdReadChar    = nil
-        cmdWriteChar   = nil
-        activityChar   = nil
-        phoneNonce     = nil
-        sessionKeys    = nil
-        seqNum         = 0
-        failAuth(AuthError.timeout)  // resume any pending continuation
+        cmdReadChar  = nil
+        cmdWriteChar = nil
+        phoneNonce   = nil
+        sessionKeys  = nil
+        seqNum       = 0
+        // Only resume the continuation if one is actually waiting — avoids a spurious
+        // "Break on All Swift Errors" exception breakpoint hit in Xcode during BLE bonding
+        // disconnects, when no continuation is pending.
+        if authContinuation != nil {
+            failAuth(AuthError.timeout)
+        } else {
+            connectionState = .disconnected
+        }
     }
 }
 
@@ -447,6 +510,15 @@ extension BandManager: CBCentralManagerDelegate {
         guard !discoveredDevices.contains(where: { $0.identifier == peripheral.identifier }) else { return }
         log.info("Discovered: \(peripheral.name ?? peripheral.identifier.uuidString) RSSI \(RSSI)")
         discoveredDevices.append(peripheral)
+
+        // Auto-connect to:
+        //   a) the first band found when no peripheral is known yet, OR
+        //   b) a rediscovery of our already-known peripheral (e.g. after willRestoreState set
+        //      self.peripheral but pendingScan consumed the poweredOn event before connect() ran).
+        let knownId = self.peripheral?.identifier
+        if knownId == nil || knownId == peripheral.identifier {
+            connect(to: peripheral)
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -465,14 +537,17 @@ extension BandManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        // A deliberate auth-retry disconnect is "clean" (no error), so check the flag explicitly.
+        let shouldReconnect = retryAuthOnDisconnect || (error != nil)
+        retryAuthOnDisconnect = false
         if let error {
             log.warning("Disconnected with error: \(error.localizedDescription)")
-            scheduleReconnect(to: peripheral)
         } else {
             log.info("Disconnected cleanly")
         }
         resetState()
         connectionState = .disconnected
+        if shouldReconnect { scheduleReconnect(to: peripheral) }
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
@@ -497,7 +572,7 @@ extension BandManager: CBPeripheralDelegate {
         }
         for service in peripheral.services ?? [] where service.uuid == MiBandUUID.mainService {
             peripheral.discoverCharacteristics(
-                [MiBandUUID.commandRead, MiBandUUID.commandWrite, MiBandUUID.activityData],
+                [MiBandUUID.commandRead, MiBandUUID.commandWrite],
                 for: service
             )
         }
@@ -515,16 +590,32 @@ extension BandManager: CBPeripheralDelegate {
             case MiBandUUID.commandRead:
                 cmdReadChar = char
                 peripheral.setNotifyValue(true, for: char)
-                log.debug("0051 (cmd read) — notifications enabled")
+                log.debug("005E (RX, band→app) — notify subscribed")
             case MiBandUUID.commandWrite:
                 cmdWriteChar = char
-                log.debug("0052 (cmd write) — ready")
-            case MiBandUUID.activityData:
-                activityChar = char
+                // Also subscribe to 005F notifications: both chars have Notify capability on Mi Band 10.
+                // GadgetBridge only subscribes to 005E, but subscribing to both catches any responses
+                // that arrive on the TX characteristic (diagnostic).
                 peripheral.setNotifyValue(true, for: char)
-                log.debug("0053 (activity) — notifications enabled")
+                log.debug("005F (TX, app→band) — write ready + notify subscribed")
             default:
                 break
+            }
+        }
+
+        guard cmdReadChar != nil && cmdWriteChar != nil else {
+            log.error("Required characteristics 005E/005F not found in service FE95")
+            return
+        }
+
+        // GadgetBridge calls startEncryptedHandshake() immediately after initializeDevice().
+        // Mirror that: trigger auth as soon as both characteristics are ready.
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.authenticate()
+            } catch {
+                self.log.error("Authentication failed: \(error.localizedDescription)")
             }
         }
     }
@@ -533,13 +624,13 @@ extension BandManager: CBPeripheralDelegate {
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard error == nil, let data = characteristic.value else { return }
-        switch characteristic.uuid {
-        case MiBandUUID.commandRead:
+        // All SPP responses arrive on 005E (commandRead) per GadgetBridge.
+        // Also handle 005F notifications in case Mi Band 10 uses the TX char bidirectionally.
+        if characteristic.uuid == MiBandUUID.commandRead {
             handleCmdReadNotification(data)
-        case MiBandUUID.activityData:
-            handleActivityNotification(data)
-        default:
-            break
+        } else if characteristic.uuid == MiBandUUID.commandWrite {
+            log.debug("005F notify (\(data.count)B): \(data.map { String(format: "%02x", $0) }.joined(separator: " "))")
+            handleCmdReadNotification(data)
         }
     }
 
@@ -561,4 +652,11 @@ extension BandManager: CBPeripheralDelegate {
             log.error("Notify state update failed for \(characteristic.uuid): \(error.localizedDescription)")
         }
     }
+}
+
+// MARK: - Debug helpers
+
+private extension Data {
+    /// Lowercase hex string, for diagnostic logging of nonces/HMACs/packets (never the AuthKey).
+    var hex: String { map { String(format: "%02x", $0) }.joined() }
 }

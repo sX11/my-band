@@ -10,6 +10,10 @@
 		93200F242FD62F9A00E8DC0C /* My Band.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "My Band.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXBuildFile section */
+		BB0A1B2C3D4E5F001122AADD /* SwiftProtobuf in Frameworks */ = {isa = PBXBuildFile; productRef = BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		93200F262FD62F9A00E8DC0C /* My Band */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
@@ -65,12 +69,33 @@
 			);
 			name = "My Band";
 			packageProductDependencies = (
+				BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */,
 			);
 			productName = "My Band";
 			productReference = 93200F242FD62F9A00E8DC0C /* My Band.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
+
+
+/* Begin XCRemoteSwiftPackageReference section */
+		BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-protobuf.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.28.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */;
+			productName = SwiftProtobuf;
+		};
+/* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXProject section */
 		93200F1C2FD62F9A00E8DC0C /* Project object */ = {
@@ -96,6 +121,9 @@
 			minimizedProjectReferenceProxies = 1;
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 93200F252FD62F9A00E8DC0C /* Products */;
+			packageReferences = (
+				BB0A1B2C3D4E5F001122AABB /* XCRemoteSwiftPackageReference "swift-protobuf" */,
+			);
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (

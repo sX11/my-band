@@ -92,21 +92,27 @@ My Band/
 
 ### Formato de Frame — XiaomiSppPacketV2
 
+Cabeçalho de 8 bytes (confirmado em `XiaomiSppPacketV2.java`; ver `BandProtocol.swift`):
+
 ```
-[0xA5][0xA5]  preamble (2 bytes)
-[type]        XiaomiPacketType: 0x00=command, 0x01=data, 0x02=ack
-[channel]     XiaomiChannel: 0x01=command(proto), 0x02=data, 0x05=activity
-[seqNum]      contador por canal (UInt8, wrap em 255)
+[0xA5][0xA5]   preamble (2 bytes)
+[type]         lower 4 bits = packetType: 1=ACK, 2=SESSION_CONFIG, 3=DATA
+[seqNum]       contador de sequência (UInt8)
 [lenLo][lenHi] comprimento do payload (UInt16 LE)
-[flags]        reservado (0x00)
-[crcLo][crcHi] CRC-16/ARC de todo o frame com bytes [8..9] zerados
-[payload...]  bytes do payload
+[crcLo][crcHi] CRC-16/ARC do PAYLOAD apenas (poly=0x8005, refin/refout, init=0)
+[payload...]   bytes do payload
 ```
 
-Canais:
-- **COMMAND (0x01)**: Comandos protobuf (`Command { type, subtype, payload }`)
-- **DATA (0x02)**: Payloads binários grandes
-- **ACTIVITY (0x05)**: Dados de sono/atividade
+Payload de um pacote DATA (dentro do payload acima):
+```
+[channel]  lower 4 bits: 1=PROTOBUF, 2=DATA, 5=ACTIVITY
+[opCode]   1=PLAINTEXT, 2=ENCRYPTED (AES-CTR, encryptV2/decryptV2 com IV=key)
+[bytes...] Command protobuf (ou bytes cifrados, se opCode=2)
+```
+
+**Transporte confiável (janela/ACK).** O SPP V2 negocia `TX_WIN` e numera os pacotes. **Toda frame DATA recebida da pulseira precisa ser confirmada** com um pacote ACK (`type=1`) carregando o mesmo `seqNum` (`BandManager.sendAck`). Sem ACK, a pulseira assume perda e retransmite o handshake inteiro a cada ~6 s. Pacotes DATA enviados pelo app usam um contador próprio incremental (`nextSeq`).
+
+**Protobuf via SwiftProtobuf.** As mensagens `Command`, `Auth`, `WatchNonce`, `Health`, `System`, etc. vêm dos tipos gerados em `BLE/Protocol/xiaomi.pb.swift` (gerados do `xiaomi.proto` do GadgetBridge). `XiaomiProto.swift` é só a camada fina de builders/parsers.
 
 ### Fluxo de Autenticação (HMAC-SHA256 V2)
 
@@ -126,11 +132,15 @@ Canais:
    decryptionNonce = keys[32..35]
    encryptionNonce = keys[36..39]
    ```
-9. **CMD_AUTH** (type=1, sub=27): enviar `AES-CTR(HMAC-SHA256(phoneNonce+watchNonce, encKey), encKey)`
-   - AES-CTR peculiaridade V2: **IV = encryptionKey** (GadgetBridge: "I wish I was kidding")
-10. **Autenticado** — banda aceita comandos subsequentes
+9. **CMD_AUTH** (type=1, sub=27): `authStep3 { encryptedNonces = HMAC-SHA256(phoneNonce+watchNonce, encKey), encryptedDeviceInfo = AES-128-CCM(authDeviceInfo) }`
+   - CCM nonce = `encryptionNonce(4) || zeros(4) || counter=0(4)`
+   - Comunicação pós-auth usa AES-CTR com peculiaridade V2: **IV = key** (GadgetBridge: "I wish I was kidding")
+10. **Banda responde** `sub=27` → **Autenticado**, comunicação cifrada
+11. **Init pós-auth obrigatório** (`sendPostAuthInit`): `setCurrentTime` + `device info (2/2)` + `device state (2/78)` + `battery (2/1)`. Sem isso a banda re-dispara auth a cada ~6 s.
 
-> O AuthKey (secretKey) tem 16 bytes (hex 32 chars). Keychain com `kSecAttrAccessibleAfterFirstUnlock`. Nunca em SwiftData/UserDefaults/logs.
+> **Primeiro pareamento.** Na primeira conexão a banda envia `sub=16` e o primeiro watch-nonce **sempre falha o HMAC**; apenas uma reconexão limpa autentica. `BandManager.retryAuthAfterReconnect()` derruba e reconecta automaticamente (limite `maxAuthRetries`). Confirmado em hardware (Mi Band 10, 2026-06-19).
+
+> O AuthKey (secretKey) tem 16 bytes (hex 32 chars). Keychain com `kSecAttrAccessibleAfterFirstUnlock`. Nunca em SwiftData/UserDefaults/logs. Nonces e HMACs **podem** ser logados em debug (não são segredos); chaves de sessão e AuthKey, nunca.
 
 ### Comandos de Sincronização
 
@@ -236,6 +246,33 @@ NSHealthShareUsageDescription
 
 ---
 
+## UI / Design System
+
+A UI é construída a partir do handoff do **Claude Design** (`My Band — Design System`, bundle exportado de claude.ai/design). Recriar fielmente em SwiftUI — copiar o **resultado visual**, não a estrutura HTML/JSX dos protótipos.
+
+**Princípios fixos do maker:**
+1. **Dark-mode first** — "gosto de modo noturno".
+2. **Simples, direto, glanceável** — o app é um *gateway* em segundo plano; a UI serve para status rápido e configuração, não para tempo de tela.
+3. **Native Apple** — SwiftUI, iOS 17+/macOS 14+, fiel à HIG.
+
+**Fundações visuais:**
+- **Paleta midnight** (OLED): base `#0A0B10`, cards `#14161F`, superfícies elevadas `#1A1D27`. Elevação por *lightness + hairline* `rgba(255,255,255,.07)`, não sombra.
+- **Accent único**: Aurora indigo `#7C7FFF` (interação, seleção, foco, glow de conexão ativa).
+- **Cores de saúde** espelham o Apple Health: HR `#FF5C7A`, passos `#46E0A0`, SpO₂ `#5BC0F8`, energia `#FF9A4C`.
+- **Rampa de fases de sono** dusk→deep-night: acordado `#F6A052` → REM `#5BC0F8` → leve `#8A8CFF` → profundo `#4B45C7`.
+- **Status**: ok/conectada mint `#46E0A0`, conectando/aviso âmbar `#F6C552`, desconectada/erro rosa `#FF5C6C`.
+- **Tipo**: escala iOS, SF Pro on-device (Geist no kit web). Numerais de dados grandes (48–64px), tabular. AuthKey e valores técnicos em **mono**.
+- **Cantos** contínuos: cards 16, sheets 20, hero/modal 28, pills redondos. **4-pt grid**, gutter 20, hit target ≥44.
+- **Ícones**: SF Symbols (kit web usa Lucide como substituto). Status sempre cor + símbolo, nunca cor sozinha.
+
+**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "Eficiência 91%"). Número é o herói. Honestidade técnica: AuthKey/BLE/HA mostrados em mono, AuthKey mascarado por padrão.
+
+**Telas (`ui_kits/app/`):** `Dashboard` (sono em destaque + status), `SleepDetail` (hipnograma), `Setup` (AuthKey + scan/conexão), `Settings`. **Status de conexão + frescor do sync são first-class em toda tela.**
+
+**Componentes do kit** (`components/`): core (`Button`, `IconButton`, `StatusPill`, `Badge`), forms (`Switch`, `TextField`, `SegmentedControl`), data (`ListRow`, `Card`, `MetricTile`, `SectionHeader`, `SleepBar`). Cada um tem `.prompt.md` e `.d.ts` descrevendo props/variantes.
+
+---
+
 ## SwiftData — Modelos Principais
 
 ```swift
@@ -284,7 +321,7 @@ O projeto segue [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) e [Sema
 
 Entradas pendentes de release ficam sob `## [Unreleased]`. Ao lançar uma versão, mover para `## [X.Y.Z] - YYYY-MM-DD`.
 
-Versão atual: **0.1.0** (camada BLE base + modelos SwiftData).
+Versão atual: **0.1.0** (camada BLE completa: auth HMAC-SHA256 validada em hardware, SwiftProtobuf, transporte com ACK, init pós-auth; modelos SwiftData). Próxima fase: UI via Claude Design.
 
 ---
 

@@ -9,6 +9,30 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **SwiftProtobuf 1.38** adicionado como dependência SPM (`apple/swift-protobuf`). Vinculado ao target "My Band" via `XCRemoteSwiftPackageReference` no `project.pbxproj`.
+- **`xiaomi.pb.swift`** — 129 tipos Swift gerados automaticamente a partir do `xiaomi.proto` do GadgetBridge (protoc 29.3 + protoc-gen-swift 1.38). Cobre toda a hierarquia de mensagens do protocolo Xiaomi: `Xiaomi_Command`, `Xiaomi_Auth`, `Xiaomi_Health`, `Xiaomi_System`, `Xiaomi_Clock`, `Xiaomi_AuthDeviceInfo`, `Xiaomi_WatchNonce`, etc.
+
+### Changed
+
+- **`XiaomiProto.swift`** — encoder/decoder manual (≈260 linhas de varint artesanal) substituído por camada fina sobre os tipos gerados pelo SwiftProtobuf. Mesma API pública (`phoneNonceCommand`, `authStep3Command`, `authDeviceInfo`, `setCurrentTimeCommand`, `healthCommand`), zero parsing manual.
+- **`BandAuthenticator.parseWatchNonce`** — migrado de `bytesField(31, from:)` aninhado para `Xiaomi_Command(serializedBytes:)` diretamente via `cmd.auth.watchNonce`.
+- **`BandManager.handleProtoCommand`** — roteamento de tipo/subtipo migrado de `XiaomiProto.uint32Field` para `Xiaomi_Command.type` / `.subtype`.
+- **`BandSyncer.extractFileIds`** — parsing de IDs de arquivo migrado de `bytesField(10/7, from:)` para `cmd.health.activityRequestFileIds`.
+
+### Fixed
+
+- **`writeSPP` ignora escritas em peripheral fora do estado `.connected`**: evita `API MISUSE: can only accept commands while in the connected state` quando um ACK é enfileirado logo após o disconnect de retry de auth.
+- **Loop de re-autenticação a cada ~6 s: faltava ACK dos frames DATA**: O SPP V2 é um transporte confiável com janela (TX_WIN/seqNum). Toda frame DATA recebida da pulseira precisa ser confirmada com um `AckPacket` carregando o mesmo `seqNum` (GadgetBridge `XiaomiSppProtocolV2.processPacket` → `sendAck`). O app processava os pacotes mas nunca enviava ACK, então a pulseira assumia perda e retransmitia o handshake inteiro (sub=26/sub=27) indefinidamente — mesmo após auth e envio do init. Adicionado `BandManager.sendAck(seqNum:)`, chamado para cada frame DATA recebida.
+- **Primeiro emparelhamento: HMAC da pulseira falhava e travava em `.error`**: No primeiro pareamento a banda envia `sub=16` e o primeiro watch nonce produz um HMAC que não bate; só uma reconexão limpa gera um handshake verificável. Antes o app ia para `.error` permanente (só recuperava se a própria banda derrubasse o link). Agora `retryAuthAfterReconnect()` derruba e reconecta automaticamente (até `maxAuthRetries=4`) ao detectar HMAC inválido, replicando o caminho que comprovadamente autentica. `didDisconnectPeripheral` honra o flag `retryAuthOnDisconnect` para reconectar mesmo em desconexão "limpa".
+- **Logs de diagnóstico de autenticação**: dump hex de cada pacote do canal auth por subtype, nonces (phone/watch) e comparação HMAC banda-vs-app, e tentativa de extrair watch nonce de pacotes `sub=16`. Nonces/HMACs são logados (não são segredos); o AuthKey e as chaves de sessão nunca são logados.
+- **Pós-autenticação: pulseira re-disparava auth a cada ~6 s (loop "Duplicate auth response")**: Após `CMD_AUTH` bem-sucedido, o app só enviava `setCurrentTime`. O GadgetBridge (`XiaomiSupport.onAuthSuccess`) envia `setCurrentTime` **+** `SystemService.initialize()` — começando por `CMD_DEVICE_INFO` (type=2, sub=2), `CMD_DEVICE_STATE_GET` (sub=78) e `CMD_BATTERY` (sub=1). Sem esse handshake de inicialização a banda considera a sessão incompleta e reenvia a confirmação de auth indefinidamente. Adicionado `BandManager.sendPostAuthInit()` e `XiaomiProto.systemCommand(subtype:)` + enum `XiaomiSystemCmd`.
+- **`BandManager.centralManager(_:didDiscover:)` — auto-connect bloqueado por state restoration**: Quando `willRestoreState` populava `self.peripheral` antes do scan iniciar, o guard `if self.peripheral == nil` impedia que `connect(to:)` fosse chamado ao redescobrir a pulseira. O log parava em "Discovered: Xiaomi Smart Band 10 …" sem nenhuma tentativa de conexão. Corrigido: agora conecta se `self.peripheral == nil` OU se o periférico descoberto tem o mesmo `identifier` do peripheral já conhecido.
+
+- **`authDeviceInfo` — device_type corrigido para iOS (1)**: O campo `unknown1` era `0` (ANDROID). Confirmado via análise do AstroBox-NG (`DeviceType::Ios = 1` para conexões BLE em iOS). Alterado para `1`.
+- **`authDeviceInfo` — app_capability corrigido para `0xFFFF_FFFF`**: O campo `unknown3` era `224`. AstroBox envia `0xFFFFFFFF` (todos os bits = todas as capacidades habilitadas).
+
 ### Fixed
 
 - `Info.plist` manual criado em `$(SRCROOT)/Info.plist` (fora da pasta sincronizada). `GENERATE_INFOPLIST_FILE = NO` no pbxproj. Corrige crash em device físico: `INFOPLIST_KEY_UIBackgroundModes` gerava `<string>` no plist gerado, mas `CBCentralManager` exige `UIBackgroundModes` como `<array>` — o runtime rejeitava o state restoration com `NSInternalInconsistencyException`.

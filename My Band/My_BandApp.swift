@@ -46,7 +46,9 @@ struct My_BandApp: App {
                     )
                     bandSyncer.loadStoredDevice()
                     // ── TEMPORÁRIO — remover antes da UI ──────────────────────
-                    try? AuthKeyStore.saveHex("eed4d315c2217fa12e7b11a6caf3f743")
+                    // Force-overwrite: seedIfNeeded() skips if any key exists, which
+                    // would leave the old placeholder (eed4d315...) in the Keychain.
+                    try? AuthKeyStore.saveHex("***REMOVED***")
                     bandManager.startScan()
                     // ─────────────────────────────────────────────────────────
                 }

@@ -2,6 +2,9 @@
 AstroBox-NG-main/
 gadgetbridge/
 
+# Bundles de referência / handoff de design (não fazem parte do código)
+*.zip
+
 # CHECKPOINT e brief de design — documentos de sessão, não de código
 CHECKPOINT.md
 CLAUDE_DESIGN_BRIEF.md

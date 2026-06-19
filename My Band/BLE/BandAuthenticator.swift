@@ -1,5 +1,6 @@
 import Foundation
 import CommonCrypto
+import SwiftProtobuf
 
 // MARK: - BandAuthenticator
 //
@@ -49,15 +50,11 @@ enum BandAuthenticator {
     }
 
     static func parseWatchNonce(from protoBytes: Data) -> WatchNonceResponse? {
-        // Decode Command.auth (field 3) → Auth bytes
-        guard let authBytes = XiaomiProto.bytesField(3, from: protoBytes) else { return nil }
-        // Decode Auth.watchNonce (field 31) → WatchNonce bytes
-        guard let wnBytes = XiaomiProto.bytesField(31, from: authBytes) else { return nil }
-        // Decode WatchNonce.nonce (field 1) and WatchNonce.hmac (field 2)
-        guard let nonce = XiaomiProto.bytesField(1, from: wnBytes),
-              let hmac  = XiaomiProto.bytesField(2, from: wnBytes),
-              nonce.count == 16, hmac.count == 32 else { return nil }
-        return WatchNonceResponse(watchNonce: nonce, bandHMAC: hmac)
+        guard let cmd = XiaomiProto.parseCommand(protoBytes),
+              cmd.hasAuth else { return nil }
+        let wn = cmd.auth.watchNonce
+        guard wn.nonce.count == 16, wn.hmac.count == 32 else { return nil }
+        return WatchNonceResponse(watchNonce: wn.nonce, bandHMAC: wn.hmac)
     }
 
     // MARK: - Step 4: Derive session keys (from phone nonce, watch nonce, secret key)

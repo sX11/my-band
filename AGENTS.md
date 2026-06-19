@@ -36,9 +36,12 @@ Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 - Nunca reconectar em loop infinito — usar backoff exponencial com máximo de 5 tentativas
 - UUIDs de características GATT ficam apenas em `MiBandUUID.swift` — não hardcodar strings em outros arquivos
 - Protocolo V2: `XiaomiSppPacketV2`, serviço `FE95`, TX `005E`, RX `005F`. UUIDs legados FEE0/FEE1 e `0x0009` são para Mi Band 5/6 — não usar.
-- Primitivas criptográficas ficam em `BLE/Crypto/XiaomiCrypto.swift`; encoding protobuf em `BLE/Protocol/XiaomiProto.swift`
+- Primitivas criptográficas ficam em `BLE/Crypto/XiaomiCrypto.swift`; builders/parsers protobuf em `BLE/Protocol/XiaomiProto.swift` (camada fina sobre os tipos gerados em `xiaomi.pb.swift` via SwiftProtobuf)
 - `startScan()` pode ser chamado antes do BT estar pronto — o flag `pendingScan` em `BandManager` lida com isso; não remover essa lógica
-- Testes de BLE requerem iPhone físico — o Simulator e o Mac não conectam com a Mi Band
+- **ACK obrigatório**: o SPP V2 é um transporte confiável com janela. **Toda frame DATA recebida precisa ser confirmada** com `sendAck(seqNum:)` usando o `seqNum` recebido. Sem isso a pulseira retransmite o handshake inteiro a cada ~6 s. Não remover.
+- **Init pós-auth**: após `Authentication successful`, enviar `sendPostAuthInit()` (setCurrentTime + device info/state/battery). Sem isso a pulseira considera a sessão incompleta e re-dispara auth.
+- **Retry de primeiro pareamento**: no primeiro pareamento o primeiro watch-nonce sempre falha o HMAC; só uma reconexão limpa autentica. `retryAuthAfterReconnect()` trata isso (limite `maxAuthRetries`). Não trocar por `failAuth` direto.
+- Testes de BLE requerem iPhone físico — o Simulator e o Mac não conectam com a Mi Band. **Autenticação confirmada em hardware real (Mi Band 10) em 2026-06-19.**
 
 ### Auth / Keychain (`Auth/`)
 
@@ -69,10 +72,14 @@ Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 
 ### UI (`UI/`)
 
+- **Design system**: a UI segue o handoff do Claude Design (`My Band — Design System`). Antes de criar telas, ler o README do bundle e os tokens (`tokens/colors.css`, `typography.css`, `spacing.css`) e os componentes em `components/`. Recriar fielmente em SwiftUI — não copiar a estrutura HTML, e sim o resultado visual.
+- **Dark-mode first**, paleta midnight (`#0A0B10` base, cards `#14161F`), um único accent Aurora indigo `#7C7FFF`. Cores de saúde espelham o Apple Health; rampa de fases de sono dusk→deep-night.
+- Copy em **pt-BR**, sentence case, sem emoji; números são heróis (tabular). Status sempre por cor + SF Symbol (nunca cor sozinha).
 - SwiftUI puro — sem UIKit direto exceto onde absolutamente necessário (ex: `UIApplication` para background tasks)
 - Suporte a macOS via `#if os(macOS)` / `#if os(iOS)` quando comportamentos divergem
 - Não criar telas separadas para Mac e iPhone — usar `NavigationSplitView` para adaptar layout
 - Dados de sono são a funcionalidade prioritária — dashboard deve exibi-los em destaque
+- Status de conexão e frescor do sync são first-class — presentes em toda tela, nunca enterrados
 
 ### Models (`Models/`)
 
@@ -86,7 +93,7 @@ Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 
 - **Não usar Combine** — projeto usa async/await e @Observable exclusivamente
 - **Não usar UserDefaults para dados sensíveis** — apenas Keychain
-- **Não adicionar dependências externas (SPM)** sem discutir — o projeto intenciona ter zero dependências externas para simplicidade e auditabilidade
+- **Não adicionar dependências externas (SPM)** sem discutir. Dependências aprovadas até agora: **SwiftProtobuf** (`apple/swift-protobuf`, usado para os tipos gerados em `xiaomi.pb.swift`). Qualquer nova precisa de justificativa e aprovação.
 - **Não criar arquivos de documentação ad-hoc** (NOTES, TODO solto) — usar comentários inline só quando WHY não é óbvio
 - **Sempre atualizar `CHANGELOG.md`** ao adicionar, alterar ou corrigir qualquer coisa notável. Entradas vão em `## [Unreleased]` nas categorias `Added / Changed / Deprecated / Removed / Fixed / Security` conforme [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Não registrar refatorações internas triviais, apenas mudanças que um futuro leitor do histórico precisaria saber.
 - **Não mockar CBCentralManager em testes** — testar apenas camadas de parsing independentes de BLE
@@ -123,14 +130,14 @@ A Mi Band 10 suporta mini apps via protocolo proprietário ainda em processo de 
 ## Fluxo de Desenvolvimento Recomendado
 
 - [x] **Camada BLE V2** — `MiBandUUID` (FE95/005E/005F), `BandProtocol` (XiaomiSppPacketV2 + CRC-16/ARC), `BandAuthenticator` (HMAC-SHA256), `BandScanner`, `BandManager`, `AuthKeyStore` — compilando em 2026-06-07
-- [x] **Crypto + Proto** — `XiaomiCrypto` (HMAC-SHA256, HKDF, AES-CTR via CommonCrypto) e `XiaomiProto` (protobuf mínimo, zero dependências SPM) — compilando em 2026-06-07
-- [x] **Persistência base** — `BandDevice`, `SleepSession`, `ActivityDay` SwiftData; `BandSyncer` com `DataChannelReceiver`; `SleepPacketParser` (2-byte entries V2)
+- [x] **Crypto + Proto** — `XiaomiCrypto` (HMAC-SHA256, HKDF, AES-CTR/CCM via CommonCrypto) e `XiaomiProto` (migrado para SwiftProtobuf + `xiaomi.pb.swift` gerado do GadgetBridge)
+- [x] **Persistência base** — `BandDevice`, `SleepSession`, `ActivityDay` SwiftData; `BandSyncer`; `SleepPacketParser` (2-byte entries V2)
 - [x] **Info.plist manual** — corrige crash `NSInternalInconsistencyException` do CBCentralManager (UIBackgroundModes como `<array>`)
-- [ ] **Teste em hardware real** → pendente cabo USB; verificar fluxo de auth, CMD_AUTH payload, e sinal de fim de stream de sono
-- [ ] **UI: tela de configuração AuthKey + status de conexão** → `ManualAuthKeyView` + status BLE em `UI/Setup/` e `UI/Dashboard/` — **via Claude Design com dados reais**
+- [x] **Teste em hardware real (2026-06-19)** — auth completa na Mi Band 10: handshake HMAC-SHA256, retry de primeiro pareamento, ACK de transporte, init pós-auth, comunicação cifrada estável. AuthKey validado.
+- [ ] **UI: Setup (AuthKey) + Dashboard + Sleep + Settings** → recriar o handoff do Claude Design em SwiftUI (`UI/`) — **próxima fase, em andamento**
+- [ ] **Parsers de device info / bateria** → `Proto command type=2` ainda só logados; parsear para alimentar o Dashboard
 - [ ] **HealthKit** → `HealthKitManager` + `HealthSyncService` + deduplicação
 - [ ] **Home Assistant** → `HAClient` + `HATriggers` + configuração em Settings
 - [ ] **App Intents** → `GetSleepDataIntent` + `SyncBandIntent` + `BandShortcuts`
-- [ ] **Dashboard UI completo** → Visualização de sono, HR, atividade — **via Claude Design**
 - [ ] **AuthKey via Xiaomi Cloud** → `XiaomiCloudAuth` (fluxo alternativo ao manual)
 - [ ] **Mini App** → (fase futura, aguardar definição de protocolo)
