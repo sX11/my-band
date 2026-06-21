@@ -6,12 +6,12 @@ import Foundation
 
 struct ActivityMinuteSample {
     let date: Date
-    var steps: Int?
-    var caloriesKcal: Int?
-    var distanceMeters: Double?
-    var heartRate: Int?
-    var spo2: Int?
-    var stress: Int?
+    var steps: Int? = nil
+    var caloriesKcal: Int? = nil
+    var distanceMeters: Double? = nil
+    var heartRate: Int? = nil
+    var spo2: Int? = nil
+    var stress: Int? = nil
 }
 
 // MARK: - XiaomiBitGroupReader

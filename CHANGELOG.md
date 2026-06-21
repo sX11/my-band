@@ -9,8 +9,22 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Crash na autorização do HealthKit** (`NSInvalidArgumentException: Authorization to share the following types is disallowed: HKCategoryTypeIdentifierAppleStandHour`): `.appleStandHour` é um tipo reservado, calculado pelo sistema (Apple Watch), e não pode constar em `requestAuthorization(toShare:)` de apps de terceiros. Removido do conjunto de tipos e da escrita em `writeDailySummary`. A máscara de horas em pé da pulseira permanece apenas local (não há tipo "stand hour" gravável por terceiros no HealthKit).
+
 ### Added
 
+- **Parsers de medições manuais e treinos** (`BLE/PacketParser/`) — três ports do GadgetBridge cobrindo dados que antes eram totalmente descartados:
+  - `ManualSamplesParser` (`ACTIVITY_MANUAL_SAMPLES`, v2): medições pontuais sob demanda — FC (`0x11`), SpO₂ (`0x12`), estresse (`0x13`) e **temperatura corporal** (`0x44`, centi-°C).
+  - `WorkoutSummaryParser` + builder posicional (`XiaomiSimpleActivityParser`): resumos de treino para todas as modalidades da Mi Band 10 (corrida, caminhada, esteira, ciclismo indoor/outdoor, livre, natação, HIIT, elíptico, remo, pular corda), com blueprint por (subtype, versão). Extrai duração, calorias, distância, passos, FC méd/máx/mín, zonas de FC, VO₂máx, braçadas/estilo de natação, voltas e saltos.
+  - `WorkoutGpsParser`: trilha GPS de treinos (V1/V2) → série lat/lon/hdop/velocidade.
+- **Escrita de treinos e novos tipos no Apple Health** (`Health/HealthKitManager.swift`):
+  - `writeWorkouts` cria `HKWorkout` via `HKWorkoutBuilder` (mapeando modalidade → `HKWorkoutActivityType`, piscina/águas abertas → `swimmingLocationType`), com totais de energia/distância (`distanceCycling`/`distanceSwimming`/`distanceWalkingRunning`), braçadas (`swimmingStrokeCount`), VO₂máx (`vo2Max`) e **rota GPS** via `HKWorkoutRouteBuilder`.
+  - `writeManualSamples` grava temperatura corporal (`bodyTemperature`), FC e SpO₂ pontuais.
+  - Frequência cardíaca **de repouso** (`restingHeartRate`) do resumo diário, que era parseada mas nunca gravada.
+  - Novos tipos adicionados à autorização do HealthKit e à descrição em `Info.plist`.
+- **`XiaomiActivityFileMeta`** — helpers de roteamento `isManualSamples`, `isWorkoutSummary`, `isWorkoutGps`; `BandSyncer.syncToHealth()` agora roteia esses arquivos para os novos parsers/escritas (com contadores `manualSamples`/`workouts` no `HealthSyncOutcome`).
 - **Sincronização com Apple Health** (`Health/HealthKitManager.swift`) — autorização + escrita de sono (`sleepAnalysis`), passos, calorias ativas, distância, frequência cardíaca e SpO₂. Deduplicação via `HKMetadataKeySyncIdentifier`/`SyncVersion` (re-sync substitui em vez de duplicar). Capability HealthKit + `NSHealth{Update,Share}UsageDescription` adicionados.
 - **Parsers de atividade** (`BLE/PacketParser/`) — `DailySummaryParser` (totais do dia: passos, calorias, HR máx/mín/médio, SpO₂ máx/mín, ports do GadgetBridge v3/v5), `DailyDetailsParser` + `XiaomiBitGroupReader` (séries por minuto de HR/SpO₂/distância via parser de grupos de bits) e `XiaomiActivityFileMeta` (parsing do id de 7 bytes: versão/subtipo/detailType).
 - **`BandSyncer.syncToHealth()`** — busca os arquivos de atividade do dia, roteia por tipo (sono/summary/details) → SwiftData + HealthKit, faz ACK de cada arquivo e atualiza `lastHealthSyncDate`.
@@ -33,8 +47,21 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`BandManager.handleProtoCommand`** — roteamento de tipo/subtipo migrado de `XiaomiProto.uint32Field` para `Xiaomi_Command.type` / `.subtype`.
 - **`BandSyncer.extractFileIds`** — parsing de IDs de arquivo migrado de `bytesField(10/7, from:)` para `cmd.health.activityRequestFileIds`.
 
+### Added
+
+- **Reconexão direta por identificador (`BandManager.reconnectToKnownDevice`)**: no relaunch, em vez de escanear do zero, o app recupera o periférico conhecido via `retrievePeripherals(withIdentifiers:)` e emite um `connect()` sem timeout (o iOS reconecta sozinho assim que a pulseira entra no alcance). `RootView` usa um `@Query` de `BandDevice` para obter o identificador de forma determinística no bootstrap, com fallback para scan quando não há periférico conhecido. Combinado com a state restoration já existente, minimiza a reconexão manual entre execuções.
+- ~~**Sincronização de horas em pé (Stand) com o Apple Health**~~ — **revertido** (ver _Fixed_): `HKCategoryType(.appleStandHour)` é reservado e não pode ser compartilhado por apps de terceiros.
+
+### Changed
+
+- **Sync busca o histórico completo, não só o dia atual (`BandSyncer.fetchFileIds`)**: o fluxo agora encadeia `CMD_ACTIVITY_FETCH_TODAY` → `CMD_ACTIVITY_FETCH_PAST` (subtype 2) e mescla as duas listas de file IDs, espelhando o `XiaomiHealthService.handleActivityFetchResponse` do GadgetBridge. Antes só `FETCH_TODAY` era enviado, então noites anteriores (registros "past") nunca eram oferecidas pela pulseira. `FETCH_PAST` é best-effort (resposta vazia ou timeout não aborta o sync). Novos builders `XiaomiProto.fetchTodayCommand`/`fetchPastCommand`.
+- **Escrita no HealthKit desacoplada da deduplicação do SwiftData (`BandSyncer.syncToHealth`)**: as sessões de sono agora são sempre (re)gravadas no Apple Health — a deduplicação por `HKMetadataKeySyncIdentifier` torna a operação idempotente, então dados apagados manualmente do app Saúde voltam a aparecer ao ressincronizar. O `persistIfNew` continua evitando registros locais duplicados no SwiftData.
+
 ### Fixed
 
+- **ACK de arquivo de atividade usava o campo proto errado (`BandSyncer.sendAck`)**: `CMD_ACTIVITY_FETCH_ACK` gravava o file ID em `activityRequestFileIds` em vez do campo dedicado `activitySyncAckFileIds` (GadgetBridge `ackRecordedData`). Como o campo de ack ficava vazio, a pulseira não marcava o arquivo como sincronizado — podia reoferecê-lo ou manter no armazenamento. Novo builder `XiaomiProto.ackCommand`.
+- **Estágios de sono não apareciam no Apple Health (`BLE/PacketParser/SleepPacketParser.swift`)**: o parser tinha três bugs de protocolo que impediam a extração dos pacotes de estágio. (1) O magic do pacote de estágio é lido em **little-endian** pelo GadgetBridge (bytes `FB FA FC FF`), mas o parser procurava `FF FC FA FB` — então nunca encontrava os estágios. (2) O timestamp `ts` do pacote é **little-endian**, mas era lido como big-endian. (3) Os bits[11:0] de cada entrada do tipo 17 são a **duração** daquele estágio (acumulada a partir do cursor), não um offset absoluto — o cálculo anterior de duração (`próximo − atual`) produzia fases truncadas/inválidas. Reescrito como port fiel do `SleepDetailsParser.java` (header versionado via `validData`, cursor cumulativo). Agora os estágios `awake`/`core`/`deep`/`rem` populam o Apple Health.
+- **Frequência cardíaca durante o sono ausente na aba "Comparisons" do Apple Health**: o parser de sono descartava a seção de HR/SpO₂ embutida no arquivo de sono (amostras `u8` com `unit`/`count`/`firstRecordTime`). Essas amostras agora são extraídas (`ParsedSleep.heartRates`/`spo2`) e gravadas no HealthKit dentro da janela de sono via `BandSyncer.syncToHealth`, permitindo que o Apple Health correlacione HR/SpO₂ com o sono. `writeSleep` passou a gravar também uma amostra `inBed` envolvente para "tempo na cama".
 - **Reassembly de frames BLE fragmentados (arquivos de atividade grandes)**: `005E` é um *byte stream* — um frame SPP V2 pode exceder o MTU e chegar dividido em várias notificações (ex.: arquivo de daily details de 912 B chegando como 495 + 417). O código tratava 1 notificação = 1 frame, rejeitava as duas metades como "Malformed", nunca dava ACK no `seq`, e a banda retransmitia a cada ~6 s indefinidamente — o daily details nunca era montado (timeout). Adicionado buffer de RX em `BandManager.drainFrames()` que acumula bytes e extrai frames completos pelo `payloadLen` (com resync ao preâmbulo `A5 A5`), espelhando `XiaomiSppProtocolV2.processPacket`. `ActivityFileReceiver` agora completa em `num == total` (semântica do GadgetBridge).
 - **`writeSPP` ignora escritas em peripheral fora do estado `.connected`**: evita `API MISUSE: can only accept commands while in the connected state` quando um ACK é enfileirado logo após o disconnect de retry de auth.
 - **Loop de re-autenticação a cada ~6 s: faltava ACK dos frames DATA**: O SPP V2 é um transporte confiável com janela (TX_WIN/seqNum). Toda frame DATA recebida da pulseira precisa ser confirmada com um `AckPacket` carregando o mesmo `seqNum` (GadgetBridge `XiaomiSppProtocolV2.processPacket` → `sendAck`). O app processava os pacotes mas nunca enviava ACK, então a pulseira assumia perda e retransmitia o handshake inteiro (sub=26/sub=27) indefinidamente — mesmo após auth e envio do init. Adicionado `BandManager.sendAck(seqNum:)`, chamado para cada frame DATA recebida.

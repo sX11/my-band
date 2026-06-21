@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 
 // MARK: - RootView
 //
@@ -11,6 +12,10 @@ struct RootView: View {
 
     @Environment(BandManager.self) private var band
     @Environment(BandSyncer.self) private var syncer
+
+    // Sourced from the model container directly so it's available at bootstrap regardless of
+    // onAppear ordering relative to BandSyncer.loadStoredDevice().
+    @Query(sort: \BandDevice.addedDate, order: .reverse) private var knownDevices: [BandDevice]
 
     private enum Phase { case setup, connecting, ready }
     @State private var phase: Phase = .setup
@@ -42,7 +47,13 @@ struct RootView: View {
             phase = .ready
         } else if AuthKeyStore.isStored {
             phase = .connecting
-            band.startScan()
+            // Reconnect directly to the known peripheral (no scan) when we have one on record;
+            // otherwise fall back to scanning to find it.
+            if let id = knownDevices.first?.peripheralIdentifier {
+                band.reconnectToKnownDevice(identifier: id)
+            } else {
+                band.startScan()
+            }
         } else {
             phase = .setup
         }

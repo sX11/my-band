@@ -2,142 +2,210 @@ import Foundation
 
 // MARK: - SleepDetailsParser
 //
-// Parses the binary sleep file returned by Mi Band 10 (confirmed from GadgetBridge
-// SleepDetailsParser.java and XiaomiActivityFileFetcher.java).
+// Parses the binary sleep file returned by Mi Band 10. Faithful port of GadgetBridge
+// SleepDetailsParser.java (XiaomiActivityFileFetcher → SleepDetailsParser).
 //
-// File layout (received from activity characteristic 0053 after CRC-32 validation):
+// File layout (received from activity characteristic after CRC-32 validation):
 //
 //   [0..6]   XiaomiActivityFileId (7 bytes)
 //   [7]      padding (expect 0x00)
-//   [8]      header bitmask (bit5=hasHR, bit4=hasSpO2, bit3=hasSnore[v3+])
-//   [9]      isAwake (0=sleeping, 1=awake/not finished)
-//   [10..13] bedTime (UInt32 LE, Unix seconds)
-//   [14..17] wakeupTime (UInt32 LE, Unix seconds)
-//   [18]     sleepQuality (if version >= 4)
-//   ... optional HR/SpO2/snore sections (skipped here)
+//   [...]    header bitmask: 1 byte (versions 1–4) or 2 bytes (version 5).
+//            validData(header, i) gates whether optional field `i` is present.
+//   then, in order (each gated/sized by version + header bits):
+//     isAwake (u8), bedTime (u32 LE), wakeupTime (u32 LE),
+//     sleepQuality (v≥4), bedTime2/wakeupTime2 block (v≥5),
+//     Heart-rate section, SpO₂ section, snore section (v≥3),
+//     then interleaved stage packets.
 //
-// After the header sections, stage packets appear interleaved, each preceded by:
-//   MAGIC = 0xfffcfafb (UInt32 BE) → bytes [0xFF, 0xFC, 0xFA, 0xFB]
+// Each section: [unit: u16 LE][count: u16 LE]([firstRecordTime: u32 LE] if v≥2)[samples].
+//   HR/SpO₂ samples are one u8 each; sample i timestamp = firstRecordTime + unit·i (seconds).
+//   Snore samples are 4 bytes each (skipped).
 //
-// Stage packet header (17 bytes total):
-//   [0..3]   magic = 0xfffcfafb
+// Stage packet header (17 bytes):
+//   [0..3]   magic = 0xFFFCFAFB read **little-endian** → on-wire bytes FB FA FC FF
 //   [4]      headerLen (= 17)
-//   [5..12]  ts (Int64, seconds)
+//   [5..12]  ts (Int64 LE, seconds for types 16/17)
 //   [13]     parity
 //   [14]     type
-//   [15..16] dataLen (UInt16 BE: (byte15 << 8) | byte16)
+//   [15..16] dataLen (UInt16 **big-endian**)
+//   [17..]   payload (dataLen bytes, big-endian fields)
 //
-// Known types:
-//   0x10 (16) — Sleep summary:   total/deep/light/rem/wake durations (minutes, UInt16 BE)
-//   0x11 (17) — Sleep stages:    array of UInt16 BE entries
-//                                 bits[15:12] = stage, bits[11:0] = offset_minutes
+// Stage packet types: 16 = summary, 17 = stages. Types 2/3/9/12/13/14/15 are flag-only
+// (no payload). Type 1 (RR intervals) is ignored — HR comes from the header HR section.
 //
-// Stage codes (type 17):
-//   0 → awake
-//   1 → light sleep
-//   2 → deep sleep
-//   3 → REM sleep
-//   4 → not sleeping
+// Type 17 entries are UInt16 BE: bits[15:12] = stage, bits[11:0] = duration_minutes of
+// that stage. The stage starts at the running cursor; the cursor advances by the duration.
+// Stage codes: 0 awake · 1 light · 2 deep · 3 rem · 4 not-sleeping (skipped).
+
+struct ParsedSleep {
+    var sessions: [SleepSession] = []
+    var heartRates: [(date: Date, bpm: Int)] = []
+    var spo2: [(date: Date, pct: Int)] = []
+}
 
 enum SleepDetailsParser {
 
-    private static let stageMagic: [UInt8] = [0xFF, 0xFC, 0xFA, 0xFB]
-    private static let headerLen = 17
+    private static let stagePacketLen = 17
 
     // MARK: - Public API
 
-    /// Parses a complete, CRC-validated activity file into SleepSession objects.
-    static func parse(_ data: Data) -> [SleepSession] {
-        guard data.count >= 18 else { return [] }
+    /// Parses a complete, CRC-validated sleep file. `meta.version` selects the header layout.
+    static func parse(_ data: Data, meta: XiaomiActivityFileMeta) -> ParsedSleep {
+        var result = ParsedSleep()
+        guard data.count > 4 else { return result }
 
-        // Extract bedTime and wakeupTime from fixed header offsets
-        let bedTime    = data.readUInt32LE(at: 10)
-        let wakeupTime = data.readUInt32LE(at: 14)
-        guard bedTime > 0, wakeupTime > bedTime else { return [] }
+        let version = meta.version
+        let headerSize = version == 5 ? 2 : 1
 
+        // Strip trailing CRC-32 before parsing fixed-length sections.
+        let r = LEReader(Data(data.dropLast(4)))
+        r.skip(7)                              // fileId
+        _ = r.u8()                             // padding (expected 0)
+
+        var header = [UInt8]()
+        for _ in 0 ..< headerSize { header.append(r.u8()) }
+
+        var headerIdx = 0
+        _ = r.u8(); headerIdx += 1             // isAwake
+        let bedTime = Int(r.i32()); headerIdx += 1
+        let wakeupTime = Int(r.i32()); headerIdx += 1
+
+        if version >= 4 {
+            if validData(header, headerIdx) { _ = r.u8() }   // sleepQuality
+            headerIdx += 1
+        }
+        if version >= 5 {
+            r.skip(9)
+            _ = r.i32()                        // bedTime2
+            _ = r.i32()                        // wakeupTime2
+            headerIdx += 5
+        }
+
+        // Heart-rate samples recorded during sleep — the data Apple Health's sleep
+        // "Comparisons" tab correlates against the sleep window.
+        if validData(header, headerIdx) {
+            result.heartRates = readSamples(r, version: version, bedTime: bedTime, range: 30...250)
+                .map { (date: $0.0, bpm: $0.1) }
+        }
+        headerIdx += 1
+
+        // SpO₂ samples during sleep.
+        if validData(header, headerIdx) {
+            result.spo2 = readSamples(r, version: version, bedTime: bedTime, range: 50...100)
+                .map { (date: $0.0, pct: $0.1) }
+        }
+        headerIdx += 1
+
+        // Snore section (v≥3) — 4 bytes/sample, skipped.
+        if version >= 3 {
+            if validData(header, headerIdx) {
+                _ = r.u16()                    // unit
+                let count = Int(r.u16())
+                if count > 0 {
+                    if version >= 2 { _ = r.i32() }
+                    r.skip(count * 4)
+                }
+            }
+            headerIdx += 1
+        }
+
+        // Stage packets.
+        guard bedTime > 0, wakeupTime > bedTime else { return result }
         let sessionStart = Date(timeIntervalSince1970: TimeInterval(bedTime))
         let sessionEnd   = Date(timeIntervalSince1970: TimeInterval(wakeupTime))
 
-        // Scan for stage packets
         var stages: [SleepPhase] = []
         var summaryMinutes: (deep: Int, light: Int, rem: Int, wake: Int)?
 
-        var i = 18  // start after fixed header (conservative; real start depends on header bitmask)
-        while i <= data.count - headerLen {
-            guard let magic = findMagic(in: data, from: i) else { break }
-            i = magic
+        while r.remaining >= stagePacketLen {
+            guard scanForStageMagic(r) else { break }   // leaves cursor after the 4 magic bytes
+            guard r.remaining >= 13 else { break }
 
-            let type    = data[i + 14]
-            let dataLen = Int(data[i + 15]) << 8 | Int(data[i + 16])
-            let dataStart = i + headerLen
-            let dataEnd   = dataStart + dataLen
-            guard dataEnd <= data.count else { i += headerLen; continue }
+            _ = r.u8()                          // headerLen (== 17)
+            let ts = r.i64()                    // seconds (LE)
+            _ = r.u8()                          // parity
+            let type = Int(r.u8())
+            let dataLen = (Int(r.u8()) << 8) | Int(r.u8())   // big-endian
 
-            let ts = data.readInt64BE(at: i + 5)  // seconds
+            // Flag-only packets: the dataLen bytes are flags, no payload follows.
+            if [0x2, 0x3, 0x9, 0xC, 0xD, 0xE, 0xF].contains(type) { continue }
+            guard dataLen >= 0, r.remaining >= dataLen else { break }
+            let payload = r.read(dataLen)
 
             switch type {
-            case 0x11:  // Sleep stages
-                let stagePhases = parseSleepStages(
-                    data.subdata(in: dataStart ..< dataEnd),
-                    baseTimestamp: TimeInterval(ts)
-                )
-                stages.append(contentsOf: stagePhases)
-
-            case 0x10:  // Sleep summary
-                summaryMinutes = parseSleepSummary(data.subdata(in: dataStart ..< dataEnd))
-
-            default:
-                break
+            case 16: summaryMinutes = parseSleepSummary(payload)
+            case 17: stages.append(contentsOf: parseSleepStages(payload, base: TimeInterval(ts)))
+            default: break                      // type 1 (RR intervals) etc. — ignored
             }
-
-            i = dataEnd
         }
 
         if !stages.isEmpty {
-            return [SleepSession(startDate: sessionStart, endDate: sessionEnd,
-                                 phases: stages, rawDataHash: hashOf(data))]
-        }
-
-        // Fallback: build from summary if no stage detail available
-        if let summary = summaryMinutes {
-            let phases = buildPhasesFromSummary(
-                start:    sessionStart,
-                deepMin:  summary.deep,
-                lightMin: summary.light,
-                remMin:   summary.rem,
-                wakeMin:  summary.wake
-            )
+            result.sessions = [SleepSession(startDate: sessionStart, endDate: sessionEnd,
+                                            phases: stages, rawDataHash: hashOf(data))]
+        } else if let s = summaryMinutes {
+            let phases = buildPhasesFromSummary(start: sessionStart,
+                                                deepMin: s.deep, lightMin: s.light,
+                                                remMin: s.rem, wakeMin: s.wake)
             if !phases.isEmpty {
-                return [SleepSession(startDate: sessionStart, endDate: sessionEnd,
-                                     phases: phases, rawDataHash: hashOf(data))]
+                result.sessions = [SleepSession(startDate: sessionStart, endDate: sessionEnd,
+                                                phases: phases, rawDataHash: hashOf(data))]
             }
         }
+        return result
+    }
 
-        return []
+    // MARK: - HR / SpO₂ section
+
+    private static func readSamples(_ r: LEReader, version: Int, bedTime: Int,
+                                    range: ClosedRange<Int>) -> [(Date, Int)] {
+        let unit = Int(r.u16())
+        let count = Int(r.u16())
+        guard count > 0 else { return [] }
+        let first = version >= 2 ? Int(r.i32()) : bedTime
+        var out: [(Date, Int)] = []
+        out.reserveCapacity(count)
+        for i in 0 ..< count {
+            let v = Int(r.u8())
+            guard range.contains(v) else { continue }
+            out.append((Date(timeIntervalSince1970: TimeInterval(first + unit * i)), v))
+        }
+        return out
     }
 
     // MARK: - Stage packet magic finder
+    //
+    // Sliding 4-byte search for FB FA FC FF (0xFFFCFAFB little-endian), matching
+    // GadgetBridge readStagePacketHeader. Leaves the cursor just past the magic.
 
-    private static func findMagic(in data: Data, from start: Int) -> Int? {
-        for i in start ... (data.count - stageMagic.count) {
-            if data[i] == 0xFF && data[i+1] == 0xFC && data[i+2] == 0xFA && data[i+3] == 0xFB {
-                return i
-            }
+    private static func scanForStageMagic(_ r: LEReader) -> Bool {
+        var b0: UInt8 = 0, b1: UInt8 = 0, b2: UInt8 = 0, b3: UInt8 = 0
+        var filled = 0
+        while r.remaining > 0 {
+            b0 = b1; b1 = b2; b2 = b3; b3 = r.u8()
+            filled += 1
+            if filled >= 4 && b0 == 0xFB && b1 == 0xFA && b2 == 0xFC && b3 == 0xFF { return true }
         }
-        return nil
+        return false
     }
 
-    // MARK: - Type 0x11: Sleep stages
+    // MARK: - Type 0x11 (17): Sleep stages
 
-    private static func parseSleepStages(_ data: Data, baseTimestamp: TimeInterval) -> [SleepPhase] {
+    private static func parseSleepStages(_ data: Data, base: TimeInterval) -> [SleepPhase] {
         guard data.count >= 2 else { return [] }
         var phases: [SleepPhase] = []
+        var cursor = base
         let count = data.count / 2
 
         for idx in 0 ..< count {
-            let word      = data.readUInt16BE(at: idx * 2)
-            let stageRaw  = UInt8(word >> 12)      // bits [15:12]
-            let offsetMin = Int(word & 0x0FFF)     // bits [11:0]
+            let word        = data.readUInt16BE(at: idx * 2)
+            let stageRaw    = UInt8(word >> 12)        // bits [15:12]
+            let durationMin = Int(word & 0x0FFF)       // bits [11:0]
+
+            let start = Date(timeIntervalSince1970: cursor)
+            cursor += TimeInterval(durationMin * 60)
+            let end = Date(timeIntervalSince1970: cursor)
+
+            guard end > start else { continue }        // zero-length marker
 
             let stage: SleepPhaseType
             switch stageRaw {
@@ -145,31 +213,17 @@ enum SleepDetailsParser {
             case 1: stage = .light
             case 2: stage = .deep
             case 3: stage = .rem
-            default: continue   // 4=notSleep, others — skip
+            default: continue                           // 4 = not sleeping, others
             }
-
-            let phaseStart = Date(timeIntervalSince1970: baseTimestamp + TimeInterval(offsetMin * 60))
-            // Duration = gap to next entry (or 1 minute stub for last)
-            let nextOffsetMin: Int
-            if idx + 1 < count {
-                let nextWord = data.readUInt16BE(at: (idx + 1) * 2)
-                nextOffsetMin = Int(nextWord & 0x0FFF)
-            } else {
-                nextOffsetMin = offsetMin + 1
-            }
-            let durationMin = max(1, nextOffsetMin - offsetMin)
-            let phaseEnd = phaseStart.addingTimeInterval(TimeInterval(durationMin * 60))
-
-            phases.append(SleepPhase(startDate: phaseStart, endDate: phaseEnd, type: stage))
+            phases.append(SleepPhase(startDate: start, endDate: end, type: stage))
         }
         return phases
     }
 
-    // MARK: - Type 0x10: Sleep summary
+    // MARK: - Type 0x10 (16): Sleep summary
     //
-    // Data layout (UInt16 BE each unless noted):
     //   byte[0]:   (sleep_index << 4) | wake_count
-    //   [1..2]:    sleep_duration (minutes)
+    //   [1..2]:    sleep_duration (minutes, UInt16 BE)
     //   [3..4]:    wake_duration
     //   [5..6]:    light_duration
     //   [7..8]:    rem_duration
@@ -185,11 +239,10 @@ enum SleepDetailsParser {
         )
     }
 
-    // MARK: - Fallback: build phases from summary (no detail stages)
+    // MARK: - Fallback: synthesise phases from the summary durations
 
     private static func buildPhasesFromSummary(
-        start: Date,
-        deepMin: Int, lightMin: Int, remMin: Int, wakeMin: Int
+        start: Date, deepMin: Int, lightMin: Int, remMin: Int, wakeMin: Int
     ) -> [SleepPhase] {
         var phases: [SleepPhase] = []
         var cursor = start
@@ -208,7 +261,14 @@ enum SleepDetailsParser {
         return phases
     }
 
-    // MARK: - Dedup hash
+    // MARK: - Helpers
+
+    /// header bit `i`: byte `i/8`, MSB-first within the byte.
+    private static func validData(_ header: [UInt8], _ i: Int) -> Bool {
+        let byteIdx = i / 8
+        guard byteIdx < header.count else { return false }
+        return (header[byteIdx] & (1 << (7 - (i % 8)))) != 0
+    }
 
     private static func hashOf(_ data: Data) -> Int {
         data.prefix(64).reduce(into: 0) { $0 ^= Int($1) }
@@ -220,23 +280,7 @@ enum SleepDetailsParser {
 private extension Data {
     func readUInt16BE(at offset: Int) -> UInt16 {
         guard offset + 1 < count else { return 0 }
-        return (UInt16(self[offset]) << 8) | UInt16(self[offset + 1])
-    }
-
-    func readUInt32LE(at offset: Int) -> UInt32 {
-        guard offset + 3 < count else { return 0 }
-        return UInt32(self[offset])
-             | (UInt32(self[offset + 1]) << 8)
-             | (UInt32(self[offset + 2]) << 16)
-             | (UInt32(self[offset + 3]) << 24)
-    }
-
-    func readInt64BE(at offset: Int) -> Int64 {
-        guard offset + 7 < count else { return 0 }
-        var result: Int64 = 0
-        for i in 0 ..< 8 {
-            result = (result << 8) | Int64(self[offset + i])
-        }
-        return result
+        let base = startIndex + offset
+        return (UInt16(self[base]) << 8) | UInt16(self[base + 1])
     }
 }

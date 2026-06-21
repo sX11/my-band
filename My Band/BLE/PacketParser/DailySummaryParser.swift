@@ -18,6 +18,8 @@ struct DailySummary {
     var spo2Max: (pct: Int, at: Date)?
     var spo2Min: (pct: Int, at: Date)?
     var spo2Avg: Int?
+    /// 24-bit mask: bit `h` set ⇒ the user stood up during hour `h` (00:00–01:00 = bit 0).
+    var standingHours: Int?
 }
 
 enum DailySummaryParser {
@@ -50,7 +52,9 @@ enum DailySummaryParser {
         let stressAvg = r.u8()
         _ = r.u8()                           // stressMax
         _ = r.u8()                           // stressMin
-        r.skip(3)                            // standing bitmask
+        // 24-bit standing-hours mask (1 bit per hour, LSB = 00:00–01:00).
+        let standB0 = Int(r.u8()), standB1 = Int(r.u8()), standB2 = Int(r.u8())
+        let standing = (standB0 | (standB1 << 8) | (standB2 << 16)) & 0x00FF_FFFF
         let calories  = Int(r.i16())
         r.skip(3)                            // unk7..9
         let spo2Max   = r.u8()
@@ -69,6 +73,7 @@ enum DailySummaryParser {
         if spo2Max > 0, spo2MaxTs > 0 { s.spo2Max = (Int(spo2Max), Date(timeIntervalSince1970: TimeInterval(spo2MaxTs))) }
         if spo2Min > 0, spo2MinTs > 0 { s.spo2Min = (Int(spo2Min), Date(timeIntervalSince1970: TimeInterval(spo2MinTs))) }
         s.spo2Avg = spo2Avg > 0 ? Int(spo2Avg) : nil
+        s.standingHours = standing > 0 ? standing : nil
         return s
     }
 }
@@ -102,4 +107,18 @@ final class LEReader {
         return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
     }
     func i32() -> Int32 { Int32(bitPattern: u32()) }
+    func f32() -> Float { Float(bitPattern: u32()) }   // IEEE-754 little-endian
+    func u64() -> UInt64 {
+        let lo = UInt64(u32()), hi = UInt64(u32())
+        return lo | (hi << 32)
+    }
+    func i64() -> Int64 { Int64(bitPattern: u64()) }
+
+    /// Reads `n` bytes (clamped to what remains) and advances the cursor.
+    func read(_ n: Int) -> Data {
+        let start = pos
+        let end = Swift.min(pos + Swift.max(0, n), data.endIndex)
+        pos = end
+        return data.subdata(in: start ..< end)
+    }
 }

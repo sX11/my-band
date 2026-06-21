@@ -20,7 +20,8 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 | ✅ | Reassembly de frames BLE fragmentados (arquivos de atividade > MTU) |
 | ✅ | Leitura de bateria (nível + carregando) |
 | ✅ | UI de Setup (AuthKey + scan/conexão) e Dashboard (bateria, última sync, botão sincronizar) via Claude Design |
-| 🚧 | Envio ao Apple Health (sono, passos, calorias, distância, FC, SpO₂) — implementado, em validação de hardware |
+| 🚧 | Envio ao Apple Health (sono, passos, calorias, distância, FC + FC de repouso, SpO₂, temperatura corporal, VO₂máx) — implementado, em validação de hardware |
+| 🚧 | Treinos no Apple Health (`HKWorkout` + rota GPS, todas as modalidades da Mi Band 10) e medições manuais (FC/SpO₂/temperatura) — implementado, em validação de hardware |
 | 🔜 | Telas SleepDetail (hipnograma) + Settings |
 | 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
 | 🔜 | Integração com Atalhos via App Intents |
@@ -82,7 +83,13 @@ My Band/
 │   │   ├── XiaomiProto.swift     # Builders/parsers (camada fina sobre SwiftProtobuf)
 │   │   └── xiaomi.pb.swift       # Tipos gerados do xiaomi.proto (GadgetBridge)
 │   └── PacketParser/
-│       └── SleepPacketParser.swift  # Parser binário de dados de sono (2-byte entries)
+│       ├── SleepPacketParser.swift     # Sono 0x08 (estágios FB FA FC FF + HR/SpO₂)
+│       ├── DailySummaryParser.swift    # Totais do dia + LEReader compartilhado
+│       ├── DailyDetailsParser.swift    # Série por minuto (HR/SpO₂/distância/estresse)
+│       ├── ManualSamplesParser.swift   # Medições manuais (FC/SpO₂/estresse/temperatura)
+│       ├── WorkoutSummaryParser.swift  # Resumos de treino (blueprint por subtype/versão)
+│       ├── WorkoutGpsParser.swift      # Trilha GPS de treino (V1/V2)
+│       └── XiaomiActivityFile.swift    # Meta do id de 7 bytes + roteamento
 │
 ├── Auth/
 │   └── AuthKeyStore.swift        # Keychain: leitura/escrita/deleção do AuthKey
@@ -92,7 +99,8 @@ My Band/
 │   ├── SleepSession.swift        # Sessão de sono + fases (light/deep/REM/awake)
 │   └── ActivityDay.swift         # Passos, calorias, distância por dia
 │
-├── Health/                       # HealthKit (em desenvolvimento)
+├── Health/
+│   └── HealthKitManager.swift    # Escrita no Apple Health (sono/atividade/treinos/rota)
 ├── HomeAssistant/                # REST API local + Cloudflare tunnel (em desenvolvimento)
 ├── Intents/                      # App Intents + Shortcuts (em desenvolvimento)
 └── UI/                           # SwiftUI (em desenvolvimento)

@@ -36,7 +36,7 @@ My Band/
 │   ├── BandSyncer.swift          # Sincronização de dados históricos (sono, steps, HR)
 │   └── Services/
 │       ├── MiBandUUID.swift      # Constantes de UUID dos serviços GATT
-│       └── PacketParser/         # Parsers por tipo de dado (sono, HR, steps, SpO2)
+│       └── PacketParser/         # Parsers por tipo de dado (sono, diário, manual, treinos+GPS)
 │
 ├── Auth/
 │   ├── AuthKeyStore.swift        # Armazenamento seguro do AuthKey no Keychain
@@ -146,9 +146,25 @@ Payload de um pacote DATA (dentro do payload acima):
 
 | Command | type | subtype | Descrição |
 |---|---|---|---|
-| Fetch sleep | 8 | 2 | Solicita histórico de sono |
+| Fetch today | 8 | 2 | Lista os file-ids de atividade pendentes do dia |
+| Fetch past | 8 | 3 | Lista o backlog de dias ainda não sincronizados |
+| Fetch request | 8 | 3 | Solicita o conteúdo de um file-id (stream em chunks) |
+| Fetch ACK | 8 | 5 | Marca um file-id como sincronizado |
 
-Resposta chega como pacotes no canal ACTIVITY/DATA. Formato de cada entrada de sono: UInt16 BE onde bits[15:12]=stage (0=awake,1=light,2=deep,3=rem) e bits[11:0]=offset_minutes.
+O mesmo mecanismo de file-ids serve **todos** os tipos de dado — cada id de 7 bytes (`XiaomiActivityFileMeta`) declara seu tipo/subtype/detailType, e `BandSyncer.syncToHealth()` roteia para o parser certo:
+
+| Tipo de arquivo | subtype | Parser |
+|---|---|---|
+| Resumo diário | `0x00` SUMMARY | `DailySummaryParser` |
+| Detalhe diário (por minuto) | `0x00` DETAILS | `DailyDetailsParser` |
+| Sono | `0x03` / `0x08` | `SleepDetailsParser` (ver nota) |
+| Medições manuais | `0x06` | `ManualSamplesParser` |
+| Treino (resumo) | SPORTS · SUMMARY | `WorkoutSummaryParser` |
+| Treino (rota GPS) | SPORTS · GPS | `WorkoutGpsParser` |
+
+Sono `0x08`: cada entrada de estágio é UInt16 BE — bits[15:12]=stage (0=awake,1=light,2=deep,3=rem), bits[11:0]=duração_min.
+
+> **Dois formatos de sono.** O GadgetBridge usa `SleepStagesParser` para `0x03` (ACTIVITY_SLEEP_STAGES, layout por **eventos de transição**, códigos de estágio `2=deep,3=light,4=rem,5=awake`) e `SleepDetailsParser` para `0x08` (layout por **duração**). Hoje roteamos ambos para o `SleepDetailsParser`, o que está correto só para `0x08` — um arquivo `0x03` produz sessão vazia silenciosamente. Confirmar em hardware qual subtype a Mi Band 10 emite antes de portar o `SleepStagesParser`.
 
 ### Background BLE no iOS
 
@@ -187,6 +203,15 @@ Resposta chega como pacotes no canal ACTIVITY/DATA. Formato de cada entrada de s
 | SpO2 | `HKQuantityTypeIdentifier.oxygenSaturation` |
 | Calorias ativas | `HKQuantityTypeIdentifier.activeEnergyBurned` |
 | Distância caminhada | `HKQuantityTypeIdentifier.distanceWalkingRunning` |
+| FC de repouso | `HKQuantityTypeIdentifier.restingHeartRate` |
+| Temperatura corporal (medição manual) | `HKQuantityTypeIdentifier.bodyTemperature` |
+| VO₂máx (treino) | `HKQuantityTypeIdentifier.vo2Max` |
+| Distância ciclismo / natação (treino) | `HKQuantityTypeIdentifier.distanceCycling` / `.distanceSwimming` |
+| Braçadas (natação) | `HKQuantityTypeIdentifier.swimmingStrokeCount` |
+| Treino | `HKObjectType.workoutType()` via `HKWorkoutBuilder` (mapeado para `HKWorkoutActivityType`) |
+| Rota de treino (GPS) | `HKSeriesType.workoutRoute()` via `HKWorkoutRouteBuilder` |
+
+> **`appleStandHour` NÃO é gravável.** `HKCategoryTypeIdentifier.appleStandHour` é reservado (o sistema o deriva do Apple Watch). Incluí-lo em `requestAuthorization(toShare:)` lança `NSInvalidArgumentException`. A máscara de horas em pé da pulseira fica só local — não há tipo "stand hour" gravável por apps de terceiros.
 
 ### Permissões (Info.plist)
 ```
@@ -321,7 +346,7 @@ O projeto segue [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) e [Sema
 
 Entradas pendentes de release ficam sob `## [Unreleased]`. Ao lançar uma versão, mover para `## [X.Y.Z] - YYYY-MM-DD`.
 
-Versão atual: **0.1.0** (camada BLE completa: auth HMAC-SHA256 validada em hardware, SwiftProtobuf, transporte com ACK, init pós-auth; modelos SwiftData). Próxima fase: UI via Claude Design.
+Versão atual: **0.1.0** (camada BLE completa: auth HMAC-SHA256 validada em hardware, SwiftProtobuf, transporte com ACK, init pós-auth; modelos SwiftData; sincronização com Apple Health cobrindo sono, atividade diária, medições manuais e treinos com rota GPS). Próxima fase: UI (SleepDetail/Settings) e validação em hardware dos parsers de treino/medição manual.
 
 ---
 

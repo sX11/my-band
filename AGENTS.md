@@ -55,6 +55,8 @@ Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 - Implementar deduplicação: consultar amostras existentes no mesmo período antes de inserir
 - Usar `HKQueryAnchor` persistido em SwiftData para sincronizações incrementais (não re-sincronizar tudo a cada vez)
 - Fases de sono: mapear para `HKCategoryValueSleepAnalysis` (.inBed, .asleepCore, .asleepDeep, .asleepREM, .awake)
+- **Nunca** incluir `HKCategoryType(.appleStandHour)` em `requestAuthorization(toShare:)` — é reservado e lança `NSInvalidArgumentException` (apps de terceiros não podem gravá-lo)
+- Treinos: usar `HKWorkoutBuilder` (não o init depreciado de `HKWorkout`); rota GPS via `HKWorkoutRouteBuilder.insertRouteData` + `finishRoute(with:)`
 
 ### Home Assistant (`HomeAssistant/`)
 
@@ -136,6 +138,7 @@ A Mi Band 10 suporta mini apps via protocolo proprietário ainda em processo de 
 - [x] **Teste em hardware real (2026-06-19)** — auth completa na Mi Band 10: handshake HMAC-SHA256, retry de primeiro pareamento, ACK de transporte, init pós-auth, comunicação cifrada estável. AuthKey validado.
 - [x] **UI: design system + Setup (2026-06-19)** — tokens e componentes (`MBButton`/`MBIconButton`/`MBTextField`/`MBStatusPill`), `SetupView` (intro + AuthKey) e `ConnectingView` ligados ao `BandManager` real; `RootView` roteando os estados
 - [x] **HealthKit + Dashboard (2026-06-19)** — `HealthKitManager` (sono/passos/calorias/distância/HR/SpO₂ com dedup), parsers `DailySummary`/`DailyDetails`, `BandSyncer.syncToHealth()`, bateria no `BandManager` e `DashboardView` (bateria + última sync + botão). **Pendente validação em hardware** (formato dos arquivos de atividade, passos cumulativo vs delta).
+- [x] **Parsers de medição manual + treinos (2026-06-19)** — `ManualSamplesParser` (FC/SpO₂/estresse/temperatura), `WorkoutSummaryParser` (+ builder posicional, todas as modalidades) e `WorkoutGpsParser`; `HealthKitManager` grava `HKWorkout`/rota GPS/VO₂máx/temperatura/FC de repouso. Corrigido crash de autorização do `appleStandHour`. **Pendente validação em hardware.**
 - [ ] **UI: SleepDetail + Settings** → próximas telas do handoff do Claude Design
 - [ ] **Parsers de device info / bateria** → `Proto command type=2` ainda só logados; parsear para alimentar o Dashboard
 - [ ] **HealthKit** → `HealthKitManager` + `HealthSyncService` + deduplicação

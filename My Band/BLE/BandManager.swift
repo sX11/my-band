@@ -91,6 +91,9 @@ final class BandManager: NSObject {
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 5
     private var pendingScan = false
+    // Set when reconnectToKnownDevice is called before Bluetooth is powered on; consumed in
+    // centralManagerDidUpdateState once .poweredOn.
+    private var pendingReconnectID: UUID?
 
     // First-time pairing: the band's first watch-nonce HMAC reliably fails; only a fresh
     // reconnect yields a valid handshake. When the HMAC check fails we tear the link down and
@@ -123,6 +126,26 @@ final class BandManager: NSObject {
     }
 
     // MARK: - Public API
+
+    /// Reconnect to a previously-paired peripheral by its CBPeripheral UUID, skipping the scan.
+    /// `connect()` with no timeout means iOS auto-connects as soon as the band is in range —
+    /// far faster and more reliable than scanning. Falls back to a scan if the system can no
+    /// longer retrieve the peripheral (e.g. it was never connected on this device).
+    func reconnectToKnownDevice(identifier: String) {
+        guard let uuid = UUID(uuidString: identifier) else { startScan(); return }
+        guard central.state == .poweredOn else { pendingReconnectID = uuid; return }
+        performReconnect(uuid)
+    }
+
+    private func performReconnect(_ uuid: UUID) {
+        if let target = central.retrievePeripherals(withIdentifiers: [uuid]).first {
+            log.info("Reconnecting directly to known peripheral \(uuid)")
+            connect(to: target)
+        } else {
+            log.info("Known peripheral not retrievable — falling back to scan")
+            startScan()
+        }
+    }
 
     func startScan() {
         guard central.state == .poweredOn else { pendingScan = true; return }
@@ -561,6 +584,7 @@ extension BandManager: CBCentralManagerDelegate {
         switch central.state {
         case .poweredOn:
             log.info("Bluetooth powered on")
+            if let id = pendingReconnectID { pendingReconnectID = nil; performReconnect(id); return }
             if pendingScan { startScan(); return }
             if connectionState == .disconnected, let p = peripheral { connect(to: p) }
         case .poweredOff:

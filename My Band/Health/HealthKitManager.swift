@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import CoreLocation
 import OSLog
 
 // MARK: - HealthKitManager
@@ -27,9 +28,19 @@ final class HealthKitManager {
     private let distance    = HKQuantityType(.distanceWalkingRunning)
     private let activeEnergy = HKQuantityType(.activeEnergyBurned)
     private let spo2        = HKQuantityType(.oxygenSaturation)
+    private let bodyTemp    = HKQuantityType(.bodyTemperature)
+    private let restingHR   = HKQuantityType(.restingHeartRate)
+    private let vo2Max      = HKQuantityType(.vo2Max)
+    private let distanceCycling  = HKQuantityType(.distanceCycling)
+    private let distanceSwimming = HKQuantityType(.distanceSwimming)
+    private let swimStrokes      = HKQuantityType(.swimmingStrokeCount)
+    private let workoutType      = HKObjectType.workoutType()
+    private let routeType        = HKSeriesType.workoutRoute()
 
     private var shareTypes: Set<HKSampleType> {
-        [sleepType, heartRate, stepCount, distance, activeEnergy, spo2]
+        [sleepType, heartRate, stepCount, distance, activeEnergy, spo2,
+         bodyTemp, restingHR, vo2Max, distanceCycling, distanceSwimming, swimStrokes,
+         workoutType, routeType]
     }
 
     // MARK: - Authorization
@@ -44,8 +55,16 @@ final class HealthKitManager {
     func writeSleep(_ sessions: [SleepSession]) async throws -> Int {
         var samples: [HKSample] = []
         for session in sessions {
+            guard session.endDate > session.startDate else { continue }
+            // Enclosing in-bed window so Apple Health reports "Time in Bed" alongside the stages.
+            let inBedId = "mb-inbed-\(Int(session.startDate.timeIntervalSince1970))-\(Int(session.endDate.timeIntervalSince1970))"
+            samples.append(HKCategorySample(
+                type: sleepType, value: HKCategoryValueSleepAnalysis.inBed.rawValue,
+                start: session.startDate, end: session.endDate,
+                metadata: syncMetadata(inBedId)
+            ))
             for phase in session.phases {
-                guard let value = Self.sleepValue(phase.type) else { continue }
+                guard phase.endDate > phase.startDate, let value = Self.sleepValue(phase.type) else { continue }
                 let id = "mb-sleep-\(Int(phase.startDate.timeIntervalSince1970))-\(Int(phase.endDate.timeIntervalSince1970))-\(phase.type.rawValue)"
                 samples.append(HKCategorySample(
                     type: sleepType, value: value.rawValue,
@@ -83,6 +102,10 @@ final class HealthKitManager {
                                     start: dayStart, end: dayEnd, id: "mb-cal-day-\(dayKey)"))
         }
         let bpm = HKUnit.count().unitDivided(by: .minute())
+        if let resting = s.restingHR {
+            samples.append(quantity(restingHR, bpm, Double(resting),
+                                    start: dayStart, end: dayEnd, id: "mb-hrresting-\(dayKey)"))
+        }
         if let max = s.maxHR {
             samples.append(quantity(heartRate, bpm, Double(max.bpm), start: max.at, end: max.at, id: "mb-hrmax-\(Int(max.at.timeIntervalSince1970))"))
         }
@@ -95,6 +118,10 @@ final class HealthKitManager {
         if let mn = s.spo2Min {
             samples.append(quantity(spo2, .percent(), Double(mn.pct) / 100.0, start: mn.at, end: mn.at, id: "mb-spo2min-\(Int(mn.at.timeIntervalSince1970))"))
         }
+        // NOTE: standingHours (DailySummary) is intentionally NOT written. HKCategoryType
+        // .appleStandHour is reserved — HealthKit disallows third-party apps from sharing it
+        // (requesting authorization throws NSInvalidArgumentException). There is no
+        // third-party-writable "stand hour" type, so the band's mask stays local-only.
         return try await save(samples)
     }
 
@@ -117,6 +144,152 @@ final class HealthKitManager {
             }
         }
         return try await save(samples)
+    }
+
+    // MARK: - Manual (on-demand) measurements
+
+    func writeManualSamples(_ manual: [ManualSample]) async throws -> Int {
+        let bpm = HKUnit.count().unitDivided(by: .minute())
+        var samples: [HKSample] = []
+        for m in manual {
+            let key = Int(m.date.timeIntervalSince1970)
+            switch m.kind {
+            case .heartRate where (30...250).contains(m.value):
+                samples.append(quantity(heartRate, bpm, m.value, start: m.date, end: m.date, id: "mb-mhr-\(key)"))
+            case .spo2 where (50...100).contains(m.value):
+                samples.append(quantity(spo2, .percent(), m.value / 100.0, start: m.date, end: m.date, id: "mb-mspo2-\(key)"))
+            case .temperature where (30...45).contains(m.value):
+                samples.append(quantity(bodyTemp, .degreeCelsius(), m.value, start: m.date, end: m.date, id: "mb-mtemp-\(key)"))
+            default:
+                continue   // stress (no Apple Health type) or out-of-range reading
+            }
+        }
+        return try await save(samples)
+    }
+
+    // MARK: - Workouts
+    //
+    // Each workout becomes an HKWorkout via HKWorkoutBuilder. Energy/distance/stroke totals
+    // are added as samples so Apple Health computes the summary; VO₂max is written as its own
+    // sample timestamped at the workout end. A GPS track, when present, becomes an
+    // HKWorkoutRoute attached to the finished workout. HKMetadataKeySyncIdentifier makes
+    // re-syncing idempotent.
+
+    func writeWorkouts(_ workouts: [WorkoutSummary],
+                       routes: [Int: [WorkoutTrackPoint]]) async throws -> Int {
+        var written = 0
+
+        for w in workouts {
+            guard w.endDate > w.startDate else { continue }
+            let key = Int(w.startDate.timeIntervalSince1970)
+
+            let config = HKWorkoutConfiguration()
+            config.activityType = Self.activityType(w.kind)
+            if let loc = Self.swimmingLocation(w.kind) { config.swimmingLocationType = loc }
+
+            let builder = HKWorkoutBuilder(healthStore: store, configuration: config, device: .local())
+            try await builder.beginCollection(at: w.startDate)
+
+            var samples: [HKSample] = []
+            if let kcal = w.caloriesKcal {
+                samples.append(quantity(activeEnergy, .kilocalorie(), kcal,
+                                        start: w.startDate, end: w.endDate, id: "mb-wkcal-\(key)"))
+            }
+            if let dist = w.distanceMeters {
+                samples.append(quantity(Self.distanceType(w.kind, distance, distanceCycling, distanceSwimming),
+                                        .meter(), dist, start: w.startDate, end: w.endDate, id: "mb-wdist-\(key)"))
+            }
+            if let strokes = w.strokes, Self.activityType(w.kind) == .swimming {
+                samples.append(quantity(swimStrokes, .count(), strokes,
+                                        start: w.startDate, end: w.endDate, id: "mb-wstrokes-\(key)"))
+            }
+            if !samples.isEmpty {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    builder.add(samples) { _, error in
+                        if let error { cont.resume(throwing: error) } else { cont.resume() }
+                    }
+                }
+            }
+
+            var metadata: [String: Any] = [
+                HKMetadataKeySyncIdentifier: "mb-workout-\(key)",
+                HKMetadataKeySyncVersion: syncVersion,
+                HKMetadataKeyIndoorWorkout: Self.swimmingLocation(w.kind) == nil && Self.isIndoor(w.kind),
+            ]
+            if let avg = w.hrAvg { metadata["MiBandAverageHeartRate"] = avg }
+            if let mx = w.hrMax  { metadata["MiBandMaxHeartRate"] = mx }
+            if let mn = w.hrMin  { metadata["MiBandMinHeartRate"] = mn }
+            if let style = w.swimStyle { metadata["MiBandSwimStyle"] = style }
+            try await builder.addMetadata(metadata)
+
+            try await builder.endCollection(at: w.endDate)
+            guard let workout = try await builder.finishWorkout() else { continue }
+            written += 1
+
+            // VO₂max is a standalone sample (not a workout statistic).
+            if let vo2 = w.vo2Max, (10...90).contains(vo2) {
+                let unit = HKUnit.literUnit(with: .milli)
+                    .unitDivided(by: HKUnit.gramUnit(with: .kilo).unitMultiplied(by: .minute()))
+                try await save([quantity(vo2Max, unit, vo2, start: w.endDate, end: w.endDate, id: "mb-vo2-\(key)")])
+            }
+
+            // Attach the GPS route, if this workout had one.
+            if let track = routes[key], track.count >= 2 {
+                let locations = track.map { p in
+                    CLLocation(coordinate: CLLocationCoordinate2D(latitude: p.latitude, longitude: p.longitude),
+                               altitude: 0,
+                               horizontalAccuracy: p.hdop ?? -1,
+                               verticalAccuracy: -1,
+                               timestamp: p.date)
+                }
+                let routeBuilder = HKWorkoutRouteBuilder(healthStore: store, device: .local())
+                try await routeBuilder.insertRouteData(locations)
+                _ = try await routeBuilder.finishRoute(with: workout, metadata: nil)
+            }
+        }
+        return written
+    }
+
+    // MARK: - Workout type mapping
+
+    private static func activityType(_ kind: WorkoutKind) -> HKWorkoutActivityType {
+        switch kind {
+        case .running, .trailRun, .treadmill:        .running
+        case .hiking, .trekking:                     .hiking
+        case .walking:                               .walking
+        case .outdoorCycling, .indoorCycling:        .cycling
+        case .poolSwim, .openWaterSwim:              .swimming
+        case .elliptical:                            .elliptical
+        case .rowing, .rowingMachine:                .rowing
+        case .jumpRoping:                            .jumpRope
+        case .hiit:                                  .highIntensityIntervalTraining
+        case .yoga:                                  .yoga
+        case .freeTraining, .other:                  .other
+        }
+    }
+
+    private static func swimmingLocation(_ kind: WorkoutKind) -> HKWorkoutSwimmingLocationType? {
+        switch kind {
+        case .poolSwim:      .pool
+        case .openWaterSwim: .openWater
+        default:             nil
+        }
+    }
+
+    private static func isIndoor(_ kind: WorkoutKind) -> Bool {
+        switch kind {
+        case .treadmill, .indoorCycling, .elliptical, .rowingMachine, .hiit, .yoga, .freeTraining: true
+        default: false
+        }
+    }
+
+    private static func distanceType(_ kind: WorkoutKind, _ walkRun: HKQuantityType,
+                                     _ cycling: HKQuantityType, _ swimming: HKQuantityType) -> HKQuantityType {
+        switch kind {
+        case .outdoorCycling, .indoorCycling: cycling
+        case .poolSwim, .openWaterSwim:        swimming
+        default:                               walkRun
+        }
     }
 
     // MARK: - Helpers

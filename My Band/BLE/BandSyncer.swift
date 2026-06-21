@@ -181,6 +181,8 @@ final class BandSyncer {
         var sleepSessions = 0
         var dailySummaries = 0
         var minuteSamples = 0
+        var manualSamples = 0
+        var workouts = 0
         var healthSamplesWritten = 0
     }
 
@@ -208,16 +210,42 @@ final class BandSyncer {
 
         var outcome = HealthSyncOutcome()
         var sleepToWrite: [SleepSession] = []
+        var sleepVitals: [ActivityMinuteSample] = []
+        var manualToWrite: [ManualSample] = []
+        var workoutsToWrite: [WorkoutSummary] = []
+        var workoutRoutes: [Int: [WorkoutTrackPoint]] = [:]
 
         for fileId in fileIds {
             guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
             do {
                 let fileData = try await fetchActivityFile(fileId: fileId, manager: manager)
 
-                if meta.isSleep {
-                    for session in SleepDetailsParser.parse(fileData) where persistIfNew(session, context) {
+                if meta.isManualSamples {
+                    let manual = ManualSamplesParser.parse(fileData, meta: meta)
+                    manualToWrite += manual
+                    outcome.manualSamples += manual.count
+                } else if meta.isWorkoutSummary {
+                    if let workout = WorkoutSummaryParser.parse(fileData, meta: meta) {
+                        workoutsToWrite.append(workout)
+                    }
+                } else if meta.isWorkoutGps {
+                    let track = WorkoutGpsParser.parse(fileData, meta: meta)
+                    if !track.isEmpty {
+                        workoutRoutes[Int(meta.timestamp.timeIntervalSince1970)] = track
+                    }
+                } else if meta.isSleep {
+                    let parsed = SleepDetailsParser.parse(fileData, meta: meta)
+                    for session in parsed.sessions {
+                        // Always (re)write to HealthKit — its sync-identifier dedup makes this
+                        // idempotent, so data deleted from Apple Health is restored on re-sync.
+                        // SwiftData insertion is still gated to avoid duplicate local records.
+                        _ = persistIfNew(session, context)
                         sleepToWrite.append(session)
                     }
+                    // HR/SpO₂ recorded during sleep — written within the sleep window so
+                    // Apple Health's sleep "Comparisons" tab can correlate them.
+                    sleepVitals += parsed.heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
+                    sleepVitals += parsed.spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) }
                 } else if meta.isDailySummary {
                     if let summary = DailySummaryParser.parse(fileData, meta: meta) {
                         outcome.dailySummaries += 1
@@ -239,6 +267,17 @@ final class BandSyncer {
         if !sleepToWrite.isEmpty {
             outcome.sleepSessions = sleepToWrite.count
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite)
+        }
+        if !sleepVitals.isEmpty {
+            outcome.minuteSamples += sleepVitals.count
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(sleepVitals)
+        }
+        if !manualToWrite.isEmpty {
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeManualSamples(manualToWrite)
+        }
+        if !workoutsToWrite.isEmpty {
+            outcome.workouts = workoutsToWrite.count
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes)
         }
 
         try? context.save()
@@ -297,10 +336,11 @@ final class BandSyncer {
         var inserted: [SleepSession] = []
         for fileId in fileIds where XiaomiActivityFileId.isSleepFile(fileId) {
             log.debug("Fetching sleep file: \(fileId.hexString)")
+            guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
 
             do {
                 let fileData = try await fetchActivityFile(fileId: fileId, manager: manager)
-                let sessions = SleepDetailsParser.parse(fileData)
+                let sessions = SleepDetailsParser.parse(fileData, meta: meta).sessions
                 log.info("Parsed \(sessions.count) session(s) from file")
 
                 for session in sessions {
@@ -331,14 +371,45 @@ final class BandSyncer {
     }
 
     // MARK: - Private: request file IDs
+    //
+    // Full sync mirrors GadgetBridge: first FETCH_TODAY (today's pending records), then
+    // FETCH_PAST (the backlog of older days not yet synced). Both lists are merged so the
+    // app reprocesses every record the band still holds — not just the current day.
 
     private func fetchFileIds(manager: BandManager) async throws -> [Data] {
-        let proto = XiaomiProto.healthCommand(subtype: XiaomiHealthCmd.fetchToday)
+        var all: [Data] = []
+        var seen = Set<Data>()
+        func merge(_ ids: [Data]) {
+            for id in ids where !seen.contains(id) { seen.insert(id); all.append(id) }
+        }
 
-        return try await withThrowingTaskGroup(of: [Data].self) { group in
+        let today = try await requestFileIds(subtype: XiaomiHealthCmd.fetchToday,
+                                             proto: XiaomiProto.fetchTodayCommand(),
+                                             manager: manager)
+        log.info("FETCH_TODAY → \(today.count) file ID(s)")
+        merge(today)
+
+        // The backlog is best-effort: an empty response or timeout shouldn't abort the sync.
+        do {
+            let past = try await requestFileIds(subtype: XiaomiHealthCmd.fetchPast,
+                                                proto: XiaomiProto.fetchPastCommand(),
+                                                manager: manager)
+            log.info("FETCH_PAST → \(past.count) file ID(s)")
+            merge(past)
+        } catch {
+            log.warning("FETCH_PAST failed (\(error.localizedDescription)) — using today's files only")
+        }
+
+        return all
+    }
+
+    /// Sends one fetch command and waits for the matching Command response (same type+subtype),
+    /// returning its file IDs. An empty list is a valid response and completes the wait.
+    private func requestFileIds(subtype: UInt32, proto: Data, manager: BandManager) async throws -> [Data] {
+        try await withThrowingTaskGroup(of: [Data].self) { group in
             let (stream, cont) = AsyncStream<Data>.makeStream()
 
-            // File IDs come back as a proto Command on 0051, not as activity chunks on 0053
+            // File IDs come back as a proto Command on 0051, not as activity chunks on 0053.
             manager.onProtoCommandReceived = { data in cont.yield(data) }
             defer {
                 manager.onProtoCommandReceived = nil
@@ -348,10 +419,8 @@ final class BandSyncer {
             manager.sendEncryptedCommand(protoBytes: proto)
 
             group.addTask {
-                // Wait for the response on the command channel (proto Command with fileIds)
-                // The band responds with Command.health.activityRequestFileIds (field 10 → field 7)
                 for await chunk in stream {
-                    if let ids = self.extractFileIds(from: chunk) { return ids }
+                    if let ids = self.extractFileIds(from: chunk, subtype: subtype) { return ids }
                 }
                 return []
             }
@@ -366,14 +435,15 @@ final class BandSyncer {
         }
     }
 
-    nonisolated private func extractFileIds(from protoBytes: Data) -> [Data]? {
-        // Expect Command { type=8, subtype=1, health { activityRequestFileIds } }
+    nonisolated private func extractFileIds(from protoBytes: Data, subtype: UInt32) -> [Data]? {
+        // Expect Command { type=8, subtype=<requested>, health { activityRequestFileIds } }.
+        // An empty list still matches (no pending records) and completes the wait.
         guard let cmd = XiaomiProto.parseCommand(protoBytes),
               cmd.type == XiaomiHealthCmd.cmdType,
-              cmd.hasHealth else { return nil }
+              cmd.subtype == subtype else { return nil }
         let raw = cmd.health.activityRequestFileIds
-        guard !raw.isEmpty, raw.count % 7 == 0 else { return nil }
-        return stride(from: 0, to: raw.count, by: 7).map { raw[$0 ..< $0 + 7] }
+        guard raw.count % 7 == 0 else { return nil }
+        return stride(from: raw.startIndex, to: raw.endIndex, by: 7).map { Data(raw[$0 ..< $0 + 7]) }
     }
 
     // MARK: - Private: fetch individual activity file
@@ -419,8 +489,7 @@ final class BandSyncer {
     // MARK: - Private: ACK file
 
     private func sendAck(fileId: Data, manager: BandManager) {
-        let proto = XiaomiProto.healthCommand(subtype: XiaomiHealthCmd.fetchAck, fileIds: fileId)
-        manager.sendEncryptedCommand(protoBytes: proto)
+        manager.sendEncryptedCommand(protoBytes: XiaomiProto.ackCommand(fileId: fileId))
         log.debug("ACK sent for file \(fileId.hexString)")
     }
 }

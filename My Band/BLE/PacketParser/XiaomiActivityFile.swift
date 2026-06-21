@@ -53,4 +53,11 @@ struct XiaomiActivityFileMeta {
     var isDailyDetails: Bool {
         type == .activity && subtype == Self.subtypeDaily && detail == .details
     }
+    /// On-demand single measurements (HR/SpO₂/stress/temperature) taken from the band's apps.
+    var isManualSamples: Bool {
+        type == .activity && subtype == Self.subtypeManual
+    }
+    /// A workout/sport session. `detail` distinguishes the summary record from its GPS track.
+    var isWorkoutSummary: Bool { type == .sports && detail == .summary }
+    var isWorkoutGps: Bool     { type == .sports && detail == .gps }
 }

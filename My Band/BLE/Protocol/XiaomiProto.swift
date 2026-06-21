@@ -133,4 +133,37 @@ enum XiaomiProto {
 
         return (try? cmd.serializedData()) ?? Data()
     }
+
+    /// CMD_ACTIVITY_FETCH_TODAY — lists today's pending activity file IDs.
+    static func fetchTodayCommand() -> Data {
+        var cmd = Xiaomi_Command()
+        cmd.type    = XiaomiHealthCmd.cmdType
+        cmd.subtype = XiaomiHealthCmd.fetchToday
+        var health = Xiaomi_Health()
+        var today = Xiaomi_ActivitySyncRequestToday()
+        today.unknown1 = 0           // official app sends 0 (GadgetBridge note)
+        health.activitySyncRequestToday = today
+        cmd.health = health
+        return (try? cmd.serializedData()) ?? Data()
+    }
+
+    /// CMD_ACTIVITY_FETCH_PAST — lists the backlog of older, not-yet-synced file IDs.
+    static func fetchPastCommand() -> Data {
+        var cmd = Xiaomi_Command()
+        cmd.type    = XiaomiHealthCmd.cmdType
+        cmd.subtype = XiaomiHealthCmd.fetchPast
+        return (try? cmd.serializedData()) ?? Data()
+    }
+
+    /// CMD_ACTIVITY_FETCH_ACK — marks a file synced. Must use the dedicated ack field
+    /// (`activitySyncAckFileIds`), not `activityRequestFileIds`, or the band acks nothing.
+    static func ackCommand(fileId: Data) -> Data {
+        var cmd = Xiaomi_Command()
+        cmd.type    = XiaomiHealthCmd.cmdType
+        cmd.subtype = XiaomiHealthCmd.fetchAck
+        var health = Xiaomi_Health()
+        health.activitySyncAckFileIds = fileId
+        cmd.health = health
+        return (try? cmd.serializedData()) ?? Data()
+    }
 }

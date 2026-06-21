@@ -23,7 +23,7 @@
 	<key>NSHealthShareUsageDescription</key>
 	<string>O My Band consulta amostras já existentes no Apple Health para evitar gravar dados duplicados da sua Mi Band 10.</string>
 	<key>NSHealthUpdateUsageDescription</key>
-	<string>O My Band grava no Apple Health os dados de sono, frequência cardíaca, passos, SpO₂, calorias e distância sincronizados da sua Mi Band 10.</string>
+	<string>O My Band grava no Apple Health os dados sincronizados da sua Mi Band 10: sono, frequência cardíaca (incluindo repouso), passos, SpO₂, calorias, distância, temperatura corporal, VO₂máx e treinos com rota de GPS.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
