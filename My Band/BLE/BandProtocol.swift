@@ -137,6 +137,17 @@ enum XiaomiSppPacket {
         return build(type: .data, seqNum: seqNum, payload: payload)
     }
 
+    /// DATA packet carrying a raw file-upload chunk on the DATA channel. Unlike commands, the DATA
+    /// channel is sent PLAINTEXT (GadgetBridge: CHANNEL_DATA → OPCODE_SEND_PLAINTEXT) — the upload
+    /// payload protects itself with an embedded MD5 + CRC-32, so it isn't AES-CTR encrypted.
+    static func buildDataChunk(_ chunk: Data, seqNum: UInt8) -> Data {
+        var payload = Data()
+        payload.append(XiaomiRawChannel.data)
+        payload.append(XiaomiOpCode.plaintext)
+        payload.append(chunk)
+        return build(type: .data, seqNum: seqNum, payload: payload)
+    }
+
     /// ACK packet.
     static func buildAck(seqNum: UInt8) -> Data {
         build(type: .ack, seqNum: seqNum, payload: Data())
@@ -211,7 +222,38 @@ enum XiaomiSystemCmd {
     static let battery:        UInt32 = 1    // CMD_BATTERY
     static let deviceInfo:     UInt32 = 2    // CMD_DEVICE_INFO
     static let clock:          UInt32 = 3    // CMD_CLOCK (set time)
+    static let language:       UInt32 = 6    // CMD_LANGUAGE (system.language.code = "pt_br")
+    static let findPhone:      UInt32 = 17   // CMD_FIND_PHONE (band → app: ring the phone)
     static let deviceStateGet: UInt32 = 78   // CMD_DEVICE_STATE_GET
+}
+
+// MARK: - Calendar command IDs (GadgetBridge XiaomiCalendarService)
+
+enum XiaomiCalendarCmd {
+    static let cmdType:  UInt32 = 12
+    static let set:      UInt32 = 1    // CMD_CALENDAR_SET (calendar.calendarSync, ≤50 events)
+}
+
+// MARK: - Weather command IDs (GadgetBridge XiaomiWeatherService)
+
+enum XiaomiWeatherCmd {
+    static let cmdType:          UInt32 = 10
+    static let setCurrent:       UInt32 = 0   // CMD_SET_CURRENT_WEATHER (weather.current)
+    static let dailyForecast:    UInt32 = 1   // CMD_UPDATE_DAILY_FORECAST (weather.forecast)
+    static let hourlyForecast:   UInt32 = 2   // CMD_UPDATE_HOURLY_FORECAST
+    static let requestConditions: UInt32 = 3  // CMD_REQUEST_CONDITIONS_FOR_LOCATION (band → app: push weather now)
+    static let getLocations:     UInt32 = 5   // CMD_GET_LOCATIONS
+    static let addLocation:      UInt32 = 7   // CMD_ADD_LOCATION (weather.location)
+}
+
+// MARK: - Schedule command IDs (GadgetBridge XiaomiScheduleService — alarms, reminders, clocks)
+
+enum XiaomiScheduleCmd {
+    static let cmdType:        UInt32 = 17
+    static let remindersGet:   UInt32 = 14
+    static let reminderCreate: UInt32 = 15   // schedule.createReminder (ReminderDetails)
+    static let reminderEdit:   UInt32 = 17   // schedule.editReminder
+    static let reminderDelete: UInt32 = 18   // schedule.deleteReminder (ids)
 }
 
 // MARK: - Health command IDs
@@ -222,4 +264,41 @@ enum XiaomiHealthCmd {
     static let fetchPast:        UInt32 = 2   // CMD_ACTIVITY_FETCH_PAST
     static let fetchRequest:     UInt32 = 3   // CMD_ACTIVITY_FETCH_REQUEST (per file ID)
     static let fetchAck:         UInt32 = 5   // CMD_ACTIVITY_FETCH_ACK
+
+    // Workout / GPS commands (GadgetBridge XiaomiHealthService)
+    static let workoutStatus:    UInt32 = 26  // CMD_WORKOUT_WATCH_STATUS  (band → app)
+    static let workoutOpen:      UInt32 = 30  // CMD_WORKOUT_WATCH_OPEN    (band → app request / app → band reply)
+    static let workoutLocation:  UInt32 = 48  // CMD_WORKOUT_LOCATION      (app → band GPS stream)
+}
+
+// MARK: - Watch face command IDs (GadgetBridge XiaomiWatchfaceService, type=4)
+
+enum XiaomiWatchfaceCmd {
+    static let cmdType: UInt32 = 4
+    static let list:    UInt32 = 0   // CMD_WATCHFACE_LIST
+    static let set:     UInt32 = 1   // CMD_WATCHFACE_SET
+    static let delete:  UInt32 = 2   // CMD_WATCHFACE_DELETE
+    static let install: UInt32 = 4   // CMD_WATCHFACE_INSTALL (band replies installStatus)
+}
+
+// MARK: - App (RPK / quick app) command IDs (GadgetBridge XiaomiRpkService, type=20)
+
+enum XiaomiRpkCmd {
+    static let cmdType:   UInt32 = 20
+    static let list:      UInt32 = 0   // CMD_RPK_LIST
+    static let install:   UInt32 = 1   // CMD_RPK_INSTALL (band replies rpkInstallStart.cmd)
+    static let installed: UInt32 = 2   // CMD_RPK_INSTALLED (band → app: install finished)
+    static let delete:    UInt32 = 3   // CMD_RPK_DELETE
+}
+
+// MARK: - Data upload command IDs (GadgetBridge XiaomiDataUploadService, type=22)
+
+enum XiaomiDataUploadCmd {
+    static let cmdType:     UInt32 = 22
+    static let uploadStart: UInt32 = 0   // CMD_UPLOAD_START (request + ack share this subtype)
+
+    // Upload payload type tags (first envelope byte after the leading 0x00).
+    static let typeWatchface: UInt8 = 16
+    static let typeFirmware:  UInt8 = 32   // intentionally unused — firmware flashing is out of scope
+    static let typeRpk:       UInt8 = 64
 }

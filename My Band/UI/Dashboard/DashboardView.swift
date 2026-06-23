@@ -14,6 +14,7 @@ struct DashboardView: View {
     @State private var syncing = false
     @State private var resultText: String?
     @State private var resultIsError = false
+    @State private var showCustomize = false
 
     private var connected: Bool { band.connectionState.isConnected }
 
@@ -25,6 +26,10 @@ struct DashboardView: View {
                     header
                     metrics
                     syncSection
+                    MBButton(title: "Personalização", variant: .secondary, size: .lg,
+                             icon: "square.grid.2x2", block: true, disabled: !connected) {
+                        showCustomize = true
+                    }
                     Spacer(minLength: MB.Space.x6)
                     MBButton(title: "Esquecer pulseira", variant: .ghost, size: .md, block: true,
                              action: onForget)
@@ -34,6 +39,7 @@ struct DashboardView: View {
                 .padding(.bottom, MB.Space.x10)
             }
         }
+        .sheet(isPresented: $showCustomize) { CustomizeView() }
     }
 
     // MARK: Header

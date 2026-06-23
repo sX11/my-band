@@ -34,6 +34,10 @@ My Band/
 │   ├── BandAuthenticator.swift   # Handshake AES-128 com AuthKey
 │   ├── BandProtocol.swift        # Encoder/decoder de pacotes do protocolo Mi Band
 │   ├── BandSyncer.swift          # Sincronização de dados históricos (sono, steps, HR)
+│   ├── WorkoutGpsService.swift   # Handshake GPS durante treinos (band→app workoutOpenWatch)
+│   ├── FindPhoneService.swift    # "Encontrar telefone": alarme no iPhone (band→app CMD_FIND_PHONE)
+│   ├── CalendarSyncService.swift # Push app→band: idioma, calendário e lembretes (EventKit)
+│   ├── WeatherSyncService.swift  # Push app→band: tempo atual + previsão (Open-Meteo)
 │   └── Services/
 │       ├── MiBandUUID.swift      # Constantes de UUID dos serviços GATT
 │       └── PacketParser/         # Parsers por tipo de dado (sono, diário, manual, treinos+GPS)
@@ -151,6 +155,41 @@ Payload de um pacote DATA (dentro do payload acima):
 | Fetch request | 8 | 3 | Solicita o conteúdo de um file-id (stream em chunks) |
 | Fetch ACK | 8 | 5 | Marca um file-id como sincronizado |
 
+### Comandos iniciados pela pulseira (band → app)
+
+Alguns recursos são **push** da pulseira: ela manda o comando e o app reage. `BandManager` os decodifica após auth e dispara callbacks (`onWorkoutOpenWatch`, `onWorkoutStatusWatch`, `onFindPhone`, `onWeatherConditionsRequest`), consumidos por serviços dedicados.
+
+| Comando | type | subtype | Quem trata | Reação |
+|---|---|---|---|---|
+| `CMD_FIND_PHONE` | 2 (SYSTEM) | 17 | `FindPhoneService` | `system.findDevice` 0=iniciar / ≠0=parar. Alarme: `AVAudioSession.playback` + sirene em loop sintetizada + vibração + notificação. Auto-stop em 45 s. |
+| `workoutOpenWatch` | 8 (HEALTH) | 30 | `WorkoutGpsService` | Inicia CoreLocation e responde GPS ready/disabled |
+| `workoutStatusWatch` | 8 (HEALTH) | 26 | `WorkoutGpsService` | started/resumed/paused/finished → controla o stream de GPS (paused para de transmitir); ao **finished** dispara `onWorkoutFinished(fileIds)` → `BandSyncer.syncWorkoutFiles` busca os arquivos nomeados (resumo + rota GPS) |
+| `CMD_REQUEST_CONDITIONS_FOR_LOCATION` | 10 (WEATHER) | 3 | `WeatherSyncService` | Banda pede o tempo (ao conectar / abrir a tela de tempo) → app responde com push de tempo, ecoando a chave/nome de localização pedida. Ver "Configuração enviada à pulseira". |
+
+> **O fim de treino dispara um sync automático e direcionado.** `workoutStatusWatch` status=finished **carrega os `activityFileIds`** do treino recém-gravado (resumo + rota GPS). `BandManager` os repassa no callback (`onWorkoutStatusWatch(status, fileIds)`) → `WorkoutGpsService.onWorkoutFinished(fileIds)` → `BandSyncer` aguarda ~8 s (flush do arquivo pela pulseira) e roda `syncWorkoutFiles(_:)` se ainda conectado, buscando/parseando/gravando/ACKando **exatamente** esses arquivos — sem relistar o backlog (FETCH_TODAY/PAST). Firmware que omita os ids cai no `syncToHealth()` completo. O loop de processamento por arquivo é compartilhado em `BandSyncer.processActivityFiles`. Totais diários, que o treino também atualiza, ficam para o próximo sync regular.
+>
+> **Não há trigger equivalente para "acordar".** A Mi Band 10 não envia um evento de fim de sono; o sono só é buscado quando o app roda o fetch (foreground ou `BackgroundSyncManager`). Fora do fim de treino, o modelo continua sendo **pull**: o app reconecta e busca os file-ids pendentes.
+
+### Configuração enviada à pulseira (app → band)
+
+`CalendarSyncService` (idioma/calendário/lembretes) e `WeatherSyncService` (tempo, via Open-Meteo) fazem push cifrado ao final de `BandSyncer.syncToHealth()`, junto com os dados de saúde/exercícios e enquanto o link está ativo (best-effort — não derruba o sync de saúde). Cada seção é independente — uma permissão negada ou falta de rede não bloqueia as outras.
+
+| Dado | type | subtype | Proto | Origem / observações |
+|---|---|---|---|---|
+| Idioma | 2 (SYSTEM) | 6 `CMD_LANGUAGE` | `system.language.code` | `Locale` → `"pt_br"` minúsculo |
+| Calendário | 12 | 1 `CMD_CALENDAR_SET` | `calendar.calendarSync.event[]` | EventKit, próximos 30 dias, ≤50, **substitui** o set na banda |
+| Lembrete (criar) | 17 (SCHEDULE) | 15 `CMD_REMINDERS_CREATE` | `schedule.createReminder` | EventKit, com data, ≤20 |
+| Lembrete (apagar) | 17 | 18 `CMD_REMINDERS_DELETE` | `schedule.deleteReminder.id[]` | apaga os ids do sync anterior antes de recriar |
+| Tempo (localização) | 10 | 7 `CMD_ADD_LOCATION` | `weather.location` | `WeatherSyncService`, chave `accu:<hash>` |
+| Tempo (atual) | 10 | 0 `CMD_SET_CURRENT_WEATHER` | `weather.current` | Open-Meteo, Guarapuava |
+| Tempo (previsão) | 10 | 1 `CMD_UPDATE_DAILY_FORECAST` | `weather.forecast` | 7 dias (hoje + 6) |
+
+> **O tempo é request-driven — a pulseira pede, o app responde.** A Mi Band 10 envia `CMD_REQUEST_CONDITIONS_FOR_LOCATION` (type=10, subtype=3) ao conectar e ao abrir a tela de tempo; a tela fica **aguardando a resposta a esse request**, então o push proativo (ao fim do `syncToHealth()`) sozinho não popula o widget. `BandManager.handleWeatherCommand` roteia subtype=3 para o callback `onWeatherConditionsRequest`, e `WeatherSyncService` responde com um push completo (location → current → forecast). A resposta **ecoa a chave/nome de localização que a banda pediu** (`requestedKey`/`requestedName`) para que ela vincule os dados; sem request, o push usa a localização padrão com `isCurrentLocation=true`. Status≠0 das respostas da banda aos nossos pushes (subtypes 0/1/7) é logado. Espelha `XiaomiWeatherService.onConditionRequestReceived` do GadgetBridge.
+
+> **Id de lembrete é atribuído pela banda.** O create não carrega id; a banda responde com `schedule.ackId` (type=17). `BandManager.onScheduleAck` captura esses ids, que `CalendarSyncService` persiste (`UserDefaults`) e usa para apagar no próximo sync — sem isso os lembretes acumulariam na pulseira.
+
+> **Frames > MTU.** Calendário com muitos eventos passa do ATT MTU. `BandManager.writeSPP` fragmenta a frame em chunks do tamanho do MTU (`maximumWriteValueLength`); a banda reassembla pelo comprimento declarado na frame. Pacotes de auth/init cabem em um chunk — caminho do handshake inalterado.
+
 O mesmo mecanismo de file-ids serve **todos** os tipos de dado — cada id de 7 bytes (`XiaomiActivityFileMeta`) declara seu tipo/subtype/detailType, e `BandSyncer.syncToHealth()` roteia para o parser certo:
 
 | Tipo de arquivo | subtype | Parser |
@@ -164,7 +203,36 @@ O mesmo mecanismo de file-ids serve **todos** os tipos de dado — cada id de 7 
 
 Sono `0x08`: cada entrada de estágio é UInt16 BE — bits[15:12]=stage (0=awake,1=light,2=deep,3=rem), bits[11:0]=duração_min.
 
-> **Dois formatos de sono.** O GadgetBridge usa `SleepStagesParser` para `0x03` (ACTIVITY_SLEEP_STAGES, layout por **eventos de transição**, códigos de estágio `2=deep,3=light,4=rem,5=awake`) e `SleepDetailsParser` para `0x08` (layout por **duração**). Hoje roteamos ambos para o `SleepDetailsParser`, o que está correto só para `0x08` — um arquivo `0x03` produz sessão vazia silenciosamente. Confirmar em hardware qual subtype a Mi Band 10 emite antes de portar o `SleepStagesParser`.
+> **Dois formatos de sono.** O GadgetBridge usa `SleepStagesParser` para `0x03` (ACTIVITY_SLEEP_STAGES, layout por **eventos de transição**, códigos de estágio `2=deep,3=light,4=rem,5=awake`) e `SleepDetailsParser` para `0x08` (layout por **duração**). Hoje roteamos ambos para o `SleepDetailsParser`. **Validado em hardware (Mi Band 10, 2026-06-21): o fetch real de sono funciona com o `SleepDetailsParser` — a pulseira emite `0x08`.** Caso um `0x03` apareça no futuro, ele produziria sessão vazia silenciosamente e exigiria portar o `SleepStagesParser`.
+
+### Instalação de watch faces e apps (app → band)
+
+Recurso de personalização (`BLE/Upload/`), portado do GadgetBridge. As mensagens proto já estavam no `xiaomi.pb.swift`. **Não toca em firmware** (`TYPE_FIRMWARE=32`) — risco de brick.
+
+| Camada | type | subtypes | Serviço |
+|---|---|---|---|
+| Watch faces | 4 | list=0, set=1, delete=2, install=4 | `WatchfaceService` |
+| Apps (RPK / quick apps) | 20 | list=0, install=1, installed=2, delete=3 | `AppInstallService` |
+| Upload em chunks | 22 | uploadStart=0 | `DataUploadService` |
+
+**Fluxo de install (faces e apps idêntico, só muda o tag de tipo):**
+1. App anuncia o arquivo: faces `watchfaceInstallStart{id,size}`; apps `rpkInfo{id,versionCode,size}`.
+2. Banda responde com status (faces `watchface.installStatus`; apps `rpk.rpkInstallStart.cmd`). `0` = aceito.
+3. App abre o upload: `CMD_UPLOAD_START{type, md5(arquivo), size}` (type **16**=watchface, **64**=rpk).
+4. Banda responde `dataUploadAck{unknown2, resumePosition, chunkSize (default 2048)}` — suporta retomada.
+5. App monta o envelope e transmite em chunks:
+   ```
+   envelope = [0x00][type][md5:16][size:u32 LE][bytes do arquivo a partir de resumePosition]
+   payload  = envelope + crc32(envelope):u32 LE
+   chunk    = [totalParts:u16 LE][parteAtual:u16 LE][fatia de (chunkSize-4) bytes]
+   ```
+6. Watch face: ao terminar, app envia `set` (ativa) + `list`. App RPK: a banda envia `installed` (sub=2) e o app pede `list`.
+
+> **Chunks de upload vão no canal DATA (2) em texto claro** — `XiaomiSppPacket.buildDataChunk`, opCode PLAINTEXT (GadgetBridge: `CHANNEL_DATA → OPCODE_SEND_PLAINTEXT`). Diferente dos comandos (canal PROTOBUF, AES-CTR): o envelope se protege com md5 + crc32. `BandManager.sendDataChunk` faz **pacing** contra o buffer de `writeWithoutResponse` do CoreBluetooth via `peripheralIsReady(toSendWriteWithoutResponse:)`, senão um upload grande estoura o buffer e perde frames.
+
+> **Formatos de arquivo** (`InstallableFile`): watch face = binário, magic `0x5A 0xA5`, id numérico NUL-terminated em `0x28`, nome em `0x68`. App = ZIP com `manifest.json` (`package`/`name`/`versionCode`), lido por `MiniZip` (Foundation não descompacta entradas de ZIP no iOS) + inflate via framework `Compression` (`COMPRESSION_ZLIB` = raw deflate).
+
+> **A validar em hardware:** o canal exato dos chunks (DATA=2) e o pacing; e se a Mi Band 10 aceita faces da comunidade (pode haver trava de região/modelo). Importação via document picker (Files), download por URL e share sheet (`onOpenURL` + `CFBundleDocumentTypes`).
 
 ### Background BLE no iOS
 

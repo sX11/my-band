@@ -20,8 +20,10 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 | ✅ | Reassembly de frames BLE fragmentados (arquivos de atividade > MTU) |
 | ✅ | Leitura de bateria (nível + carregando) |
 | ✅ | UI de Setup (AuthKey + scan/conexão) e Dashboard (bateria, última sync, botão sincronizar) via Claude Design |
-| 🚧 | Envio ao Apple Health (sono, passos, calorias, distância, FC + FC de repouso, SpO₂, temperatura corporal, VO₂máx) — implementado, em validação de hardware |
-| 🚧 | Treinos no Apple Health (`HKWorkout` + rota GPS, todas as modalidades da Mi Band 10) e medições manuais (FC/SpO₂/temperatura) — implementado, em validação de hardware |
+| ✅ | Envio ao Apple Health — sono (estágios) e atividade diária (passos, calorias, distância, FC + FC de repouso, SpO₂) — **validado em hardware (Mi Band 10)** |
+| ✅ | Sincronização em segundo plano via `BGProcessingTask` (reconecta, sincroniza e reagenda com o app suspenso) — **validada em hardware** |
+| ✅ | Medições manuais no Apple Health (FC, SpO₂) — **validado em hardware (Mi Band 10)** |
+| 🚧 | Treinos no Apple Health (`HKWorkout` + rota GPS + VO₂máx) e handshake GPS com o iPhone (CoreLocation → `workoutLocation` stream) — implementado, **a confirmar em hardware** |
 | 🔜 | Telas SleepDetail (hipnograma) + Settings |
 | 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
 | 🔜 | Integração com Atalhos via App Intents |

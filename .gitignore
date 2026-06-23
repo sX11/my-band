@@ -58,3 +58,6 @@ PreviewContent/
 *.mobileprovision
 *.provisionprofile
 AuthKey_*.p8
+
+# Claude Code — overrides locais da máquina
+.claude/settings.local.json

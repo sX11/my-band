@@ -83,8 +83,16 @@ final class BandManager: NSObject {
     private var sessionKeys: XiaomiCrypto.SessionKeys?
     private var authContinuation: CheckedContinuation<Void, Error>?
 
+    // Callers awaiting a fully-authenticated link (e.g. the background sync task). Resumed on
+    // auth success, or thrown on auth failure / disconnect / timeout. Separate from
+    // authContinuation, which tracks a single in-flight authenticate() call.
+    private var connectWaiters: [CheckedContinuation<Void, Error>] = []
+
     // Per-session sequence counter (single counter for all SPP frames sent)
     private var seqNum: UInt8 = 0
+
+    // Resumed by peripheralIsReady(toSendWriteWithoutResponse:) to pace large uploads.
+    private var writeReadyContinuation: CheckedContinuation<Void, Never>?
 
     // MARK: - Reconnect
 
@@ -111,6 +119,29 @@ final class BandManager: NSObject {
     var onProtoCommandReceived:  ((Data) -> Void)?
     /// Called for each decrypted activity data chunk (on characteristic 0053).
     var onActivityChunkReceived: ((Data) -> Void)?
+    /// Called when the band requests GPS for a workout (workoutOpenWatch, subtype=30). Param = sport code.
+    var onWorkoutOpenWatch:      ((UInt32) -> Void)?
+    /// Called when the band reports workout status (workoutStatusWatch, subtype=26).
+    /// Params = status code + the workout's activity file ids (concatenated 7-byte ids; empty if
+    /// the firmware didn't include them). On status=finished these name the just-recorded files.
+    var onWorkoutStatusWatch:    ((UInt32, Data) -> Void)?
+    /// Called when the band's "find phone" feature is toggled (System, subtype=17).
+    /// Param = true to start ringing the phone, false to stop (user dismissed it on the band).
+    var onFindPhone:             ((Bool) -> Void)?
+    /// Called with the band-assigned id when a Schedule item (e.g. a reminder) is created
+    /// (Schedule command carrying schedule.ackId). CalendarSyncService uses it to track which
+    /// reminders to delete on the next sync.
+    var onScheduleAck:           ((UInt32) -> Void)?
+    /// Called when the band requests weather (Weather, subtype=3). Params = (locationKey, locationName);
+    /// both empty means the band wants its current-location weather. The band sends this on connect and
+    /// when its weather screen opens — it's the trigger WeatherSyncService responds to with a push.
+    var onWeatherConditionsRequest: ((String, String) -> Void)?
+    /// Called for every Watchface command (type=4) from the band — WatchfaceService handles it.
+    var onWatchfaceCommand:      ((Xiaomi_Command) -> Void)?
+    /// Called for every Rpk/app command (type=20) from the band — AppInstallService handles it.
+    var onRpkCommand:            ((Xiaomi_Command) -> Void)?
+    /// Called for every DataUpload command (type=22) from the band — DataUploadService handles it.
+    var onDataUploadCommand:     ((Xiaomi_Command) -> Void)?
 
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "BLE")
 
@@ -199,6 +230,34 @@ final class BandManager: NSObject {
         central.cancelPeripheralConnection(p)
     }
 
+    /// Connects to a known peripheral (skipping the scan) and waits until the link is fully
+    /// authenticated, or throws on failure/timeout. Used by the background sync task, which must
+    /// drive the connection to completion before fetching. Returns immediately if already connected.
+    func ensureConnected(identifier: String, timeout: Duration = .seconds(25)) async throws {
+        if connectionState.isConnected { return }
+
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.resumeConnectWaiters(throwing: SyncError.timeout)
+        }
+        defer { timeoutTask.cancel() }
+
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            connectWaiters.append(c)
+            reconnectToKnownDevice(identifier: identifier)
+        }
+    }
+
+    private func resumeConnectWaiters(throwing error: Error?) {
+        guard !connectWaiters.isEmpty else { return }
+        let waiters = connectWaiters
+        connectWaiters.removeAll()
+        for c in waiters {
+            if let error { c.resume(throwing: error) } else { c.resume() }
+        }
+    }
+
     /// Sends an already-encrypted command packet (for post-auth use by BandSyncer).
     func sendEncryptedCommand(protoBytes: Data) {
         guard let keys = sessionKeys else { return }
@@ -209,6 +268,19 @@ final class BandManager: NSObject {
         } catch {
             log.error("Encryption failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Sends one raw file-upload chunk on the DATA channel (plaintext), pacing against
+    /// CoreBluetooth's write-without-response buffer so a large face/app upload doesn't overflow
+    /// it and silently drop frames. Awaits peripheralIsReady when the buffer is full.
+    func sendDataChunk(_ chunk: Data) async {
+        if let p = peripheral, let char = cmdWriteChar,
+           char.properties.contains(.writeWithoutResponse), !p.canSendWriteWithoutResponse {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                writeReadyContinuation = cont
+            }
+        }
+        writeSPP(XiaomiSppPacket.buildDataChunk(chunk, seqNum: nextSeq()))
     }
 
     // MARK: - Private: SPP write
@@ -222,8 +294,25 @@ final class BandManager: NSObject {
         // Use withResponse if the characteristic supports it, otherwise withoutResponse.
         // 005E on Mi Band 10 V2 supports write without response (confirmed in GadgetBridge).
         let writeType: CBCharacteristicWriteType = char.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
-        log.debug("005F write (\(packet.count)B, \(writeType == .withoutResponse ? "noRsp" : "rsp")): \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
-        p.writeValue(packet, for: char, type: writeType)
+
+        // A single SPP frame can exceed the ATT MTU (e.g. a calendar-sync frame with many events).
+        // CoreBluetooth does not fragment a single writeValue beyond the MTU, so split the frame
+        // into MTU-sized GATT writes; the band reassembles the byte stream by the frame's declared
+        // length (mirrors GadgetBridge's chunked outgoing write). For the small auth/init packets
+        // this is a single chunk, so the existing handshake path is unchanged.
+        let mtu = max(20, p.maximumWriteValueLength(for: writeType))
+        if packet.count <= mtu {
+            log.debug("005F write (\(packet.count)B, \(writeType == .withoutResponse ? "noRsp" : "rsp")): \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
+            p.writeValue(packet, for: char, type: writeType)
+            return
+        }
+        log.debug("005F write (\(packet.count)B in \(mtu)B chunks, \(writeType == .withoutResponse ? "noRsp" : "rsp"))")
+        var offset = packet.startIndex
+        while offset < packet.endIndex {
+            let end = packet.index(offset, offsetBy: mtu, limitedBy: packet.endIndex) ?? packet.endIndex
+            p.writeValue(packet.subdata(in: offset..<end), for: char, type: writeType)
+            offset = end
+        }
     }
 
     private func nextSeq() -> UInt8 {
@@ -382,6 +471,19 @@ final class BandManager: NSObject {
         case XiaomiSystemCmd.cmdType:
             handleSystemCommand(cmd)
             onProtoCommandReceived?(protoBytes)
+        case XiaomiHealthCmd.cmdType:
+            handleHealthCommand(subtype: cmd.subtype, cmd: cmd, protoBytes: protoBytes)
+        case XiaomiWeatherCmd.cmdType:
+            handleWeatherCommand(cmd)
+        case XiaomiWatchfaceCmd.cmdType:
+            onWatchfaceCommand?(cmd)
+        case XiaomiRpkCmd.cmdType:
+            onRpkCommand?(cmd)
+        case XiaomiDataUploadCmd.cmdType:
+            onDataUploadCommand?(cmd)
+        case XiaomiScheduleCmd.cmdType where cmd.hasSchedule && cmd.schedule.hasAckID:
+            log.debug("Schedule ack id=\(cmd.schedule.ackID)")
+            onScheduleAck?(cmd.schedule.ackID)
         default:
             log.debug("Proto command type=\(cmd.type) subtype=\(cmd.subtype) — \(protoBytes.count) bytes")
             onProtoCommandReceived?(protoBytes)
@@ -391,6 +493,15 @@ final class BandManager: NSObject {
     /// Captures battery info from a System command response (CMD_BATTERY / device state).
     /// GadgetBridge: cmd.system.power.battery → level + charger state.
     private func handleSystemCommand(_ cmd: Xiaomi_Command) {
+        // Find-phone (CMD_FIND_PHONE): the band pushes this to make the phone ring. The findDevice
+        // value is 0 to start the alert, non-zero (1) when the user dismisses it on the band
+        // (GadgetBridge XiaomiSystemService: mode == 0 ? START : STOP).
+        if cmd.subtype == XiaomiSystemCmd.findPhone, cmd.hasSystem, cmd.system.hasFindDevice {
+            let shouldStart = cmd.system.findDevice == 0
+            log.info("Find phone \(shouldStart ? "START" : "STOP") requested by band")
+            onFindPhone?(shouldStart)
+            return
+        }
         guard cmd.hasSystem, cmd.system.hasPower, cmd.system.power.hasBattery else { return }
         let battery = cmd.system.power.battery
         if battery.hasLevel {
@@ -398,6 +509,44 @@ final class BandManager: NSObject {
             // state: 1 = charging (GadgetBridge convertBatteryStateFromRawValue)
             batteryCharging = battery.hasState && battery.state == 1
             log.info("Battery \(self.batteryLevel ?? -1)%\(self.batteryCharging ? " (charging)" : "")")
+        }
+    }
+
+    /// Weather is request-driven: the band asks the app to push conditions (subtype=3), and the app's
+    /// own pushes (add-location / current / forecast) come back as status responses on the same type.
+    private func handleWeatherCommand(_ cmd: Xiaomi_Command) {
+        switch cmd.subtype {
+        case XiaomiWeatherCmd.requestConditions:
+            let loc  = (cmd.hasWeather && cmd.weather.hasLocation) ? cmd.weather.location : nil
+            let key  = loc?.code ?? ""
+            let name = loc?.name ?? ""
+            log.info("Weather requested by band (location: \(key.isEmpty ? "current" : key))")
+            onWeatherConditionsRequest?(key, name)
+        default:
+            // Status reply to one of our pushes. status≠0 means the band rejected it (e.g. 1 =
+            // unsupported, 3 = location already added) — logged so a failed push is visible.
+            if cmd.hasStatus, cmd.status != 0 {
+                log.warning("Weather cmd subtype=\(cmd.subtype) rejected (status \(cmd.status))")
+            } else {
+                log.debug("Weather cmd subtype=\(cmd.subtype) acknowledged")
+            }
+        }
+    }
+
+    private func handleHealthCommand(subtype: UInt32, cmd: Xiaomi_Command, protoBytes: Data) {
+        switch subtype {
+        case XiaomiHealthCmd.workoutOpen where cmd.hasHealth && cmd.health.hasWorkoutOpenWatch:
+            let sport = cmd.health.workoutOpenWatch.sport
+            log.info("Workout GPS request (sport=\(sport)) — forwarding to WorkoutGpsService")
+            onWorkoutOpenWatch?(sport)
+        case XiaomiHealthCmd.workoutStatus where cmd.hasHealth && cmd.health.hasWorkoutStatusWatch:
+            let watch = cmd.health.workoutStatusWatch
+            let fileIds = watch.hasActivityFileIds ? watch.activityFileIds : Data()
+            log.info("Workout status update: \(watch.status) (\(fileIds.count / 7) file id(s))")
+            onWorkoutStatusWatch?(watch.status, fileIds)
+        default:
+            // All other health subtypes (activity fetch responses etc.) go to BandSyncer.
+            onProtoCommandReceived?(protoBytes)
         }
     }
 
@@ -498,6 +647,7 @@ final class BandManager: NSObject {
         log.info("Authentication successful — communication is now encrypted")
         authContinuation?.resume()
         authContinuation = nil
+        resumeConnectWaiters(throwing: nil)
         if let p = peripheral {
             onAuthenticated?(p.name ?? "Mi Band 10", p.identifier.uuidString)
         }
@@ -522,6 +672,7 @@ final class BandManager: NSObject {
         connectionState = .error(error.localizedDescription)
         authContinuation?.resume(throwing: error)
         authContinuation = nil
+        resumeConnectWaiters(throwing: error)
     }
 
     /// Tear down the link and reconnect to retry authentication. Used for the first-pairing
@@ -572,6 +723,8 @@ final class BandManager: NSObject {
             failAuth(AuthError.timeout)
         } else {
             connectionState = .disconnected
+            // Fail any background-sync waiter so it doesn't hang until its own timeout.
+            resumeConnectWaiters(throwing: SyncError.notConnected)
         }
     }
 }
@@ -661,6 +814,11 @@ extension BandManager: CBCentralManagerDelegate {
 // MARK: - CBPeripheralDelegate
 
 extension BandManager: CBPeripheralDelegate {
+
+    func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        writeReadyContinuation?.resume()
+        writeReadyContinuation = nil
+    }
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error {

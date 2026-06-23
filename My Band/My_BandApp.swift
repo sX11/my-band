@@ -33,21 +33,40 @@ struct My_BandApp: App {
 
     @State private var bandManager = BandManager()
     @State private var bandSyncer  = BandSyncer()
+    @State private var customization = CustomizationManager()
+
+    #if canImport(UIKit)
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #endif
+
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environment(bandManager)
                 .environment(bandSyncer)
+                .environment(customization)
                 .onAppear {
                     bandSyncer.setup(
                         manager: bandManager,
                         context: Self.sharedModelContainer.mainContext
                     )
+                    customization.setup(manager: bandManager)
                     bandSyncer.loadStoredDevice()
+                    BackgroundSyncManager.shared.configure(manager: bandManager, syncer: bandSyncer)
                     // O scan/conexão agora é disparado pela UI (RootView/SetupView).
+                }
+                .onOpenURL { url in
+                    // Shared file ("Abrir com → My Band") for a .bin/.rpk. Installs against the
+                    // live connection; progress/result surface in CustomizeView.
+                    Task { await customization.installFromFile(url) }
                 }
         }
         .modelContainer(Self.sharedModelContainer)
+        .onChange(of: scenePhase) { _, phase in
+            // Ao ir para segundo plano, garante que há um pedido de sync agendado.
+            if phase == .background { BackgroundSyncManager.shared.scheduleNext() }
+        }
     }
 }

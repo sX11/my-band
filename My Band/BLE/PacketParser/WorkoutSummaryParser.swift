@@ -1,4 +1,7 @@
 import Foundation
+import OSLog
+
+private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "WorkoutParser")
 
 // MARK: - WorkoutKind
 //
@@ -9,6 +12,7 @@ enum WorkoutKind {
     case running, walking, hiking, trekking, trailRun, treadmill
     case outdoorCycling, indoorCycling
     case freeTraining, hiit, yoga
+    case strengthTraining                               // Treino de Força (code 17 / subtype 0x11)
     case poolSwim, openWaterSwim
     case elliptical, rowing, rowingMachine, jumpRoping
     case other
@@ -84,7 +88,10 @@ enum WorkoutSummaryParser {
         r.skip(7)                              // fileId
         guard r.u8() == 0 else { return nil }  // padding
 
-        guard let blueprint = blueprint(subtype: meta.subtype, version: meta.version) else { return nil }
+        guard let blueprint = blueprint(subtype: meta.subtype, version: meta.version) else {
+            log.warning("WorkoutSummaryParser: no blueprint for subtype=0x\(String(meta.subtype, radix: 16)) version=\(meta.version) — skipped")
+            return nil
+        }
 
         var kind = blueprint.defaultKind
         r.skip(blueprint.headerSize)
@@ -104,7 +111,9 @@ enum WorkoutSummaryParser {
             case WorkoutKey.swimStyle:
                 swimStyle = Self.swimStyleName(Int(value))
             case WorkoutKey.workoutType:
-                if let mapped = workoutKind(fromCode: Int(value)) { kind = mapped }
+                let code = Int(value)
+                log.debug("WorkoutSummaryParser: workoutType code=\(code) subtype=0x\(String(meta.subtype, radix: 16)) version=\(meta.version)")
+                if let mapped = workoutKind(fromCode: code) { kind = mapped }
                 fields[key] = value
             default:
                 fields[key] = value
@@ -113,6 +122,7 @@ enum WorkoutSummaryParser {
 
         let start = meta.timestamp
         let end = endEpoch.map { Date(timeIntervalSince1970: $0) } ?? start
+        log.info("WorkoutSummaryParser: subtype=0x\(String(meta.subtype, radix: 16)) version=\(meta.version) → kind=\(String(describing: kind)) workoutTypeField=\(fields[WorkoutKey.workoutType].map { String(Int($0)) } ?? "absent")")
         return WorkoutSummary(kind: kind, startDate: start,
                               endDate: end > start ? end : start,
                               swimStyle: swimStyle, fields: fields,
@@ -441,7 +451,10 @@ enum WorkoutSummaryParser {
         case 13: .rowingMachine
         case 14: .jumpRoping
         case 15: .walking
-        case 16: .hiit
+        case 16:  .hiit
+        // Strength training uses subtype 0x08 (freestyle layout), version 10, with workoutType=308.
+        // Confirmed from hardware log: subtype=0x8 version=10 workoutType code=308.
+        case 308: .strengthTraining
         case 107: .rowing
         default: nil
         }

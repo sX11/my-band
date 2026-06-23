@@ -1,6 +1,9 @@
 import Foundation
 import SwiftData
 import OSLog
+#if canImport(UIKit)
+import UIKit
+#endif
 
 // MARK: - Sync errors
 
@@ -128,6 +131,10 @@ final class BandSyncer {
     private weak var bandManager: BandManager?
     private var modelContext: ModelContext?
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Sync")
+    private let workoutGps   = WorkoutGpsService()
+    private let findPhone    = FindPhoneService()
+    private let calendarSync = CalendarSyncService()
+    private let weatherSync  = WeatherSyncService()
 
     // MARK: - Setup
 
@@ -138,7 +145,57 @@ final class BandSyncer {
         manager.onAuthenticated = { [weak self] name, peripheralID in
             Task { await self?.persistDevice(name: name, peripheralIdentifier: peripheralID) }
         }
+
+        workoutGps.setup(manager: manager)
+        findPhone.setup(manager: manager)
+        calendarSync.setup(manager: manager)
+        weatherSync.setup(manager: manager)
+
+        // Pull the just-finished workout into Apple Health automatically. The band needs a moment
+        // to flush the activity file before its file-id shows up in the fetch list, so wait before
+        // syncing; skip if a sync is already running. When this fires from a background BLE callback
+        // iOS would suspend the app within a few seconds, so wrap the wait + sync in a background
+        // task assertion (≈30 s) to cover the delay plus the fetch.
+        workoutGps.onWorkoutFinished = { [weak self] fileIds in
+            Task { @MainActor in
+                guard let self, !self.isSyncing else { return }
+                let bg = self.beginBackgroundAssertion(name: "post-workout-sync")
+                defer { self.endBackgroundAssertion(bg) }
+                try? await Task.sleep(for: .seconds(8))
+                guard self.bandManager?.connectionState.isConnected == true else { return }
+                do {
+                    // The band hands us the just-recorded file ids in workoutStatusWatch, so fetch
+                    // exactly those — skipping the FETCH_TODAY/PAST listing. Older firmware that
+                    // omits the ids falls back to a full sync. (Daily totals, which a workout also
+                    // bumps, are left for the next regular/background sync.)
+                    let ids = self.splitFileIds(fileIds)
+                    if ids.isEmpty {
+                        self.log.info("Workout finished (no file ids) — running full Apple Health sync")
+                        try await self.syncToHealth()
+                    } else {
+                        self.log.info("Workout finished — fetching \(ids.count) named workout file(s)")
+                        try await self.syncWorkoutFiles(ids)
+                    }
+                }
+                catch { self.log.error("Post-workout sync failed: \(error.localizedDescription)") }
+            }
+        }
     }
+
+    // MARK: - Background task assertion
+
+    #if canImport(UIKit)
+    private func beginBackgroundAssertion(name: String) -> UIBackgroundTaskIdentifier {
+        UIApplication.shared.beginBackgroundTask(withName: name)
+    }
+    private func endBackgroundAssertion(_ id: UIBackgroundTaskIdentifier) {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+    }
+    #else
+    private func beginBackgroundAssertion(name: String) -> Int { 0 }
+    private func endBackgroundAssertion(_ id: Int) {}
+    #endif
 
     // MARK: - Device persistence
 
@@ -208,12 +265,96 @@ final class BandSyncer {
         let fileIds = try await fetchFileIds(manager: manager)
         log.info("Received \(fileIds.count) file ID(s)")
 
+        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context)
+        markSynced(context)
+
+        log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
+
+        // Push phone-side config (language, calendar, reminders) as part of the same sync, while
+        // the link is up. Best-effort: a failure here must not fail the health sync.
+        if manager.connectionState.isConnected {
+            await calendarSync.pushAll()
+        }
+        if manager.connectionState.isConnected {
+            await weatherSync.pushWeather()
+        }
+
+        return outcome
+    }
+
+    // MARK: - Targeted post-workout sync
+    //
+    // Pulls exactly the activity files the band named in workoutStatusWatch (the summary + GPS
+    // track of the session just finished) into Apple Health, skipping the FETCH_TODAY/FETCH_PAST
+    // listing. Daily totals — which a workout also bumps — are left for the next regular sync.
+
+    @discardableResult
+    func syncWorkoutFiles(_ fileIds: [Data]) async throws -> HealthSyncOutcome {
+        guard let manager = bandManager, manager.connectionState.isConnected else {
+            throw SyncError.notConnected
+        }
+        guard let context = modelContext else { throw SyncError.noDeviceRecord }
+        guard !fileIds.isEmpty else { return HealthSyncOutcome() }
+
+        isSyncing = true
+        lastError = nil
+        defer { isSyncing = false }
+
+        do {
+            try await HealthKitManager.shared.requestAuthorization()
+        } catch {
+            lastError = error
+            throw error
+        }
+
+        log.info("Targeted workout sync — \(fileIds.count) file(s)")
+        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context)
+        markSynced(context)
+        log.info("Targeted workout sync done — \(outcome.healthSamplesWritten) samples written")
+        return outcome
+    }
+
+    /// Splits a concatenated activity-file-id blob (each id is 7 bytes) into individual ids.
+    private func splitFileIds(_ raw: Data) -> [Data] {
+        guard !raw.isEmpty, raw.count % 7 == 0 else { return [] }
+        return stride(from: raw.startIndex, to: raw.endIndex, by: 7).map { Data(raw[$0 ..< $0 + 7]) }
+    }
+
+    private func markSynced(_ context: ModelContext) {
+        try? context.save()
+        let now = Date()
+        currentDevice?.lastHealthSyncDate = now
+        currentDevice?.lastSyncDate = now
+        lastHealthSync = now
+        lastSyncDate = now
+        try? context.save()
+    }
+
+    // MARK: - Activity file processing
+    //
+    // Fetches, parses, writes-to-Health, and ACKs each of `fileIds`. Shared by the full sync (ids
+    // discovered via FETCH_TODAY/PAST) and the targeted post-workout sync (ids handed over by
+    // workoutStatusWatch). Inserts SwiftData records; the caller persists via markSynced.
+    //
+    // ACK is sent only after the corresponding HealthKit write is confirmed. Daily summary/details
+    // are written inline (per file), so they're ACK'd inline too. Sleep, manual, and workout files
+    // are batched, so their ACKs go out after the batch write. If a write throws or the app is
+    // killed before ACKs are sent, the band re-offers those files on the next connection — no data
+    // is permanently lost.
+
+    private func processActivityFiles(_ fileIds: [Data],
+                                      manager: BandManager,
+                                      context: ModelContext) async throws -> HealthSyncOutcome {
         var outcome = HealthSyncOutcome()
         var sleepToWrite: [SleepSession] = []
         var sleepVitals: [ActivityMinuteSample] = []
         var manualToWrite: [ManualSample] = []
         var workoutsToWrite: [WorkoutSummary] = []
         var workoutRoutes: [Int: [WorkoutTrackPoint]] = [:]
+
+        var sleepIds:   [Data] = []
+        var manualIds:  [Data] = []
+        var workoutIds: [Data] = []
 
         for fileId in fileIds {
             guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
@@ -224,15 +365,18 @@ final class BandSyncer {
                     let manual = ManualSamplesParser.parse(fileData, meta: meta)
                     manualToWrite += manual
                     outcome.manualSamples += manual.count
+                    manualIds.append(fileId)
                 } else if meta.isWorkoutSummary {
                     if let workout = WorkoutSummaryParser.parse(fileData, meta: meta) {
                         workoutsToWrite.append(workout)
                     }
+                    workoutIds.append(fileId)
                 } else if meta.isWorkoutGps {
                     let track = WorkoutGpsParser.parse(fileData, meta: meta)
                     if !track.isEmpty {
                         workoutRoutes[Int(meta.timestamp.timeIntervalSince1970)] = track
                     }
+                    workoutIds.append(fileId)
                 } else if meta.isSleep {
                     let parsed = SleepDetailsParser.parse(fileData, meta: meta)
                     for session in parsed.sessions {
@@ -246,19 +390,20 @@ final class BandSyncer {
                     // Apple Health's sleep "Comparisons" tab can correlate them.
                     sleepVitals += parsed.heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
                     sleepVitals += parsed.spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) }
+                    sleepIds.append(fileId)
                 } else if meta.isDailySummary {
                     if let summary = DailySummaryParser.parse(fileData, meta: meta) {
                         outcome.dailySummaries += 1
                         persistActivityDay(summary, context)
                         outcome.healthSamplesWritten += try await HealthKitManager.shared.writeDailySummary(summary)
                     }
+                    sendAck(fileId: fileId, manager: manager)
                 } else if meta.isDailyDetails {
                     let minutes = DailyDetailsParser.parse(fileData, meta: meta)
                     outcome.minuteSamples += minutes.count
                     outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(minutes)
+                    sendAck(fileId: fileId, manager: manager)
                 }
-
-                sendAck(fileId: fileId, manager: manager)
             } catch {
                 log.error("Failed file \(fileId.hexString): \(error.localizedDescription)")
             }
@@ -272,23 +417,19 @@ final class BandSyncer {
             outcome.minuteSamples += sleepVitals.count
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(sleepVitals)
         }
+        // Sleep files ACK'd after both sessions and vitals are written.
+        sleepIds.forEach { sendAck(fileId: $0, manager: manager) }
+
         if !manualToWrite.isEmpty {
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeManualSamples(manualToWrite)
+            manualIds.forEach { sendAck(fileId: $0, manager: manager) }
         }
         if !workoutsToWrite.isEmpty {
             outcome.workouts = workoutsToWrite.count
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes)
+            workoutIds.forEach { sendAck(fileId: $0, manager: manager) }
         }
 
-        try? context.save()
-        let now = Date()
-        currentDevice?.lastHealthSyncDate = now
-        currentDevice?.lastSyncDate = now
-        lastHealthSync = now
-        lastSyncDate = now
-        try? context.save()
-
-        log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
         return outcome
     }
 

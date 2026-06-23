@@ -233,21 +233,60 @@ final class HealthKitManager {
                 try await save([quantity(vo2Max, unit, vo2, start: w.endDate, end: w.endDate, id: "mb-vo2-\(key)")])
             }
 
-            // Attach the GPS route, if this workout had one.
-            if let track = routes[key], track.count >= 2 {
-                let locations = track.map { p in
-                    CLLocation(coordinate: CLLocationCoordinate2D(latitude: p.latitude, longitude: p.longitude),
-                               altitude: 0,
-                               horizontalAccuracy: p.hdop ?? -1,
-                               verticalAccuracy: -1,
-                               timestamp: p.date)
-                }
-                let routeBuilder = HKWorkoutRouteBuilder(healthStore: store, device: .local())
-                try await routeBuilder.insertRouteData(locations)
-                _ = try await routeBuilder.finishRoute(with: workout, metadata: nil)
+            // Attach the GPS route, if this workout had one. A route failure must not abort the
+            // whole batch — the workout is already saved, so log it and move on; the file still
+            // gets ACKed and the workout itself is intact in Apple Health.
+            if let track = Self.route(forWorkoutStart: w.startDate, in: routes) {
+                do { try await attachRoute(track, to: workout) }
+                catch { log.error("Workout route attach failed (start \(key)): \(error.localizedDescription)") }
             }
         }
         return written
+    }
+
+    // MARK: - GPS route
+
+    /// Picks the GPS track for a workout. The band tags the workout summary and its GPS track with
+    /// the same session-start timestamp, but the two file ids can differ by a second or two, so
+    /// fall back to the nearest track that starts within two minutes of the workout.
+    private static func route(forWorkoutStart start: Date,
+                              in routes: [Int: [WorkoutTrackPoint]]) -> [WorkoutTrackPoint]? {
+        let key = Int(start.timeIntervalSince1970)
+        if let exact = routes[key] { return exact }
+        return routes
+            .filter { abs($0.key - key) <= 120 }
+            .min { abs($0.key - key) < abs($1.key - key) }?
+            .value
+    }
+
+    /// Builds an HKWorkoutRoute from a band GPS track. Two HealthKit constraints drive the
+    /// cleanup here: CoreLocation treats a sample with negative `horizontalAccuracy` as invalid
+    /// and `insertRouteData` rejects the whole batch if any is invalid; and the builder requires
+    /// strictly increasing timestamps. So duplicate/out-of-order fixes are dropped and the band's
+    /// hdop is mapped to a positive metre estimate.
+    private func attachRoute(_ track: [WorkoutTrackPoint], to workout: HKWorkout) async throws {
+        var lastTime = -Double.greatestFiniteMagnitude
+        let locations: [CLLocation] = track
+            .sorted { $0.date < $1.date }
+            .compactMap { p in
+                let t = p.date.timeIntervalSince1970
+                guard t > lastTime else { return nil }   // strictly increasing — drop dupes
+                lastTime = t
+                // hdop is a dimensionless dilution of precision; scale by a nominal 5 m UERE to
+                // get a usable accuracy estimate. Missing/zero hdop (V1 tracks) → a conservative
+                // fixed value, which keeps the sample valid so HealthKit accepts the route.
+                let accuracy: CLLocationAccuracy
+                if let hdop = p.hdop, hdop > 0 { accuracy = hdop * 5.0 } else { accuracy = 10.0 }
+                return CLLocation(
+                    coordinate: CLLocationCoordinate2D(latitude: p.latitude, longitude: p.longitude),
+                    altitude: 0, horizontalAccuracy: accuracy, verticalAccuracy: -1,
+                    course: -1, speed: p.speed ?? -1, timestamp: p.date
+                )
+            }
+        guard locations.count >= 2 else { return }
+        let routeBuilder = HKWorkoutRouteBuilder(healthStore: store, device: .local())
+        try await routeBuilder.insertRouteData(locations)
+        _ = try await routeBuilder.finishRoute(with: workout, metadata: nil)
     }
 
     // MARK: - Workout type mapping
@@ -264,6 +303,7 @@ final class HealthKitManager {
         case .jumpRoping:                            .jumpRope
         case .hiit:                                  .highIntensityIntervalTraining
         case .yoga:                                  .yoga
+        case .strengthTraining:                      .traditionalStrengthTraining
         case .freeTraining, .other:                  .other
         }
     }
@@ -278,7 +318,7 @@ final class HealthKitManager {
 
     private static func isIndoor(_ kind: WorkoutKind) -> Bool {
         switch kind {
-        case .treadmill, .indoorCycling, .elliptical, .rowingMachine, .hiit, .yoga, .freeTraining: true
+        case .treadmill, .indoorCycling, .elliptical, .rowingMachine, .hiit, .yoga, .freeTraining, .strengthTraining: true
         default: false
         }
     }
