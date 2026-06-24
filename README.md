@@ -23,7 +23,11 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 | ✅ | Envio ao Apple Health — sono (estágios) e atividade diária (passos, calorias, distância, FC + FC de repouso, SpO₂) — **validado em hardware (Mi Band 10)** |
 | ✅ | Sincronização em segundo plano via `BGProcessingTask` (reconecta, sincroniza e reagenda com o app suspenso) — **validada em hardware** |
 | ✅ | Medições manuais no Apple Health (FC, SpO₂) — **validado em hardware (Mi Band 10)** |
-| 🚧 | Treinos no Apple Health (`HKWorkout` + rota GPS + VO₂máx) e handshake GPS com o iPhone (CoreLocation → `workoutLocation` stream) — implementado, **a confirmar em hardware** |
+| ✅ | Treinos no Apple Health (`HKWorkout` + rota GPS + VO₂máx) e handshake GPS com o iPhone (CoreLocation → `workoutLocation` stream) — **validado em hardware** |
+| ✅ | Série de FC por segundo do treino anexada ao `HKWorkout` (gráfico de FC dentro do treino) — **validada em hardware** |
+| ✅ | Balança BLE OKOK/Chipsea (broadcast-only) → peso + IMC no Apple Health, com perfil de altura — **validada em hardware** |
+| ✅ | Instalação de watch faces e apps RPK (upload em chunks) — watch faces a confirmar; RPK rejeitado pela Mi Band 10 (provável trava de modelo) |
+| ✅ | Target de testes unitários (Swift Testing, 23 testes) com fixtures reais — **validado no iPhone** |
 | 🔜 | Telas SleepDetail (hipnograma) + Settings |
 | 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
 | 🔜 | Integração com Atalhos via App Intents |
@@ -54,12 +58,7 @@ O AuthKey é uma chave de 16 bytes (32 caracteres hex) vinculada ao seu disposit
 
 ### 2. Inserir o AuthKey no app
 
-Na tela de configuração (em desenvolvimento), insira os 32 caracteres hex do AuthKey. O app os armazena no Keychain com acesso após o primeiro desbloqueio, permitindo sync em background.
-
-Ou via código (para testes):
-```swift
-try AuthKeyStore.saveHex("sua_chave_aqui_32_chars")
-```
+No primeiro uso, o app abre a tela de **Setup** quando não há AuthKey no Keychain: informe os 32 caracteres hex do AuthKey (campo seguro, mascarado) e toque em **Conectar pulseira**. O app valida e armazena a chave no Keychain com acesso após o primeiro desbloqueio (`kSecAttrAccessibleAfterFirstUnlock`), permitindo sync em background. A chave **nunca** é gravada em código, logs, SwiftData ou UserDefaults.
 
 ### 3. Parear a pulseira
 
@@ -147,10 +146,14 @@ A UI está sendo construída a partir de um **design system dark-mode-first** en
 
 ## Referências
 
-- [GadgetBridge](https://codeberg.org/Freeyourgadget/Gadgetbridge) — implementação de referência do protocolo Mi Band 10 V2
+- [GadgetBridge](https://codeberg.org/Freeyourgadget/Gadgetbridge) — implementação de referência do protocolo Mi Band 10 V2 (auth, parsers de atividade/treino, watch faces/RPK, tempo)
 - [huami-token](https://github.com/argrento/huami-token) — extração de AuthKey via Xiaomi Cloud
-- [AstroBox-NG](AstroBox-NG-main/) — referência de protocolo BLE para wearables (incluído no repositório)
+- [homeassistant-okokscale](https://github.com/rrooggiieerr/homeassistant-okokscale) (Apache-2.0) — referência do decode da balança BLE OKOK/Chipsea (variante VC0)
+- [Open-Meteo](https://open-meteo.com/) — previsão do tempo enviada à pulseira (grátis, sem chave)
+- AstroBox-NG — referência de protocolo BLE para wearables (não incluída no repositório público)
 - [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) / [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+
+> Este projeto porta trechos de protocolo do GadgetBridge e do homeassistant-okokscale (engenharia reversa de formatos BLE). Os créditos a esses projetos estão acima; nenhum AuthKey, credencial ou segredo é incluído no repositório.
 
 ---
 
