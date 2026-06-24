@@ -575,7 +575,9 @@ final class BandSyncer {
 
             manager.sendEncryptedCommand(protoBytes: proto)
 
-            group.addTask {
+            // Pinned to the main actor: the proto callback delivers on .main and the parsers are
+            // main-actor-isolated (module default), so processing here keeps it all on one actor.
+            group.addTask { @MainActor in
                 for await chunk in stream {
                     if let ids = self.extractFileIds(from: chunk, subtype: subtype) { return ids }
                 }
@@ -592,7 +594,7 @@ final class BandSyncer {
         }
     }
 
-    nonisolated private func extractFileIds(from protoBytes: Data, subtype: UInt32) -> [Data]? {
+    private func extractFileIds(from protoBytes: Data, subtype: UInt32) -> [Data]? {
         // Expect Command { type=8, subtype=<requested>, health { activityRequestFileIds } }.
         // An empty list still matches (no pending records) and completes the wait.
         guard let cmd = XiaomiProto.parseCommand(protoBytes),
@@ -621,7 +623,9 @@ final class BandSyncer {
             manager.sendEncryptedCommand(protoBytes: proto)
 
             let log = self.log
-            group.addTask {
+            // Pinned to the main actor: chunks arrive on .main and ActivityFileReceiver is
+            // main-actor-isolated (module default). Reassembly/CRC are light, so staying on main is fine.
+            group.addTask { @MainActor in
                 for await chunk in stream {
                     receiver.addChunk(chunk)
                     log.debug("Activity chunk \(receiver.chunkProgress) (\(chunk.count)B)")

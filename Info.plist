@@ -37,7 +37,9 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>NSBluetoothAlwaysUsageDescription</key>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+		<false/>
+		<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>O My Band usa Bluetooth para se conectar à Mi Band 10 e sincronizar dados de atividade e sono em segundo plano.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
 	<string>O My Band envia seus próximos eventos de calendário para a Mi Band 10, para que você os veja no pulso.</string>
