@@ -34,6 +34,7 @@ struct My_BandApp: App {
     @State private var bandManager = BandManager()
     @State private var bandSyncer  = BandSyncer()
     @State private var customization = CustomizationManager()
+    @State private var scaleManager = ScaleManager()
 
     #if canImport(UIKit)
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -47,6 +48,7 @@ struct My_BandApp: App {
                 .environment(bandManager)
                 .environment(bandSyncer)
                 .environment(customization)
+                .environment(scaleManager)
                 .onAppear {
                     bandSyncer.setup(
                         manager: bandManager,
@@ -55,7 +57,9 @@ struct My_BandApp: App {
                     customization.setup(manager: bandManager)
                     bandSyncer.loadStoredDevice()
                     BackgroundSyncManager.shared.configure(manager: bandManager, syncer: bandSyncer)
-                    // O scan/conexão agora é disparado pela UI (RootView/SetupView).
+                    // O scan/conexão da pulseira agora é disparado pela UI (RootView/SetupView).
+                    // A balança é broadcast-only: escutar o anúncio (foreground) basta.
+                    scaleManager.start()
                 }
                 .onOpenURL { url in
                     // Shared file ("Abrir com → My Band") for a .bin/.rpk. Installs against the

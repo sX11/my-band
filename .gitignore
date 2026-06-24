@@ -1,6 +1,12 @@
 # Pastas de referência / softwares de exemplo (não fazem parte do app)
 AstroBox-NG-main/
 gadgetbridge/
+homeassistant-okokscale-main/
+
+# Working files de arte do ícone (a arte usada no build fica em My Band/) — não versionar
+/Icon Exports/
+/Icon.icon/
+/Icon.pxd
 
 # Bundles de referência / handoff de design (não fazem parte do código)
 *.zip

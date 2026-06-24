@@ -16,6 +16,19 @@ enum WorkoutKind {
     case poolSwim, openWaterSwim
     case elliptical, rowing, rowingMachine, jumpRoping
     case other
+
+    /// Whether a phone GPS stream is useful for this sport. Indoor / stationary sports (strength,
+    /// yoga, treadmill, pool, machines…) gain nothing from it — the app replies "GPS disabled" so
+    /// the band starts them immediately instead of waiting for, and recording, a fix it won't use.
+    var usesGps: Bool {
+        switch self {
+        case .running, .trailRun, .walking, .hiking, .trekking, .outdoorCycling, .openWaterSwim:
+            return true
+        case .treadmill, .indoorCycling, .freeTraining, .hiit, .yoga, .strengthTraining,
+             .poolSwim, .elliptical, .rowing, .rowingMachine, .jumpRoping, .other:
+            return false
+        }
+    }
 }
 
 // MARK: - WorkoutSummary
@@ -434,7 +447,7 @@ enum WorkoutSummaryParser {
 
     /// Subset of XiaomiWorkoutType.fromCode used by the V2 walking/cycling files whose kind
     /// comes from a payload field rather than the file-id subtype.
-    private static func workoutKind(fromCode code: Int) -> WorkoutKind? {
+    static func workoutKind(fromCode code: Int) -> WorkoutKind? {
         switch code {
         case 1:  .running
         case 2:  .walking

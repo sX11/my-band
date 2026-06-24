@@ -220,6 +220,9 @@ final class BandManager: NSObject {
         log.debug("Session config sent — waiting for band response")
 
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            // A stale continuation (e.g. characteristics rediscovered on a reconnect mid-auth) would
+            // leak and hang. Resume the old one before replacing it.
+            authContinuation?.resume(throwing: AuthError.timeout)
             authContinuation = c
         }
         // continuation resumed by handleAuthSuccess() or failAuth()
@@ -302,7 +305,13 @@ final class BandManager: NSObject {
         // this is a single chunk, so the existing handshake path is unchanged.
         let mtu = max(20, p.maximumWriteValueLength(for: writeType))
         if packet.count <= mtu {
-            log.debug("005F write (\(packet.count)B, \(writeType == .withoutResponse ? "noRsp" : "rsp")): \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
+            // Full hex only for small frames (handshake/commands). Upload chunks are large and
+            // frequent — building the hex string for every one is wasteful, so log just the length.
+            if packet.count <= 64 {
+                log.debug("005F write (\(packet.count)B, \(writeType == .withoutResponse ? "noRsp" : "rsp")): \(packet.map { String(format: "%02x", $0) }.joined(separator: " "))")
+            } else {
+                log.debug("005F write (\(packet.count)B, \(writeType == .withoutResponse ? "noRsp" : "rsp"))")
+            }
             p.writeValue(packet, for: char, type: writeType)
             return
         }
@@ -361,12 +370,13 @@ final class BandManager: NSObject {
     }
 
     /// Index of the next 0xA5 0xA5 preamble at or after offset 1, or nil if none.
+    /// Indexes the Data directly (no Array copy) — this runs on every misaligned RX byte.
     private func nextPreambleOffset(in data: Data) -> Int? {
         guard data.count >= 2 else { return nil }
-        let bytes = Array(data)
+        let base = data.startIndex
         var i = 1
-        while i < bytes.count - 1 {
-            if bytes[i] == 0xA5 && bytes[i + 1] == 0xA5 { return i }
+        while i < data.count - 1 {
+            if data[base + i] == 0xA5 && data[base + i + 1] == 0xA5 { return i }
             i += 1
         }
         return nil
@@ -796,9 +806,14 @@ extension BandManager: CBCentralManagerDelegate {
         } else {
             log.info("Disconnected cleanly")
         }
+        // resetState() already sets the right state (.error if an auth attempt was pending,
+        // else .disconnected). Don't clobber it — only force .disconnected when we're not retrying.
         resetState()
-        connectionState = .disconnected
-        if shouldReconnect { scheduleReconnect(to: peripheral) }
+        if shouldReconnect {
+            scheduleReconnect(to: peripheral)
+        } else {
+            connectionState = .disconnected
+        }
     }
 
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {

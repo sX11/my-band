@@ -15,6 +15,7 @@ struct DashboardView: View {
     @State private var resultText: String?
     @State private var resultIsError = false
     @State private var showCustomize = false
+    @State private var showProfile = false
 
     private var connected: Bool { band.connectionState.isConnected }
 
@@ -30,6 +31,10 @@ struct DashboardView: View {
                              icon: "square.grid.2x2", block: true, disabled: !connected) {
                         showCustomize = true
                     }
+                    MBButton(title: "Perfil", variant: .secondary, size: .lg,
+                             icon: "person.text.rectangle", block: true) {
+                        showProfile = true
+                    }
                     Spacer(minLength: MB.Space.x6)
                     MBButton(title: "Esquecer pulseira", variant: .ghost, size: .md, block: true,
                              action: onForget)
@@ -40,6 +45,7 @@ struct DashboardView: View {
             }
         }
         .sheet(isPresented: $showCustomize) { CustomizeView() }
+        .sheet(isPresented: $showProfile) { ProfileView() }
     }
 
     // MARK: Header
@@ -108,7 +114,9 @@ struct DashboardView: View {
         resultText = nil
         Task {
             do {
-                let outcome = try await syncer.syncToHealth()
+                // Funnel through the same coalesced entry point as the background/intent triggers,
+                // so a manual tap can't race a sync already in flight.
+                let outcome = try await BackgroundSyncManager.shared.syncNow()
                 resultIsError = false
                 resultText = "Sincronizado · \(outcome.healthSamplesWritten) amostras no Apple Health"
             } catch {

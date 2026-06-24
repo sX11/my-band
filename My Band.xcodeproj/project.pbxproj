@@ -10,14 +10,30 @@
 		9371A6672FE501BE00C68E69 /* SwiftProtobuf in Frameworks */ = {isa = PBXBuildFile; productRef = BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		AB00000000000000000000AB /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 93200F1C2FD62F9A00E8DC0C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 93200F232FD62F9A00E8DC0C;
+			remoteInfo = "My Band";
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		93200F242FD62F9A00E8DC0C /* My Band.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "My Band.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		AB00000000000000000000A8 /* My BandTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "My BandTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		93200F262FD62F9A00E8DC0C /* My Band */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "My Band";
+			sourceTree = "<group>";
+		};
+		AB00000000000000000000A9 /* My BandTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "My BandTests";
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -31,6 +47,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AB00000000000000000000A6 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -38,6 +61,7 @@
 			isa = PBXGroup;
 			children = (
 				93200F262FD62F9A00E8DC0C /* My Band */,
+				AB00000000000000000000A9 /* My BandTests */,
 				93200F252FD62F9A00E8DC0C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -46,6 +70,7 @@
 			isa = PBXGroup;
 			children = (
 				93200F242FD62F9A00E8DC0C /* My Band.app */,
+				AB00000000000000000000A8 /* My BandTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -76,6 +101,29 @@
 			productReference = 93200F242FD62F9A00E8DC0C /* My Band.app */;
 			productType = "com.apple.product-type.application";
 		};
+		AB00000000000000000000A1 /* My BandTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AB00000000000000000000A2 /* Build configuration list for PBXNativeTarget "My BandTests" */;
+			buildPhases = (
+				AB00000000000000000000A5 /* Sources */,
+				AB00000000000000000000A6 /* Frameworks */,
+				AB00000000000000000000A7 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AB00000000000000000000AA /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				AB00000000000000000000A9 /* My BandTests */,
+			);
+			name = "My BandTests";
+			packageProductDependencies = (
+			);
+			productName = "My BandTests";
+			productReference = AB00000000000000000000A8 /* My BandTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -88,6 +136,10 @@
 				TargetAttributes = {
 					93200F232FD62F9A00E8DC0C = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					AB00000000000000000000A1 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = 93200F232FD62F9A00E8DC0C;
 					};
 				};
 			};
@@ -109,12 +161,20 @@
 			projectRoot = "";
 			targets = (
 				93200F232FD62F9A00E8DC0C /* My Band */,
+				AB00000000000000000000A1 /* My BandTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		93200F222FD62F9A00E8DC0C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AB00000000000000000000A7 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -131,7 +191,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AB00000000000000000000A5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AB00000000000000000000AA /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 93200F232FD62F9A00E8DC0C /* My Band */;
+			targetProxy = AB00000000000000000000AB /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		93200F2F2FD62F9C00E8DC0C /* Debug */ = {
@@ -139,6 +214,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -203,6 +279,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -258,8 +335,9 @@
 		93200F322FD62F9C00E8DC0C /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Icon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = "My Band/My Band.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -287,8 +365,9 @@
 		93200F332FD62F9C00E8DC0C /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Icon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_ENTITLEMENTS = "My Band/My Band.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -313,6 +392,48 @@
 			};
 			name = Release;
 		};
+		AB00000000000000000000A3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Z7KM7R2775;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "matheusdanoite.My-BandTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/My Band.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/My Band";
+			};
+			name = Debug;
+		};
+		AB00000000000000000000A4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Z7KM7R2775;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "matheusdanoite.My-BandTests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/My Band.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/My Band";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -330,6 +451,15 @@
 			buildConfigurations = (
 				93200F322FD62F9C00E8DC0C /* Debug */,
 				93200F332FD62F9C00E8DC0C /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AB00000000000000000000A2 /* Build configuration list for PBXNativeTarget "My BandTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AB00000000000000000000A3 /* Debug */,
+				AB00000000000000000000A4 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

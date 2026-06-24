@@ -38,9 +38,12 @@ My Band/
 │   ├── FindPhoneService.swift    # "Encontrar telefone": alarme no iPhone (band→app CMD_FIND_PHONE)
 │   ├── CalendarSyncService.swift # Push app→band: idioma, calendário e lembretes (EventKit)
 │   ├── WeatherSyncService.swift  # Push app→band: tempo atual + previsão (Open-Meteo)
+│   ├── Scale/                    # Balança BLE OKOK/Chipsea (independente da pulseira)
+│   │   ├── ScaleManager.swift    # Escuta o anúncio (broadcast-only) e grava peso no Apple Health
+│   │   └── ScaleWeightParser.swift # Decode do peso (variante VC0)
 │   └── Services/
 │       ├── MiBandUUID.swift      # Constantes de UUID dos serviços GATT
-│       └── PacketParser/         # Parsers por tipo de dado (sono, diário, manual, treinos+GPS)
+│       └── PacketParser/         # Parsers por tipo (sono, diário, manual, treinos+GPS, FC intra-treino)
 │
 ├── Auth/
 │   ├── AuthKeyStore.swift        # Armazenamento seguro do AuthKey no Keychain
@@ -75,6 +78,8 @@ My Band/
     ├── Dashboard/                # Tela principal com resumo de dados
     ├── Setup/                    # Fluxo de configuração (AuthKey + HA)
     ├── Sleep/                    # Visualização detalhada de sono
+    ├── Profile/                  # Perfil do usuário (altura → IMC no Apple Health)
+    ├── Customize/                # Watch faces e apps RPK
     └── Settings/                 # Configurações gerais
 ```
 
@@ -200,6 +205,9 @@ O mesmo mecanismo de file-ids serve **todos** os tipos de dado — cada id de 7 
 | Medições manuais | `0x06` | `ManualSamplesParser` |
 | Treino (resumo) | SPORTS · SUMMARY | `WorkoutSummaryParser` |
 | Treino (rota GPS) | SPORTS · GPS | `WorkoutGpsParser` |
+| Treino (detalhe FC/seg) | SPORTS · DETAILS | `WorkoutDetailsParser` |
+
+> **Série de FC por segundo do treino (`WorkoutDetailsParser`).** Durante o treino a pulseira grava um arquivo `SPORTS · DETAILS` (subtype `0x08`) com **uma amostra de FC por segundo**. O GadgetBridge **não** parseia isso (`XiaomiActivityParser.createForSports` só trata `SUMMARY`/`GPS_TRACK` e descarta o resto), então o layout foi revertido de uma captura real (Mi Band 10, 2026-06-23, version 3) e validado por CRC-32: `[id:7][pad:1][header:11]` com a duração (s) em `u16@10` (== nº de amostras), seguido de `duração` amostras `[fc:u8][flag:u8][00][00]`, 1 Hz a partir do início (fc=0 nos ~18 s de aquisição do sensor; `flag=1` a cada ~12 amostras, um keyframe — ignorado). `BandSyncer` casa a série ao treino pelo timestamp (igual à rota GPS) e `HealthKitManager.writeWorkouts` anexa as amostras ao `HKWorkout` (no builder, antes do `finishWorkout`, sync-id por amostra). Só version 3 confirmada; outras versões → série vazia (o arquivo ainda é ACKado). Para outros subtypes/versões de `SPORTS · DETAILS` (ex.: `0x16`, version 5) o parser devolve vazio e o `else` de `processActivityFiles` apenas ACKa — sem o ACK a pulseira re-oferece o arquivo a cada conexão (re-download perpétuo; um deles tinha 12 KB). Novas fixtures: `dumpActivityFileFixture` (DEBUG).
 
 Sono `0x08`: cada entrada de estágio é UInt16 BE — bits[15:12]=stage (0=awake,1=light,2=deep,3=rem), bits[11:0]=duração_min.
 
@@ -241,6 +249,19 @@ Recurso de personalização (`BLE/Upload/`), portado do GadgetBridge. As mensage
 - Implementar `centralManager(_:willRestoreState:)` para reconectar após o app ser suspenso
 - Reconnect automático via `connect(_:options:)` ao receber `didDisconnectPeripheral`, com backoff exponencial (máx. 5 tentativas)
 
+### Orquestração de sincronização
+
+`BackgroundSyncManager` é o **ponto de entrada único** de todo sync (foreground ou background). Todos os gatilhos passam por `syncNow(disconnectWhenDone:)`, que **coalesce** chamadas concorrentes em um único `Task` em voo — botão do Dashboard, App Intent/Siri, BGTask e o acordar por BLE nunca disparam dois fetches ao mesmo tempo. `disconnectWhenDone`: `nil` = só desconecta se o próprio sync abriu o link (link vivo em foreground permanece); `true`/`false` força (acordares em background passam `true` para liberar o rádio). `syncToHealth()`/`syncWorkoutFiles()` também têm guard de reentrância (`!isSyncing`), serializado pelo `@MainActor` (guard + set antes do primeiro `await`).
+
+Gatilhos de background, em ordem de frequência/confiabilidade:
+1. **Acordar por BLE (state restoration).** Quando a pulseira volta ao alcance, o CoreBluetooth relança o app; ao autenticar, `BandSyncer.onAuthenticated` chama `syncOnBackgroundWakeIfStale()` — só roda se em background, com throttle por `lastHealthSync` (15 min) e desconexão ao fim. É o caminho mais confiável (o evento BLE é que acorda o app).
+2. **`BGAppRefreshTask`** (`com.myband.refresh`) — leve, agendado com frequência pelo SO.
+3. **`BGProcessingTask`** (`com.myband.sync`) — pesado/deferível, costuma rodar carregando.
+
+Ambos os BGTasks são registrados em `register()` (do `AppDelegate.didFinishLaunching` — única janela permitida pelo `BGTaskScheduler.register`) e reagendados em `scheduleNext()` ao ir para segundo plano (`scenePhase`). `Info.plist`: os dois ids em `BGTaskSchedulerPermittedIdentifiers` e os background modes `fetch` (app-refresh) + `processing`. Em launch a frio disparado por uma task, `awaitDependencies()` espera o `configure()` da UI.
+
+> O fim de treino tem seu próprio caminho (`handleWorkoutFinished`): espera ~8 s o flush do arquivo e busca os file-ids nomeados via `syncWorkoutFiles`, sem passar pelo `syncNow` (mas protegido pelo mesmo guard `!isSyncing`).
+
 ---
 
 ## Extração do AuthKey
@@ -278,6 +299,7 @@ Recurso de personalização (`BLE/Upload/`), portado do GadgetBridge. As mensage
 | Braçadas (natação) | `HKQuantityTypeIdentifier.swimmingStrokeCount` |
 | Treino | `HKObjectType.workoutType()` via `HKWorkoutBuilder` (mapeado para `HKWorkoutActivityType`) |
 | Rota de treino (GPS) | `HKSeriesType.workoutRoute()` via `HKWorkoutRouteBuilder` |
+| Peso (balança BLE) | `HKQuantityTypeIdentifier.bodyMass` (+ `.bodyMassIndex` derivado de `.height` lida do Health) |
 
 > **`appleStandHour` NÃO é gravável.** `HKCategoryTypeIdentifier.appleStandHour` é reservado (o sistema o deriva do Apple Watch). Incluí-lo em `requestAuthorization(toShare:)` lança `NSInvalidArgumentException`. A máscara de horas em pé da pulseira fica só local — não há tipo "stand hour" gravável por apps de terceiros.
 
@@ -290,6 +312,21 @@ NSHealthShareUsageDescription
 ### Deduplicação
 - Antes de escrever, consultar amostras existentes no período para evitar duplicatas
 - Usar `HKQueryAnchor` com persistência em SwiftData para sincronizações incrementais
+
+> **Reconciliação entre fontes (passos / distância / energia ativa).** O iPhone grava essas mesmas grandezas, e o Apple Health **soma** toda fonte de terceiros por cima do iPhone — a dedup privada iPhone+Watch não se estende a terceiros e **não há API** para mudar a agregação nem registrar a pulseira como fonte confiável. Gravar o total da pulseira cru dobra a contagem (caminhada de 200 → 400). Solução (`HealthKitManager.writeReconciledActivity`): grava-se só o **excedente** da pulseira sobre o iPhone, por minuto — `delta = max(0, banda − iPhone)`, com a soma do iPhone obtida via `HKStatisticsCollectionQuery` em buckets de 1 min e predicado `fonte ≠ este app`. O total por minuto vira `max(banda, iPhone)`: sem double-count, **Mobilidade do iPhone preservada** (Assimetria/Comprimento do Passo/Velocidade/Estabilidade ao Caminhar — a pulseira não produz nada disso e elas exigem o Monitoramento de Fitness **ligado**), e passos sem o telefone ainda capturados. Funciona porque a pulseira reporta minutos **já concluídos**: quando o minuto sincroniza, o pedômetro do iPhone já o finalizou, então o delta é estável e o re-sync (idempotente via sync-id) reproduz o mesmo valor — sem necessidade de `HKObserverQuery` para o dia corrente.
+>
+> **A fonte oficial dessas três grandezas é o arquivo de detalhe diário (por minuto).** `writeDailySummary` deixou de gravar passos/energia (manteria-se somando); ele só escreve extremos band-exclusivos (FC/SpO₂, FC de repouso). Se o usuário **negar a leitura** no HealthKit, os somatórios do iPhone voltam vazios e grava-se o valor cheio da pulseira (direção segura — pulseira como fonte). **SpO₂ fica fora da reconciliação** (o iPhone não tem o sensor) e continua cru por minuto em `writeMinuteSamples`, granularidade intacta.
+
+---
+
+## Balança BLE (OKOK/Chipsea)
+
+`BLE/Scale/` integra uma balança BLE OKOK/Chipsea, **independente da pulseira** (CoreBluetooth próprio). Porta os caminhos de peso da integração [homeassistant-okokscale](https://github.com/rrooggiieerr/homeassistant-okokscale) (Apache-2.0).
+
+- **`ScaleWeightParser`** — decodifica o peso do *manufacturer data* do anúncio BLE (`[companyId:2 LE][payload]`). Variante **VC0** (validada em hardware, balança "Yoda1"): casada pelo **byte baixo do company id = `0xC0`** (espelha o `key & 0xFF == 0xC0` da integração); payload de 13 bytes, peso em `bytes[0..1]` BE, `byte[6]` traz a unidade (`(b>>3)&3`: 0=kg, 2=lb, 3=st:lb) e o **bit-final** (`b&1`). Normaliza tudo para kg.
+- **`ScaleManager`** (`@Observable @MainActor NSObject`) — só **escaneia**, nunca conecta. Escreve uma pesagem por vez: qualquer frame zero/não-final **rearma** (`lastFinalWeight = nil`), e um novo frame final não-zero conta como nova pesagem (subir de novo no mesmo peso loga de novo). Grava via `HealthKitManager.writeBodyMass` (`bodyMass` + `bodyMassIndex` quando há `height` no Health), sync-id por timestamp (idempotente).
+
+> **A balança é broadcast-only.** Confirmado em hardware: **não aceita conexão GATT** (todo `connect` dá timeout, mesmo durante a medição) e **não anuncia service UUID**. Consequências: (1) escuta **foreground-only** — scan sem filtro de serviço não funciona em background no iOS (a pulseira, com state restoration por UUID, continua em background normalmente); (2) **só o peso é recuperável**. A impedância **não chega ao telefone** — o anúncio carrega só o peso (bytes 2-3 são um `0x1388` constante, não impedância) e não há GATT. Os números de composição corporal do app OKOK (gordura %, massa magra, água…) são **estimativa a partir de peso + perfil**, não bioimpedância real: validado observando que todas as métricas se movem **monotonicamente com o peso** entre duas pesagens. Por isso o My Band grava só `bodyMass`/`bodyMassIndex` (dado medido), não composição corporal estimada.
 
 ---
 
@@ -414,7 +451,7 @@ O projeto segue [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) e [Sema
 
 Entradas pendentes de release ficam sob `## [Unreleased]`. Ao lançar uma versão, mover para `## [X.Y.Z] - YYYY-MM-DD`.
 
-Versão atual: **0.1.0** (camada BLE completa: auth HMAC-SHA256 validada em hardware, SwiftProtobuf, transporte com ACK, init pós-auth; modelos SwiftData; sincronização com Apple Health cobrindo sono, atividade diária, medições manuais e treinos com rota GPS). Próxima fase: UI (SleepDetail/Settings) e validação em hardware dos parsers de treino/medição manual.
+Versão atual: **0.1.0** (camada BLE completa: auth HMAC-SHA256 validada em hardware, SwiftProtobuf, transporte com ACK, init pós-auth; modelos SwiftData; sincronização com Apple Health cobrindo sono, atividade diária, medições manuais, treinos com rota GPS e **série de FC por segundo do treino**; **balança BLE OKOK/Chipsea → peso/IMC no Apple Health**, com perfil de altura; target de testes unitários validado no iPhone). Próxima fase: UI (SleepDetail/Settings) e demais validações em hardware.
 
 ---
 

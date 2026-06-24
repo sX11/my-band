@@ -11,9 +11,14 @@ struct BandShortcuts: AppShortcutsProvider {
         AppShortcut(
             intent: SyncBandIntent(),
             phrases: [
+                "Sincronizar \(.applicationName)",
                 "Sincronizar minha pulseira no \(.applicationName)",
                 "Sincronizar a pulseira com o \(.applicationName)",
-                "Sincronizar \(.applicationName)",
+                "Sincronizar minha Mi Band no \(.applicationName)",
+                "Atualizar minha pulseira no \(.applicationName)",
+                "Sincronizar dados da pulseira no \(.applicationName)",
+                "Puxar dados da Mi Band no \(.applicationName)",
+                "Sincronizar pulseira com o Apple Health no \(.applicationName)",
             ],
             shortTitle: "Sincronizar pulseira",
             systemImageName: "arrow.triangle.2.circlepath"

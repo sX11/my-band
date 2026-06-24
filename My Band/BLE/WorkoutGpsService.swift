@@ -63,6 +63,16 @@ final class WorkoutGpsService: NSObject {
     private func handleWorkoutOpen(sport: UInt32) {
         log.debug("Workout open request (sport=\(sport))")
 
+        // Skip GPS for indoor / stationary sports (strength, yoga, pool, machines…). Reply "GPS
+        // disabled" so the band starts immediately without waiting for a fix it won't record, and
+        // never start CoreLocation. Unknown sport codes fall through to the GPS path — safer to give
+        // an unrecognised outdoor sport its route than to silently drop it.
+        if let kind = WorkoutSummaryParser.workoutKind(fromCode: Int(sport)), !kind.usesGps {
+            log.info("Workout sport=\(sport) (\(String(describing: kind))) doesn't use GPS — replying disabled")
+            replyGpsDisabled()
+            return
+        }
+
         let authStatus = locationManager.authorizationStatus
 
         switch authStatus {

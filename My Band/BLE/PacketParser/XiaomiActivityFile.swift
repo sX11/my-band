@@ -60,4 +60,6 @@ struct XiaomiActivityFileMeta {
     /// A workout/sport session. `detail` distinguishes the summary record from its GPS track.
     var isWorkoutSummary: Bool { type == .sports && detail == .summary }
     var isWorkoutGps: Bool     { type == .sports && detail == .gps }
+    /// The per-second sensor series recorded during a workout (e.g. subtype 8 = heart rate).
+    var isWorkoutDetails: Bool { type == .sports && detail == .details }
 }

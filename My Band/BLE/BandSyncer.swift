@@ -73,7 +73,8 @@ private final class ActivityFileReceiver {
         complete = false
     }
 
-    // CRC-32 validation (last 4 bytes of assembled file)
+    // CRC-32 validation (last 4 bytes of assembled file). Shares the canonical implementation in
+    // Checksums (same poly/init/xorout) — no separate copy here.
     func validateCRC() -> Bool {
         let data = buffer
         guard data.count >= 4 else { return false }
@@ -82,28 +83,8 @@ private final class ActivityFileReceiver {
                        (UInt32(data[data.count - 3]) << 8) |
                        (UInt32(data[data.count - 2]) << 16) |
                        (UInt32(data[data.count - 1]) << 24)
-        return crc32(body) == storedCRC
+        return Checksums.crc32(Data(body)) == storedCRC
     }
-
-    private func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFF_FFFF
-        let table = Self.crc32Table
-        for byte in data {
-            let index = Int((crc ^ UInt32(byte)) & 0xFF)
-            crc = table[index] ^ (crc >> 8)
-        }
-        return crc ^ 0xFFFF_FFFF
-    }
-
-    private static let crc32Table: [UInt32] = {
-        (0..<256).map { i -> UInt32 in
-            var crc = UInt32(i)
-            for _ in 0..<8 {
-                crc = (crc & 1) != 0 ? 0xEDB88320 ^ (crc >> 1) : crc >> 1
-            }
-            return crc
-        }
-    }()
 }
 
 // MARK: - BandSyncer
@@ -143,7 +124,13 @@ final class BandSyncer {
         modelContext = context
 
         manager.onAuthenticated = { [weak self] name, peripheralID in
-            Task { await self?.persistDevice(name: name, peripheralIdentifier: peripheralID) }
+            Task { @MainActor in
+                guard let self else { return }
+                self.persistDevice(name: name, peripheralIdentifier: peripheralID)
+                // A background (state-restoration) wake authenticates but has nothing driving a
+                // sync; kick one if data is stale. No-op in the foreground.
+                BackgroundSyncManager.shared.syncOnBackgroundWakeIfStale()
+            }
         }
 
         workoutGps.setup(manager: manager)
@@ -151,34 +138,38 @@ final class BandSyncer {
         calendarSync.setup(manager: manager)
         weatherSync.setup(manager: manager)
 
-        // Pull the just-finished workout into Apple Health automatically. The band needs a moment
-        // to flush the activity file before its file-id shows up in the fetch list, so wait before
-        // syncing; skip if a sync is already running. When this fires from a background BLE callback
-        // iOS would suspend the app within a few seconds, so wrap the wait + sync in a background
-        // task assertion (≈30 s) to cover the delay plus the fetch.
         workoutGps.onWorkoutFinished = { [weak self] fileIds in
-            Task { @MainActor in
-                guard let self, !self.isSyncing else { return }
-                let bg = self.beginBackgroundAssertion(name: "post-workout-sync")
-                defer { self.endBackgroundAssertion(bg) }
-                try? await Task.sleep(for: .seconds(8))
-                guard self.bandManager?.connectionState.isConnected == true else { return }
-                do {
-                    // The band hands us the just-recorded file ids in workoutStatusWatch, so fetch
-                    // exactly those — skipping the FETCH_TODAY/PAST listing. Older firmware that
-                    // omits the ids falls back to a full sync. (Daily totals, which a workout also
-                    // bumps, are left for the next regular/background sync.)
-                    let ids = self.splitFileIds(fileIds)
-                    if ids.isEmpty {
-                        self.log.info("Workout finished (no file ids) — running full Apple Health sync")
-                        try await self.syncToHealth()
-                    } else {
-                        self.log.info("Workout finished — fetching \(ids.count) named workout file(s)")
-                        try await self.syncWorkoutFiles(ids)
-                    }
-                }
-                catch { self.log.error("Post-workout sync failed: \(error.localizedDescription)") }
+            Task { @MainActor in await self?.handleWorkoutFinished(fileIds) }
+        }
+    }
+
+    // MARK: - Post-workout sync
+    //
+    // The band needs a moment to flush the activity file before its id shows up, so wait first; skip
+    // if a sync is already running. Fired from a background BLE callback, iOS would suspend the app
+    // within seconds, so the wait + sync run inside a background task assertion (≈30 s).
+
+    private func handleWorkoutFinished(_ fileIds: Data) async {
+        guard !isSyncing else { return }
+        let bg = beginBackgroundAssertion(name: "post-workout-sync")
+        defer { endBackgroundAssertion(bg) }
+        try? await Task.sleep(for: .seconds(8))
+        guard bandManager?.connectionState.isConnected == true else { return }
+        do {
+            // The band hands us the just-recorded file ids in workoutStatusWatch, so fetch exactly
+            // those — skipping the FETCH_TODAY/PAST listing. Older firmware that omits the ids falls
+            // back to a full sync. (Daily totals, which a workout also bumps, are left for the next
+            // regular/background sync.)
+            let ids = splitFileIds(fileIds)
+            if ids.isEmpty {
+                log.info("Workout finished (no file ids) — running full Apple Health sync")
+                try await syncToHealth()
+            } else {
+                log.info("Workout finished — fetching \(ids.count) named workout file(s)")
+                try await syncWorkoutFiles(ids)
             }
+        } catch {
+            log.error("Post-workout sync failed: \(error.localizedDescription)")
         }
     }
 
@@ -230,8 +221,9 @@ final class BandSyncer {
     //
     // Fetches today's activity files and routes each by its file-id metadata:
     //   sleep         → SleepDetailsParser   → HealthKit sleepAnalysis (+ SwiftData)
-    //   daily summary → DailySummaryParser   → HealthKit steps/calories/HR/SpO₂ (+ ActivityDay)
-    //   daily details → DailyDetailsParser   → HealthKit per-minute HR/SpO₂/distance
+    //   daily summary → DailySummaryParser   → HealthKit HR/SpO₂ extremes (+ ActivityDay)
+    //   daily details → DailyDetailsParser   → HealthKit per-minute HR/SpO₂ (raw) +
+    //                                           steps/distance/energy (reconciled vs iPhone)
     // Each file is ACKed so the band marks it synced.
 
     struct HealthSyncOutcome {
@@ -245,6 +237,10 @@ final class BandSyncer {
 
     @discardableResult
     func syncToHealth() async throws -> HealthSyncOutcome {
+        // Re-entrancy guard. The guard + flag set run synchronously before the first await, so the
+        // @MainActor serialises overlapping triggers (manual button, BGTask, background-wake) into
+        // a single run — the rest see the flag and bail.
+        guard !isSyncing else { return HealthSyncOutcome() }
         guard let manager = bandManager, manager.connectionState.isConnected else {
             throw SyncError.notConnected
         }
@@ -290,6 +286,7 @@ final class BandSyncer {
 
     @discardableResult
     func syncWorkoutFiles(_ fileIds: [Data]) async throws -> HealthSyncOutcome {
+        guard !isSyncing else { return HealthSyncOutcome() }
         guard let manager = bandManager, manager.connectionState.isConnected else {
             throw SyncError.notConnected
         }
@@ -336,11 +333,38 @@ final class BandSyncer {
     // discovered via FETCH_TODAY/PAST) and the targeted post-workout sync (ids handed over by
     // workoutStatusWatch). Inserts SwiftData records; the caller persists via markSynced.
     //
-    // ACK is sent only after the corresponding HealthKit write is confirmed. Daily summary/details
-    // are written inline (per file), so they're ACK'd inline too. Sleep, manual, and workout files
-    // are batched, so their ACKs go out after the batch write. If a write throws or the app is
-    // killed before ACKs are sent, the band re-offers those files on the next connection — no data
-    // is permanently lost.
+    // ACK is sent only after the corresponding HealthKit write is confirmed, and for EVERY file that
+    // was fetched — not only the ones that produced writable samples — so a file that parses to
+    // nothing (or whose sibling already synced) doesn't get re-offered forever. The daily summary is
+    // written and ACK'd inline; sleep, manual, workout, and daily-detail files are batched, so their
+    // ACKs go out after the batch write (daily details are batched so the reconciliation can exclude
+    // workout-covered minutes). If a write throws or the app is killed before ACKs are sent, the band
+    // re-offers those files on the next connection — no data is lost.
+
+    #if DEBUG
+    /// Prints one copy-pasteable fixture block per activity file to the console.
+    /// Uses `print` (not `Logger`) so the full hex is emitted untruncated and unredacted.
+    private func dumpActivityFileFixture(fileId: Data, meta: XiaomiActivityFileMeta, data: Data) {
+        let kind: String
+        switch true {
+        case meta.isWorkoutSummary: kind = "workout-summary"
+        case meta.isWorkoutGps:     kind = "workout-gps"
+        case meta.isSleep:          kind = "sleep"
+        case meta.isManualSamples:  kind = "manual"
+        case meta.isDailySummary:   kind = "daily-summary"
+        case meta.isDailyDetails:   kind = "daily-details"
+        default:                    kind = "unknown"
+        }
+        let iso = ISO8601DateFormatter().string(from: meta.timestamp)
+        print("""
+        ===== FIXTURE BEGIN =====
+        kind=\(kind) subtype=\(meta.subtype) detail=\(meta.detail) version=\(meta.version) ts=\(iso) bytes=\(data.count)
+        id=\(fileId.hexString)
+        data=\(data.hexString)
+        ===== FIXTURE END =====
+        """)
+    }
+    #endif
 
     private func processActivityFiles(_ fileIds: [Data],
                                       manager: BandManager,
@@ -351,15 +375,26 @@ final class BandSyncer {
         var manualToWrite: [ManualSample] = []
         var workoutsToWrite: [WorkoutSummary] = []
         var workoutRoutes: [Int: [WorkoutTrackPoint]] = [:]
+        var workoutHeartRates: [Int: [WorkoutHRSample]] = [:]
+
+        var detailMinutes: [ActivityMinuteSample] = []
 
         var sleepIds:   [Data] = []
         var manualIds:  [Data] = []
         var workoutIds: [Data] = []
+        var detailIds:  [Data] = []
 
         for fileId in fileIds {
             guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
             do {
                 let fileData = try await fetchActivityFile(fileId: fileId, manager: manager)
+
+                #if DEBUG
+                // Fixture capture: the full reassembled activity file, before any parser
+                // touches it. Sync against real hardware, then copy these blocks from the
+                // Xcode console into the test target's fixtures. Remove once captured.
+                dumpActivityFileFixture(fileId: fileId, meta: meta, data: fileData)
+                #endif
 
                 if meta.isManualSamples {
                     let manual = ManualSamplesParser.parse(fileData, meta: meta)
@@ -375,6 +410,15 @@ final class BandSyncer {
                     let track = WorkoutGpsParser.parse(fileData, meta: meta)
                     if !track.isEmpty {
                         workoutRoutes[Int(meta.timestamp.timeIntervalSince1970)] = track
+                    }
+                    workoutIds.append(fileId)
+                } else if meta.isWorkoutDetails {
+                    // Per-second HR series recorded during the workout. Attached to the matching
+                    // HKWorkout below (keyed by the session-start timestamp, like the GPS route).
+                    let hr = WorkoutDetailsParser.parse(fileData, meta: meta)
+                    if !hr.isEmpty {
+                        workoutHeartRates[Int(meta.timestamp.timeIntervalSince1970)] = hr
+                        log.info("Workout HR detail: \(hr.count) sample(s) for session at \(meta.timestamp.description)")
                     }
                     workoutIds.append(fileId)
                 } else if meta.isSleep {
@@ -399,9 +443,21 @@ final class BandSyncer {
                     }
                     sendAck(fileId: fileId, manager: manager)
                 } else if meta.isDailyDetails {
+                    // Batched (not written inline) so the reconciliation can exclude minutes covered
+                    // by a workout — those file ids are only fully known after the loop.
                     let minutes = DailyDetailsParser.parse(fileData, meta: meta)
                     outcome.minuteSamples += minutes.count
-                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(minutes)
+                    detailMinutes += minutes
+                    detailIds.append(fileId)
+                } else {
+                    // No parser matches this file. We still ACK it so the band stops re-offering it on
+                    // every connection (one such file was 12 KB, re-downloaded each sync forever). This
+                    // mirrors GadgetBridge, whose fetcher ACKs every fetched file BEFORE creating a parser
+                    // and discards whatever has none. Inline ACK is safe: we only reach here after
+                    // fetchActivityFile returned without throwing, so the "ACK only after a successful
+                    // fetch" invariant holds. (Workout per-second detail — sports/details — is handled
+                    // above by isWorkoutDetails; an unknown future subtype/version lands here.)
+                    log.info("No parser for file \(fileId.hexString) (type=\(String(describing: meta.type)) subtype=\(meta.subtype) detail=\(String(describing: meta.detail))) — ACKing to stop re-offering")
                     sendAck(fileId: fileId, manager: manager)
                 }
             } catch {
@@ -420,15 +476,33 @@ final class BandSyncer {
         // Sleep files ACK'd after both sessions and vitals are written.
         sleepIds.forEach { sendAck(fileId: $0, manager: manager) }
 
+        // ACK every file we successfully fetched — NOT gated on the write batch being non-empty.
+        // A fetched file that parsed to nothing (or whose sibling already synced) still has to be
+        // ACKed, otherwise the band re-offers it forever and shows it as "not synced". The ACK runs
+        // after the write so a thrown write skips it (the band then re-offers — no data loss). Only
+        // files that fetched without throwing reach the *Ids arrays.
         if !manualToWrite.isEmpty {
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeManualSamples(manualToWrite)
-            manualIds.forEach { sendAck(fileId: $0, manager: manager) }
         }
+        manualIds.forEach { sendAck(fileId: $0, manager: manager) }
+
         if !workoutsToWrite.isEmpty {
             outcome.workouts = workoutsToWrite.count
-            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes)
-            workoutIds.forEach { sendAck(fileId: $0, manager: manager) }
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes, heartRates: workoutHeartRates)
         }
+        // Workout summary + GPS files: a GPS file can be pending without a parseable summary (its
+        // summary was ACKed in an earlier sync), which used to leave it dangling forever.
+        workoutIds.forEach { sendAck(fileId: $0, manager: manager) }
+
+        // Daily details last: HR/SpO₂ raw (band-exclusive), and steps/distance/energy reconciled
+        // against the iPhone — excluding minutes inside a workout, whose distance/energy the workout
+        // samples above already contribute.
+        if !detailMinutes.isEmpty {
+            let workoutWindows = workoutsToWrite.map { (start: $0.startDate, end: $0.endDate) }
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(detailMinutes)
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeReconciledActivity(detailMinutes, excludingWorkouts: workoutWindows)
+        }
+        detailIds.forEach { sendAck(fileId: $0, manager: manager) }
 
         return outcome
     }
@@ -451,64 +525,6 @@ final class BandSyncer {
         record.calories = Double(summary.caloriesKcal)
         record.device = currentDevice
         if existing == nil { context.insert(record) }
-    }
-
-    // MARK: - Sleep sync
-
-    @discardableResult
-    func syncSleep() async throws -> [SleepSession] {
-        guard let manager = bandManager, manager.connectionState.isConnected else {
-            throw SyncError.notConnected
-        }
-        guard let context = modelContext else { throw SyncError.noDeviceRecord }
-
-        isSyncing = true
-        lastError = nil
-        defer { isSyncing = false }
-
-        log.info("Starting sleep sync (type=8 subtype=1 → today's file IDs)")
-
-        // 1. Request today's activity file IDs
-        let fileIds = try await fetchFileIds(manager: manager)
-        guard !fileIds.isEmpty else { throw SyncError.emptyPayload }
-        log.info("Received \(fileIds.count) file ID(s)")
-
-        // 2. Fetch and parse each sleep file
-        var inserted: [SleepSession] = []
-        for fileId in fileIds where XiaomiActivityFileId.isSleepFile(fileId) {
-            log.debug("Fetching sleep file: \(fileId.hexString)")
-            guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
-
-            do {
-                let fileData = try await fetchActivityFile(fileId: fileId, manager: manager)
-                let sessions = SleepDetailsParser.parse(fileData, meta: meta).sessions
-                log.info("Parsed \(sessions.count) session(s) from file")
-
-                for session in sessions {
-                    let hash = session.rawDataHash
-                    let dup  = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.rawDataHash == hash })
-                    guard (try? context.fetch(dup))?.isEmpty ?? true else { continue }
-                    session.device = currentDevice
-                    context.insert(session)
-                    inserted.append(session)
-                }
-
-                // 3. ACK the file
-                sendAck(fileId: fileId, manager: manager)
-            } catch {
-                log.error("Failed to fetch/parse file \(fileId.hexString): \(error)")
-            }
-        }
-
-        if !inserted.isEmpty {
-            try context.save()
-            currentDevice?.lastSyncDate = Date()
-            try context.save()
-        }
-
-        lastSyncDate = Date()
-        log.info("Sync complete — \(inserted.count) new session(s) saved")
-        return inserted
     }
 
     // MARK: - Private: request file IDs
@@ -570,9 +586,9 @@ final class BandSyncer {
                 throw SyncError.timeout
             }
 
-            let result = try await group.next()!
+            let result = try await group.next() ?? []
             group.cancelAll()
-            return result ?? []
+            return result
         }
     }
 
@@ -632,30 +648,5 @@ final class BandSyncer {
     private func sendAck(fileId: Data, manager: BandManager) {
         manager.sendEncryptedCommand(protoBytes: XiaomiProto.ackCommand(fileId: fileId))
         log.debug("ACK sent for file \(fileId.hexString)")
-    }
-}
-
-// MARK: - XiaomiActivityFileId helpers
-
-enum XiaomiActivityFileId {
-    // 7-byte file ID:
-    //   [0..3] timestamp (UInt32 LE, unix seconds)
-    //   [4]    timezone (Int8, blocks of 15 min)
-    //   [5]    version (UInt8)
-    //   [6]    flags: bit7=type (0=ACTIVITY), bits6:2=subtype, bits1:0=detailType
-
-    static func isSleepFile(_ fileId: Data) -> Bool {
-        guard fileId.count == 7 else { return false }
-        let flags   = fileId[6]
-        let type    = (flags >> 7) & 1       // 0 = ACTIVITY
-        let subtype = (flags >> 2) & 0x1F    // 0x03 = ACTIVITY_SLEEP_STAGES, 0x08 = ACTIVITY_SLEEP
-        return type == 0 && (subtype == 0x03 || subtype == 0x08)
-    }
-
-    static func timestamp(_ fileId: Data) -> Date? {
-        guard fileId.count == 7 else { return nil }
-        let ts = UInt32(fileId[0]) | (UInt32(fileId[1]) << 8) |
-                 (UInt32(fileId[2]) << 16) | (UInt32(fileId[3]) << 24)
-        return Date(timeIntervalSince1970: TimeInterval(ts))
     }
 }

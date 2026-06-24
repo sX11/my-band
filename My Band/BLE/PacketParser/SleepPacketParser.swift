@@ -270,8 +270,16 @@ enum SleepDetailsParser {
         return (header[byteIdx] & (1 << (7 - (i % 8)))) != 0
     }
 
+    /// FNV-1a 64-bit over the whole file. The previous XOR-fold collapsed to a single byte
+    /// (0–255), so distinct nights collided and `persistIfNew` silently dropped legitimate new
+    /// sessions from SwiftData (Apple Health was unaffected — it always rewrites).
     private static func hashOf(_ data: Data) -> Int {
-        data.prefix(64).reduce(into: 0) { $0 ^= Int($1) }
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return Int(bitPattern: UInt(truncatingIfNeeded: hash))
     }
 }
 

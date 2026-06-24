@@ -121,6 +121,9 @@ enum XiaomiCrypto {
     //   encrypt outgoing commands: key=sessionKeys.encryptionKey, IV=encryptionKey
     //   decrypt incoming commands: key=sessionKeys.decryptionKey, IV=decryptionKey
 
+    // NOTE: re-runs AES-ECB per 16-byte block and appends byte-by-byte. Fine for the small command
+    // protobufs this handles (the only ciphered path — file uploads go plaintext on the DATA
+    // channel). If a large payload is ever routed through here, switch to a buffered keystream.
     static func aesCTR(data: Data, key: Data) throws -> Data {
         guard key.count == kCCKeySizeAES128 else {
             throw CryptoError.invalidKeyLength(key.count)

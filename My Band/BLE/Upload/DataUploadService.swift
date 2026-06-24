@@ -119,6 +119,8 @@ final class DataUploadService {
         }
         defer { timeoutTask.cancel() }
         return try await withCheckedThrowingContinuation { cont in
+            // Guard against a leaked continuation from a prior (aborted) upload.
+            ackContinuation?.resume(throwing: UploadError.timeout)
             ackContinuation = cont
         }
     }
