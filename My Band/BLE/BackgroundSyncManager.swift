@@ -141,7 +141,8 @@ final class BackgroundSyncManager {
         task.expirationHandler = { [weak self] in
             self?.log.warning("Background task expired — tearing down")
             work.cancel()
-            self?.manager?.disconnect()
+            // Release the link but keep auto-reconnect, so the band can wake us again later.
+            self?.manager?.disconnect(userInitiated: false)
         }
     }
     #endif
@@ -174,13 +175,15 @@ final class BackgroundSyncManager {
         if !wasConnected { try await manager.ensureConnected(identifier: id) }
 
         let shouldDisconnect = disconnectWhenDone ?? !wasConnected
-        defer { if shouldDisconnect { manager.disconnect() } }
+        // userInitiated: false — releasing the active link must NOT stop auto-reconnect, or the band
+        // could never wake us again. BandManager re-arms a standing connect on the resulting drop.
+        defer { if shouldDisconnect { manager.disconnect(userInitiated: false) } }
         return try await syncer.syncToHealth()
     }
 
     /// Called when the band authenticates while the app is in the background — e.g. CoreBluetooth
     /// state restoration relaunched us because the band came back in range. Without this, such a
-    /// wake-up would connect but never sync. Throttled and best-effort; frees the radio when done.
+    /// wake-up would connect but never sync. Throttled and best-effort.
     func syncOnBackgroundWakeIfStale() {
         #if canImport(UIKit)
         guard UIApplication.shared.applicationState == .background else { return }
@@ -193,7 +196,10 @@ final class BackgroundSyncManager {
         Task { @MainActor in
             defer { endAssertion(assertion) }
             do {
-                let outcome = try await syncNow(disconnectWhenDone: true)
+                // Keep the link up (disconnectWhenDone: false): the band just reached us, so holding
+                // the connection is what gives constant background communication (push events: find
+                // phone, workout, weather). A later drop re-arms a standing connect on its own.
+                let outcome = try await syncNow(disconnectWhenDone: false)
                 log.info("Background-wake sync done — \(outcome.healthSamplesWritten) samples")
             } catch {
                 log.error("Background-wake sync failed: \(error.localizedDescription)")

@@ -12,7 +12,7 @@ struct SetupView: View {
 
     let onConnect: (String) -> String?
 
-    private enum Step { case intro, key }
+    private enum Step { case intro, choose, xiaomi, key }
     @State private var step: Step = .intro
     @State private var key = ""
     @State private var fieldError: String?
@@ -26,8 +26,15 @@ struct SetupView: View {
         ZStack {
             MB.bgApp.ignoresSafeArea()
             switch step {
-            case .intro: intro
-            case .key:   keyEntry
+            case .intro:  intro
+            case .choose: methodChoice
+            case .xiaomi:
+                XiaomiLoginView(
+                    onExtracted: onConnect,
+                    onManual: { step = .key },
+                    onBack:   { step = .choose }
+                )
+            case .key:    keyEntry
             }
         }
         .animation(.easeOut(duration: MB.Motion.durBase), value: step)
@@ -64,12 +71,90 @@ struct SetupView: View {
             Spacer()
             MBButton(title: "Começar", variant: .primary, size: .lg,
                      iconRight: "arrow.right", block: true, glow: true) {
-                step = .key
+                step = .choose
             }
         }
         .padding(.horizontal, MB.Space.x7)
         .padding(.top, 70)
         .padding(.bottom, MB.Space.x10)
+    }
+
+    // MARK: Method choice
+
+    private var methodChoice: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            MBIconButton(icon: "arrow.left", variant: .plain, accessibilityLabelText: "Voltar") {
+                step = .intro
+            }
+            .padding(.bottom, 18)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Obter a AuthKey")
+                    .font(.mbTitle1)
+                    .tracking(-0.02 * 28)
+                    .foregroundStyle(MB.textPrimary)
+                Text("A chave de pareamento da pulseira. Extraia da sua conta Xiaomi ou informe manualmente.")
+                    .font(.mbBody)
+                    .foregroundStyle(MB.textSecondary)
+            }
+            .padding(.bottom, 28)
+
+            VStack(spacing: 14) {
+                methodCard(
+                    icon: "qrcode", title: "Extrair da conta Xiaomi",
+                    sub: "Escaneie um QR e o app busca a chave sozinho.",
+                    recommended: true
+                ) { step = .xiaomi }
+
+                methodCard(
+                    icon: "key.fill", title: "Inserir manualmente",
+                    sub: "Já tem a chave de 32 caracteres? Cole aqui.",
+                    recommended: false
+                ) { step = .key }
+            }
+
+            Spacer()
+        }
+        .padding(.horizontal, MB.Space.x7)
+        .padding(.top, 70)
+        .padding(.bottom, MB.Space.x10)
+    }
+
+    private func methodCard(icon: String, title: String, sub: String,
+                            recommended: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 14) {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(MB.accentSoft)
+                    .frame(width: 44, height: 44)
+                    .overlay(Image(systemName: icon).font(.system(size: 20)).foregroundStyle(MB.accent))
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        Text(title).font(.mbHeadline).foregroundStyle(MB.textPrimary)
+                        if recommended {
+                            Text("Recomendado")
+                                .font(.mbCaption)
+                                .foregroundStyle(MB.accent200)
+                                .padding(.horizontal, 8).padding(.vertical, 2)
+                                .background(MB.accentSoft)
+                                .mbCornerRadius(MB.Radius.full)
+                        }
+                    }
+                    Text(sub).font(.mbFootnote).foregroundStyle(MB.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(MB.textTertiary)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(MB.surfaceCard)
+            .overlay(RoundedRectangle(cornerRadius: MB.Radius.lg, style: .continuous)
+                .strokeBorder(MB.hairline, lineWidth: 1))
+            .mbCornerRadius(MB.Radius.lg)
+        }
+        .buttonStyle(.plain)
     }
 
     private var brandMark: some View {
@@ -106,7 +191,7 @@ struct SetupView: View {
         VStack(alignment: .leading, spacing: 0) {
             MBIconButton(icon: "arrow.left", variant: .plain,
                          accessibilityLabelText: "Voltar") {
-                step = .intro
+                step = .choose
             }
             .padding(.bottom, 18)
 

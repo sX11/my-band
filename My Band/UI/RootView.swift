@@ -28,7 +28,8 @@ struct RootView: View {
                     .transition(.opacity)
             case .connecting:
                 ConnectingView(onConnected: { phase = .ready },
-                               onRetry: { band.startScan() })
+                               onRetry: { band.startScan() },
+                               onReconfigure: forget)
                     .transition(.opacity)
             case .ready:
                 DashboardView(onForget: forget)

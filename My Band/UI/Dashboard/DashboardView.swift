@@ -18,6 +18,13 @@ struct DashboardView: View {
     @State private var showProfile = false
 
     private var connected: Bool { band.connectionState.isConnected }
+    /// Mid-handshake (or scanning) — a reconnect is already under way, so the button waits.
+    private var connecting: Bool {
+        switch band.connectionState {
+        case .connecting, .discoveringServices, .sessionConfig, .authenticating, .scanning: true
+        default: false
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -95,6 +102,14 @@ struct DashboardView: View {
                      block: true, glow: true, loading: syncing, disabled: !connected || syncing) {
                 runSync()
             }
+            if !connected {
+                MBButton(title: connecting ? "Conectando…" : "Reconectar",
+                         variant: .secondary, size: .lg,
+                         icon: "antenna.radiowaves.left.and.right",
+                         block: true, loading: connecting, disabled: connecting) {
+                    reconnect()
+                }
+            }
             if let resultText {
                 Text(resultText)
                     .font(.mbFootnote)
@@ -106,6 +121,14 @@ struct DashboardView: View {
                     .font(.mbFootnote).foregroundStyle(MB.textTertiary)
                     .frame(maxWidth: .infinity)
             }
+        }
+    }
+
+    private func reconnect() {
+        if let id = syncer.currentDevice?.peripheralIdentifier {
+            band.reconnectToKnownDevice(identifier: id)
+        } else {
+            band.startScan()
         }
     }
 

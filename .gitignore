@@ -2,11 +2,15 @@
 AstroBox-NG-main/
 gadgetbridge/
 homeassistant-okokscale-main/
+Xiaomi-cloud-tokens-extractor-master/
+pill-dial-smart-band-10-main/
+token_extractor/
 
 # Working files de arte do ícone (a arte usada no build fica em My Band/) — não versionar
 /Icon Exports/
 /Icon.icon/
 /Icon.pxd
+/App Icon Template.pxd
 
 # Bundles de referência / handoff de design (não fazem parte do código)
 *.zip

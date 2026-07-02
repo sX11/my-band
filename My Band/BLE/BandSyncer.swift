@@ -14,6 +14,7 @@ enum SyncError: LocalizedError {
     case emptyPayload
     case unexpectedResponse
     case crcMismatch
+    case fileIdMismatch
 
     var errorDescription: String? {
         switch self {
@@ -23,6 +24,7 @@ enum SyncError: LocalizedError {
         case .emptyPayload:       return "Nenhum dado recebido da pulseira."
         case .unexpectedResponse: return "Resposta inesperada da pulseira."
         case .crcMismatch:        return "CRC-32 inválido no arquivo de atividade."
+        case .fileIdMismatch:     return "Arquivo recebido não corresponde ao solicitado."
         }
     }
 }
@@ -39,6 +41,7 @@ private final class ActivityFileReceiver {
     private(set) var expectedTotal: Int = 0
     private(set) var receivedCount: Int = 0
     private var complete = false
+    private var started = false
 
     /// Completion is signalled by the LAST chunk (num == total), matching GadgetBridge
     /// XiaomiActivityFileFetcher.addChunk — more robust than counting received chunks.
@@ -56,7 +59,12 @@ private final class ActivityFileReceiver {
             expectedTotal = total
             receivedCount = 0
             complete = false
+            started = true
         }
+
+        // Ignore tail chunks of a previous file's transfer that arrive before this file's first
+        // chunk — appending them mid-stream would corrupt the buffer and shift every record.
+        guard started else { return }
 
         buffer.append(payload.dropFirst(4))
         receivedCount += 1
@@ -71,6 +79,7 @@ private final class ActivityFileReceiver {
         expectedTotal = 0
         receivedCount = 0
         complete = false
+        started = false
     }
 
     // CRC-32 validation (last 4 bytes of assembled file). Shares the canonical implementation in
@@ -501,6 +510,13 @@ final class BandSyncer {
             let workoutWindows = workoutsToWrite.map { (start: $0.startDate, end: $0.endDate) }
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(detailMinutes)
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeReconciledActivity(detailMinutes, excludingWorkouts: workoutWindows)
+            // Cardio Recovery: pairs recent workouts already in Health with the post-workout
+            // per-minute HR this batch carries. Best-effort — must not block the ACKs below.
+            do {
+                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeHeartRateRecoveries(minutes: detailMinutes)
+            } catch {
+                log.error("Cardio recovery write failed: \(error.localizedDescription)")
+            }
         }
         detailIds.forEach { sendAck(fileId: $0, manager: manager) }
 
@@ -631,7 +647,20 @@ final class BandSyncer {
                     log.debug("Activity chunk \(receiver.chunkProgress) (\(chunk.count)B)")
                     if receiver.isComplete {
                         guard receiver.validateCRC() else { throw SyncError.crcMismatch }
-                        return receiver.assembled()
+                        let file = receiver.assembled()
+                        // Chunks on 0053 carry no file id, so a fetch is correlated to its request
+                        // only by timing through a single callback. When the band is still flushing a
+                        // large file (e.g. a night of sleep) and we've already requested the next one,
+                        // that file's chunk stream lands in this receiver and passes CRC — a *valid*
+                        // file, just the wrong one. Parsing it under the requested file's meta walks
+                        // unrelated bytes as minute records (a sleep file decoded as daily-details
+                        // emitted ~1.4M phantom steps). Every activity file repeats its own 7-byte id
+                        // at the start of the payload, so reject any whose embedded id != the one we
+                        // asked for; not ACKing it lets the band re-offer it on the next sync.
+                        guard file.count >= 7, file.prefix(7).elementsEqual(fileId) else {
+                            throw SyncError.fileIdMismatch
+                        }
+                        return file
                     }
                 }
                 throw SyncError.emptyPayload

@@ -24,6 +24,19 @@ final class CalendarSyncService {
     private let maxReminders = 20
     private let createdReminderIDsKey = "myband.createdReminderIDs"
 
+    // Each section is pushed on every sync, but the payloads rarely change between syncs (language
+    // almost never, calendar/reminders only when the user edits them). Pushing an unchanged set every
+    // few minutes is wasted radio time and, for reminders, a needless delete+recreate churn on the
+    // band. We cache a stable signature of the last successfully-sent payload and skip when it matches.
+    private let lastLanguageKey  = "myband.lastPushedLanguage"
+    private let lastCalendarKey  = "myband.lastPushedCalendarSig"
+    private let lastRemindersKey = "myband.lastPushedRemindersSig"
+
+    /// Launch-stable signature (Swift's Hashable is per-process salted, so it can't be persisted).
+    private func signature(_ s: String) -> String {
+        String(Checksums.crc32(Data(s.utf8)), radix: 16)
+    }
+
     func setup(manager: BandManager) {
         bandManager = manager
     }
@@ -50,8 +63,13 @@ final class CalendarSyncService {
         let lang   = locale.language.languageCode?.identifier ?? "en"
         let region = locale.region?.identifier ?? Locale.current.region?.identifier ?? "US"
         let code   = "\(lang)_\(region)".lowercased()
+        guard UserDefaults.standard.string(forKey: lastLanguageKey) != code else {
+            log.debug("Language unchanged (\(code)) — skipping push")
+            return
+        }
         log.info("Pushing language: \(code)")
         bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.languageCommand(code: code))
+        UserDefaults.standard.set(code, forKey: lastLanguageKey)
     }
 
     // MARK: - Calendar
@@ -81,10 +99,17 @@ final class CalendarSyncService {
                 }
                 return e
             }
+        let sig = signature(events.map { "\($0.title)|\($0.start)|\($0.end)|\($0.allDay)|\($0.notifyMinutesBefore)" }
+            .joined(separator: ";"))
+        guard UserDefaults.standard.string(forKey: lastCalendarKey) != sig else {
+            log.debug("Calendar unchanged (\(events.count) event(s)) — skipping push")
+            return
+        }
         log.info("Pushing \(events.count) calendar event(s)")
         bandManager?.sendEncryptedCommand(
             protoBytes: XiaomiProto.calendarSyncCommand(events: Array(events), disabled: events.isEmpty)
         )
+        UserDefaults.standard.set(sig, forKey: lastCalendarKey)
     }
 
     // MARK: - Reminders
@@ -92,6 +117,18 @@ final class CalendarSyncService {
     private func pushReminders() async {
         guard await requestRemindersAccess() else {
             log.info("Reminders access not granted — skipping")
+            return
+        }
+
+        let reminders = await fetchDueReminders()
+
+        // Skip the delete+recreate churn when the due-reminder set hasn't changed since the last
+        // push. The persisted band-assigned ids stay valid, so there's nothing to reconcile.
+        let sig = signature(reminders.prefix(maxReminders)
+            .map { "\($0.title ?? "")|\($0.dueDateComponents?.date?.timeIntervalSince1970 ?? 0)" }
+            .joined(separator: ";"))
+        guard UserDefaults.standard.string(forKey: lastRemindersKey) != sig else {
+            log.debug("Reminders unchanged — skipping push")
             return
         }
 
@@ -111,7 +148,6 @@ final class CalendarSyncService {
         bandManager?.onScheduleAck = { id in ackedIDs.append(Int(id)) }
         defer { bandManager?.onScheduleAck = nil }
 
-        let reminders = await fetchDueReminders()
         var sent = 0
         for reminder in reminders.prefix(maxReminders) {
             guard let due = reminder.dueDateComponents?.date else { continue }
@@ -123,6 +159,7 @@ final class CalendarSyncService {
         // Give the band a moment to ack each create before persisting the ids it assigned.
         try? await Task.sleep(for: .seconds(2))
         UserDefaults.standard.set(ackedIDs, forKey: createdReminderIDsKey)
+        UserDefaults.standard.set(sig, forKey: lastRemindersKey)
         log.info("Pushed \(sent) reminder(s), \(ackedIDs.count) acked")
     }
 

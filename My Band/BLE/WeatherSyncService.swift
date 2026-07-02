@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import CoreLocation
 
 // MARK: - WeatherSyncService
 //
@@ -12,18 +13,41 @@ import OSLog
 // Default location is Guarapuava, PR. Best-effort: no network / decode failure just skips.
 
 @MainActor
-final class WeatherSyncService {
+final class WeatherSyncService: NSObject {
 
-    /// Guarapuava, PR.
+    /// Default location (Guarapuava, PR) — used for the proactive push and as a fallback when the
+    /// band asks about a location name that can't be geocoded.
     private let latitude  = -25.3935
     private let longitude = -51.4562
     private let locationName = "Guarapuava"
 
+    private let geocodeCacheKey = "myband.weatherGeocodeCache"
+    /// Administrative context appended to disambiguate local names (see coordinates(forLocationNamed:)).
+    private let homeContext = "Guarapuava, Paraná, Brasil"
+    /// A result this close to the default counts as "the home area" (Guarapuava is ~50 km across).
+    private let homeAreaRadius: CLLocationDistance = 60_000
+
     private weak var bandManager: BandManager?
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Weather")
 
+    // iPhone GPS so the band's weather follows where the user actually is (every request uses it).
+    private let locationManager = CLLocationManager()
+    private var lastFix: (location: CLLocation, at: Date)?
+    private let fixTTL: TimeInterval = 5 * 60           // reuse a fix across back-to-back requests
+    private var isRequestingFix = false
+    private var fixWaiters: [CheckedContinuation<CLLocation?, Never>] = []
+    private var placeNameCache: [String: String] = [:]  // rounded "lat,lon" → reverse-geocoded city
+
+    // The proactive push at the end of every sync would re-fetch and re-send on each sync (minutes
+    // apart). Weather doesn't change that fast, so throttle it. Band-initiated requests
+    // (onWeatherConditionsRequest) bypass this — the band's weather screen is waiting on that answer.
+    private let proactiveThrottle: TimeInterval = 30 * 60
+    private let lastProactivePushKey = "myband.lastWeatherPush"
+
     func setup(manager: BandManager) {
         bandManager = manager
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyKilometer   // city-level is enough for weather
         // The band pulls weather on its own schedule (on connect, when its weather screen opens). It's
         // the trigger the band's UI actually waits on, so respond to it — a proactive push alone won't
         // populate the widget. Echo the location the band asked for so it binds our data correctly.
@@ -39,17 +63,163 @@ final class WeatherSyncService {
     /// key/name are echoed back so the band associates the data with the location it asked about.
     func pushWeather(requestedKey: String = "", requestedName: String = "") async {
         guard bandManager?.connectionState.isConnected == true else { return }
+
+        let proactive = requestedKey.isEmpty
+        if proactive {
+            let last = UserDefaults.standard.double(forKey: lastProactivePushKey)
+            if last > 0, Date().timeIntervalSince1970 - last < proactiveThrottle {
+                log.debug("Weather pushed recently — skipping proactive push")
+                return
+            }
+        }
+
+        let target = await resolveLocation(requestedKey: requestedKey, requestedName: requestedName)
         do {
-            let data = try await fetch()
-            sendToBand(data, requestedKey: requestedKey, requestedName: requestedName)
+            let data = try await fetch(latitude: target.lat, longitude: target.lon)
+            sendToBand(data, name: target.name, code: target.code, isCurrent: target.isCurrent)
+            if proactive {
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastProactivePushKey)
+            }
         } catch {
             log.error("Weather fetch failed: \(error.localizedDescription)")
         }
     }
 
+    // MARK: - Location resolution
+    //
+    // Resolution order (per user choice — the weather always follows where the phone is):
+    //   1. iPhone GPS — every request, foreground or background. The band's requested key is echoed so
+    //      its waiting tile binds to our reply, but the data and label are the user's real location.
+    //   2. GPS denied/unavailable → the band's named location, geocoded (saved-location behaviour).
+    //   3. Nothing resolved → the default location (Guarapuava).
+
+    private func resolveLocation(requestedKey: String, requestedName: String)
+        async -> (lat: Double, lon: Double, name: String, code: String, isCurrent: Bool) {
+
+        if let loc = await currentLocation() {
+            let name = await placeName(for: loc) ?? (requestedName.isEmpty ? "Localização atual" : requestedName)
+            // Echo the requested key so the band binds the reply to the tile it's waiting on; for a
+            // proactive push (no request) derive a stable key from the resolved name.
+            let code = requestedKey.isEmpty ? locationKey(name) : requestedKey
+            log.info("Weather location from GPS: \(name) (\(loc.coordinate.latitude), \(loc.coordinate.longitude))")
+            return (loc.coordinate.latitude, loc.coordinate.longitude, name, code, true)
+        }
+
+        if !requestedName.isEmpty, let coord = await coordinates(forLocationNamed: requestedName) {
+            return (coord.lat, coord.lon, requestedName, requestedKey, requestedKey.isEmpty)
+        }
+
+        let name = requestedName.isEmpty ? locationName : requestedName
+        let code = requestedKey.isEmpty ? locationKey(locationName) : requestedKey
+        return (latitude, longitude, name, code, requestedKey.isEmpty)
+    }
+
+    /// A single GPS fix, reusing a recent one across back-to-back requests. Returns nil when location
+    /// is denied/restricted; on first use (notDetermined) it asks for When-In-Use and returns nil for
+    /// this round (the next request will have the answer).
+    private func currentLocation() async -> CLLocation? {
+        switch locationManager.authorizationStatus {
+        case .notDetermined:
+            locationManager.requestWhenInUseAuthorization()
+            return nil
+        case .authorizedWhenInUse, .authorizedAlways:
+            break
+        default:
+            return nil
+        }
+
+        if let fix = lastFix, Date().timeIntervalSince(fix.at) < fixTTL { return fix.location }
+
+        return await withCheckedContinuation { (cont: CheckedContinuation<CLLocation?, Never>) in
+            fixWaiters.append(cont)
+            guard !isRequestingFix else { return }
+            isRequestingFix = true
+            locationManager.requestLocation()
+            // requestLocation can hang; cap it and fall back to the last cached fix.
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(8))
+                self?.finishFix(self?.locationManager.location)
+            }
+        }
+    }
+
+    private func finishFix(_ location: CLLocation?) {
+        guard isRequestingFix else { return }
+        isRequestingFix = false
+        if let location { lastFix = (location, Date()) }
+        let result = location ?? lastFix?.location
+        let waiters = fixWaiters
+        fixWaiters = []
+        waiters.forEach { $0.resume(returning: result) }
+    }
+
+    /// Reverse-geocodes a fix to a city name for the band's label. Cached by ~1 km cell.
+    private func placeName(for loc: CLLocation) async -> String? {
+        let cellKey = String(format: "%.2f,%.2f", loc.coordinate.latitude, loc.coordinate.longitude)
+        if let cached = placeNameCache[cellKey] { return cached }
+        guard let placemarks = try? await CLGeocoder().reverseGeocodeLocation(loc, preferredLocale: Locale(identifier: "pt_BR")),
+              let p = placemarks.first else { return nil }
+        let name = p.locality ?? p.subAdministrativeArea ?? p.name
+        if let name { placeNameCache[cellKey] = name }
+        return name
+    }
+
+    // MARK: - Geocoding
+
+    /// Resolves a band-supplied location name to coordinates via CLGeocoder. Results are cached
+    /// (persisted) because the band re-requests on every connect and Apple rate-limits geocoding.
+    ///
+    /// The hard case is that the band's locations are usually *neighbourhoods* of the home city
+    /// ("Santa Cruz" is a bairro of Guarapuava), and a bare geocode of such a name matches a far
+    /// same-named city (Santa Cruz do Sul, Santa Cruz de la Sierra…) — worse than the old default.
+    /// So we try the name qualified with the home city first and accept it only when it lands in the
+    /// home area; otherwise we fall back to the bare name (a genuinely different, possibly distant,
+    /// configured city), and finally to nil (caller uses the default).
+    private func coordinates(forLocationNamed name: String) async -> (lat: Double, lon: Double)? {
+        let cacheKey = name.lowercased()
+        if let hit = (UserDefaults.standard.dictionary(forKey: geocodeCacheKey) as? [String: [Double]])?[cacheKey],
+           hit.count == 2 {
+            return (hit[0], hit[1])
+        }
+
+        let home = CLLocation(latitude: latitude, longitude: longitude)
+        let qualified = await geocode("\(name), \(homeContext)")
+        let resolved: CLLocation?
+        if let q = qualified, q.distance(from: home) < homeAreaRadius {
+            resolved = q                                   // a local neighbourhood of the home city
+        } else {
+            resolved = await geocode(name) ?? qualified    // a different city; else the qualified hit
+        }
+
+        guard let loc = resolved else {
+            log.info("Could not geocode \"\(name)\" — using default location")
+            return nil
+        }
+        let coord = (lat: loc.coordinate.latitude, lon: loc.coordinate.longitude)
+        // Re-read before writing: a concurrent request (the band can ask about two locations at once)
+        // may have added its own entry during the awaits above, which a stale copy would clobber.
+        var cache = UserDefaults.standard.dictionary(forKey: geocodeCacheKey) as? [String: [Double]] ?? [:]
+        cache[cacheKey] = [coord.lat, coord.lon]
+        UserDefaults.standard.set(cache, forKey: geocodeCacheKey)
+        log.info("Geocoded \"\(name)\" → \(coord.lat), \(coord.lon)")
+        return coord
+    }
+
+    /// One geocoding pass, biased toward the home region. A fresh geocoder per call: CLGeocoder
+    /// rejects concurrent requests on a single instance, and the band can ask about two locations
+    /// back-to-back.
+    private func geocode(_ query: String) async -> CLLocation? {
+        let region = CLCircularRegion(center: CLLocationCoordinate2D(latitude: latitude, longitude: longitude),
+                                      radius: 2_000_000, identifier: "weather-hint")
+        guard let placemarks = try? await CLGeocoder().geocodeAddressString(query, in: region, preferredLocale: Locale(identifier: "pt_BR")) else {
+            return nil
+        }
+        return placemarks.first?.location
+    }
+
     // MARK: - Open-Meteo fetch
 
-    private func fetch() async throws -> OpenMeteoResponse {
+    private func fetch(latitude: Double, longitude: Double) async throws -> OpenMeteoResponse {
         var comps = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
         comps.queryItems = [
             .init(name: "latitude",  value: String(latitude)),
@@ -74,14 +244,9 @@ final class WeatherSyncService {
 
     // MARK: - Build + send
 
-    private func sendToBand(_ w: OpenMeteoResponse, requestedKey: String = "", requestedName: String = "") {
+    private func sendToBand(_ w: OpenMeteoResponse, name: String, code: String, isCurrent: Bool) {
         guard let manager = bandManager else { return }
         let tz = TimeZone(secondsFromGMT: w.utcOffsetSeconds) ?? .current
-
-        // Answering a request → mirror the band's key/name; proactive push → our default as current location.
-        let name      = requestedName.isEmpty ? locationName : requestedName
-        let code      = requestedKey.isEmpty ? locationKey(locationName) : requestedKey
-        let isCurrent = requestedKey.isEmpty
 
         let metadata = makeMetadata(timestamp: w.current.time, tz: tz, name: name, code: code, isCurrent: isCurrent)
 
@@ -203,6 +368,32 @@ final class WeatherSyncService {
         case 85, 86:       return 13  // SNOW_SHOWERS
         case 95, 96, 99:   return 4   // THUNDERSTORM
         default:           return 2   // OVERCAST
+        }
+    }
+}
+
+// MARK: - CLLocationManagerDelegate
+//
+// Callbacks are nonisolated (CoreLocation calls on an arbitrary queue) and hop to the main actor to
+// settle the in-flight one-shot fix. A new authorization grant retries any waiter immediately.
+
+extension WeatherSyncService: CLLocationManagerDelegate {
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        let last = locations.last
+        Task { @MainActor in self.finishFix(last) }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor in self.finishFix(self.locationManager.location) }
+    }
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        Task { @MainActor in
+            if status == .authorizedWhenInUse || status == .authorizedAlways, self.isRequestingFix {
+                self.locationManager.requestLocation()
+            }
         }
     }
 }

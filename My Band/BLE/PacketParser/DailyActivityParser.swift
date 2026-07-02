@@ -83,6 +83,14 @@ final class XiaomiBitGroupReader {
 
 enum DailyDetailsParser {
 
+    // A human tops out around 5 steps/second; 1000/min (≈17/s) is already impossible. A value above
+    // this means the bit cursor is misaligned — the 14-bit steps field is reading unrelated bytes,
+    // which tops out near 16383 and, summed over a file, produced ~1.4M phantom steps. When it
+    // happens the whole record stream is garbage, so discard the file rather than write any of it.
+    // (The fetch-side file-id check in BandSyncer is the primary guard; this is defence in depth for
+    // a genuinely corrupt daily-details file that still carries the right id.)
+    private static let maxPlausibleStepsPerMinute = 1000
+
     static func parse(_ data: Data, meta: XiaomiActivityFileMeta) -> [ActivityMinuteSample] {
         let headerSize: Int
         switch meta.version {
@@ -155,6 +163,8 @@ enum DailyDetailsParser {
                 _ = parser.nextGroup(16)                  // light
                 _ = parser.nextGroup(16)                  // body momentum
             }
+
+            if let s = steps, s > maxPlausibleStepsPerMinute { return [] }
 
             samples.append(ActivityMinuteSample(
                 date: minute, steps: zeroNil(steps), caloriesKcal: zeroNil(calories),

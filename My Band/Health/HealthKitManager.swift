@@ -29,6 +29,10 @@ final class HealthKitManager {
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Health")
 
     private let syncVersion = 1
+    /// Reconciled minutes newer than this are skipped: the iPhone pedometer may not have written
+    /// them to HealthKit yet, so reconciling them would delta against a near-zero baseline and inflate
+    /// the surplus. They're reconciled on a later sync once settled (the band re-offers today's file).
+    private let reconcileSettleWindow: TimeInterval = 15 * 60
 
     var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
@@ -48,20 +52,46 @@ final class HealthKitManager {
     private let bodyMass         = HKQuantityType(.bodyMass)
     private let bodyMassIndex    = HKQuantityType(.bodyMassIndex)
     private let height           = HKQuantityType(.height)
+    private let physicalEffort   = HKQuantityType(.physicalEffort)
+    private let runningSpeed     = HKQuantityType(.runningSpeed)
+    private let runningStride    = HKQuantityType(.runningStrideLength)
+    private let cyclingSpeedType = HKQuantityType(.cyclingSpeed)
+    private let hrRecovery       = HKQuantityType(.heartRateRecoveryOneMinute)
     private let workoutType      = HKObjectType.workoutType()
     private let routeType        = HKSeriesType.workoutRoute()
 
+    /// MET: 1 kcal por kg por hora — a unidade do physicalEffort e do HKMetadataKeyAverageMETs.
+    private static let metUnit = HKUnit.kilocalorie()
+        .unitDivided(by: HKUnit.gramUnit(with: .kilo).unitMultiplied(by: .hour()))
+
     private var shareTypes: Set<HKSampleType> {
-        [sleepType, heartRate, stepCount, distance, activeEnergy, spo2,
+        var types: Set<HKSampleType> = [sleepType, heartRate, stepCount, distance, activeEnergy, spo2,
          bodyTemp, restingHR, vo2Max, distanceCycling, distanceSwimming, swimStrokes,
-         bodyMass, bodyMassIndex, height, workoutType, routeType]
+         bodyMass, bodyMassIndex, height, workoutType, routeType,
+         physicalEffort, runningSpeed, runningStride, cyclingSpeedType, hrRecovery]
+        if #available(iOS 18.0, *) {
+            types.insert(HKQuantityType(.estimatedWorkoutEffortScore))
+            types.insert(HKQuantityType(.distanceRowing))
+        }
+        return types
     }
 
     // MARK: - Authorization
 
     func requestAuthorization() async throws {
         guard isAvailable else { throw HealthError.unavailable }
-        try await store.requestAuthorization(toShare: shareTypes, read: shareTypes)
+        // Date of birth is read-only (characteristic): age drives the max-HR estimate behind the
+        // workout effort score. Denial is fine — the score falls back to a fixed max HR.
+        var readTypes: Set<HKObjectType> = shareTypes
+        readTypes.insert(HKCharacteristicType(.dateOfBirth))
+        try await store.requestAuthorization(toShare: shareTypes, read: readTypes)
+    }
+
+    /// The newer, enrichment-only types are guarded by this before being added to a save batch: a
+    /// single denied type fails the whole `store.save`, which would break the established pipeline
+    /// (HR/SpO₂/workouts) over an optional metric. Denied/undetermined → that metric is skipped.
+    private func canShare(_ type: HKSampleType) -> Bool {
+        store.authorizationStatus(for: type) == .sharingAuthorized
     }
 
     // MARK: - Sleep
@@ -136,14 +166,23 @@ final class HealthKitManager {
         return try await save(samples)
     }
 
-    // MARK: - Per-minute detail (HR / SpO₂ time series)
+    // MARK: - Per-minute detail (HR / SpO₂ / Physical Effort time series)
     //
     // Band-exclusive vitals only. Distance moved to writeReconciledActivity (it double-counts with
     // the iPhone); HR and SpO₂ have no iPhone equivalent here, so they're written raw at full
     // granularity. Also used for the HR/SpO₂ samples recorded during sleep.
+    //
+    // Physical Effort (METs, the same all-day metric the Apple Watch populates) derives from the
+    // band's per-minute active calories and the user's weight: MET = 1 (resting baseline, which the
+    // band's *active* kcal excludes by definition) + kcal·60/kg. No reconciliation needed — the
+    // iPhone never writes physicalEffort. Sleep-vitals batches carry no calories, so they skip it.
 
     func writeMinuteSamples(_ minutes: [ActivityMinuteSample]) async throws -> Int {
         let bpm = HKUnit.count().unitDivided(by: .minute())
+        var weightKg: Double?
+        if canShare(physicalEffort), minutes.contains(where: { ($0.caloriesKcal ?? 0) > 0 }) {
+            weightKg = (try? await latestBodyMassKg()) ?? nil
+        }
         var samples: [HKSample] = []
         for m in minutes {
             let key = Int(m.date.timeIntervalSince1970)
@@ -153,6 +192,14 @@ final class HealthKitManager {
             if let s = m.spo2, (50...100).contains(s) {
                 samples.append(quantity(spo2, .percent(), Double(s) / 100.0, start: m.date, end: m.date, id: "mb-spo2-\(key)"))
             }
+            if let kcal = m.caloriesKcal, kcal > 0, let w = weightKg, w > 0 {
+                let met = 1.0 + Double(kcal) * 60.0 / w
+                if (1.0...30.0).contains(met) {
+                    samples.append(quantity(physicalEffort, Self.metUnit, met,
+                                            start: m.date, end: m.date.addingTimeInterval(60),
+                                            id: "mb-effort-\(key)"))
+                }
+            }
         }
         return try await save(samples)
     }
@@ -161,11 +208,14 @@ final class HealthKitManager {
     //
     // Writes only the band's surplus over the iPhone, per minute, so the Health total stops
     // double-counting (see the type header). Each band minute is reconciled against the iPhone's
-    // already-recorded value for that exact minute: delta = max(0, band − iPhone). We rely on the
-    // band reporting *completed* minutes — by the time a minute syncs, the iPhone's pedometer has
-    // long finalised it, so the delta is stable and re-syncing (idempotent via sync identifier)
-    // reproduces the same value. If the user denied read access the iPhone sums come back empty and
-    // we fall back to writing the full band value — the safe direction (band stays authoritative).
+    // already-recorded value for that exact minute: delta = max(0, band − iPhone). Two things keep
+    // the surplus accurate across re-syncs: (1) minutes inside reconcileSettleWindow are skipped, so
+    // the iPhone's pedometer has had time to write them before we delta against it; (2) a monotonic
+    // sync version lets a later sync REPLACE an earlier surplus with a corrected one — HealthKit only
+    // replaces a same-identifier sample when the new version is strictly greater (equal/lower saves
+    // are ignored), so a constant version would freeze a first, possibly inflated, write forever. If
+    // the user denied read access the iPhone sums come back empty and we fall back to writing the
+    // full band value — the safe direction (band stays authoritative).
 
     func writeReconciledActivity(_ minutes: [ActivityMinuteSample],
                                  excludingWorkouts windows: [(start: Date, end: Date)] = []) async throws -> Int {
@@ -175,22 +225,31 @@ final class HealthKitManager {
         // so they're always reconciled.
         func inWorkout(_ d: Date) -> Bool { windows.contains { d >= $0.start && d < $0.end } }
 
-        let steps = minutes.compactMap { m in m.steps.map { (m.date, Double($0)) } }
-        let dist  = minutes.filter { !inWorkout($0.date) }.compactMap { m in m.distanceMeters.map { (m.date, $0) } }
-        let cals  = minutes.filter { !inWorkout($0.date) }.compactMap { m in m.caloriesKcal.map { (m.date, Double($0)) } }
+        // Skip minutes the iPhone may not have finalised yet (see the type header). Skipped recent
+        // minutes are reconciled on a later sync — the band keeps re-offering today's growing file.
+        let cutoff = Date().addingTimeInterval(-reconcileSettleWindow)
+        func settled(_ d: Date) -> Bool { d < cutoff }
+
+        let steps = minutes.filter { settled($0.date) }.compactMap { m in m.steps.map { (m.date, Double($0)) } }
+        let dist  = minutes.filter { settled($0.date) && !inWorkout($0.date) }.compactMap { m in m.distanceMeters.map { (m.date, $0) } }
+        let cals  = minutes.filter { settled($0.date) && !inWorkout($0.date) }.compactMap { m in m.caloriesKcal.map { (m.date, Double($0)) } }
+
+        // Strictly-increasing across the BLE-round-trip gap between any two syncs, so the later sync's
+        // recomputed (usually smaller) delta replaces the earlier one instead of being discarded.
+        let version = Int(Date().timeIntervalSince1970)
 
         var samples: [HKSample] = []
-        samples += try await reconciledSurplus(stepCount, .count(), steps, idPrefix: "mb-steps-rec")
-        samples += try await reconciledSurplus(distance, .meter(), dist, idPrefix: "mb-dist-rec")
-        samples += try await reconciledSurplus(activeEnergy, .kilocalorie(), cals, idPrefix: "mb-cal-rec")
+        samples += try await reconciledSurplus(stepCount, .count(), steps, idPrefix: "mb-steps-rec", version: version)
+        samples += try await reconciledSurplus(distance, .meter(), dist, idPrefix: "mb-dist-rec", version: version)
+        samples += try await reconciledSurplus(activeEnergy, .kilocalorie(), cals, idPrefix: "mb-cal-rec", version: version)
         return try await save(samples)
     }
 
     /// Builds per-minute "surplus" samples for one quantity type: band value minus the iPhone's sum
-    /// for the same minute, dropped when ≤ 0.
+    /// for the same minute, dropped when ≤ 0. `version` is the monotonic sync version (see caller).
     private func reconciledSurplus(_ type: HKQuantityType, _ unit: HKUnit,
                                    _ values: [(date: Date, value: Double)],
-                                   idPrefix: String) async throws -> [HKSample] {
+                                   idPrefix: String, version: Int) async throws -> [HKSample] {
         let points = values.filter { $0.value > 0 }.sorted { $0.date < $1.date }
         guard let first = points.first?.date, let last = points.last?.date else { return [] }
         let end = last.addingTimeInterval(60)
@@ -203,7 +262,7 @@ final class HealthKitManager {
             guard delta > 0 else { continue }
             out.append(quantity(type, unit, delta,
                                 start: p.date, end: p.date.addingTimeInterval(60),
-                                id: "\(idPrefix)-\(key)"))
+                                id: "\(idPrefix)-\(key)", version: version))
         }
         return out
     }
@@ -272,10 +331,15 @@ final class HealthKitManager {
                        heartRates: [Int: [WorkoutHRSample]] = [:]) async throws -> Int {
         var written = 0
         let bpm = HKUnit.count().unitDivided(by: .minute())
+        // Weight (average METs) and age (max-HR estimate behind the effort score) are fetched once
+        // per batch; both degrade gracefully when absent.
+        let weightKg = (try? await latestBodyMassKg()) ?? nil
+        let estimatedMaxHR = estimatedMaxHeartRate()
 
         for w in workouts {
             guard w.endDate > w.startDate else { continue }
             let key = Int(w.startDate.timeIntervalSince1970)
+            let track = Self.route(forWorkoutStart: w.startDate, in: routes)
 
             let config = HKWorkoutConfiguration()
             config.activityType = Self.activityType(w.kind)
@@ -290,12 +354,41 @@ final class HealthKitManager {
                                         start: w.startDate, end: w.endDate, id: "mb-wkcal-\(key)"))
             }
             if let dist = w.distanceMeters {
-                samples.append(quantity(Self.distanceType(w.kind, distance, distanceCycling, distanceSwimming),
-                                        .meter(), dist, start: w.startDate, end: w.endDate, id: "mb-wdist-\(key)"))
+                var distType = Self.distanceType(w.kind, distance, distanceCycling, distanceSwimming)
+                // Rowing got its own quantity on iOS 18; before that it fell into the default
+                // distanceWalkingRunning branch, silently inflating the walking total.
+                if #available(iOS 18.0, *), w.kind == .rowing || w.kind == .rowingMachine,
+                   canShare(HKQuantityType(.distanceRowing)) {
+                    distType = HKQuantityType(.distanceRowing)
+                }
+                samples.append(quantity(distType, .meter(), dist,
+                                        start: w.startDate, end: w.endDate, id: "mb-wdist-\(key)"))
             }
             if let strokes = w.strokes, Self.activityType(w.kind) == .swimming {
                 samples.append(quantity(swimStrokes, .count(), strokes,
                                         start: w.startDate, end: w.endDate, id: "mb-wstrokes-\(key)"))
+            }
+            // In-workout speed series from the GPS track (V2 points carry m/s), so Apple Health
+            // draws the speed/pace graph. Running kinds → runningSpeed, cycling → cyclingSpeed.
+            // Walking/hiking are deliberately excluded: walkingSpeed feeds the iPhone's Mobility
+            // metrics, which stay iPhone-authoritative (see writeReconciledActivity's rationale).
+            if let track, let speedType = Self.speedType(w.kind), canShare(speedType) {
+                let mps = HKUnit.meter().unitDivided(by: .second())
+                for p in track where w.startDate ... w.endDate ~= p.date {
+                    guard let v = p.speed, v > 0, v < 30 else { continue }
+                    samples.append(quantity(speedType, mps, v, start: p.date, end: p.date,
+                                            id: "mb-wspd-\(key)-\(Int(p.date.timeIntervalSince1970))"))
+                }
+            }
+            // Average stride length for runs — the band only has workout totals (distance/steps),
+            // so it's one sample spanning the workout, not a per-step series.
+            if Self.activityType(w.kind) == .running, canShare(runningStride),
+               let dist = w.distanceMeters, let steps = w.steps, steps > 0 {
+                let stride = dist / steps
+                if (0.3...3.0).contains(stride) {
+                    samples.append(quantity(runningStride, .meter(), stride,
+                                            start: w.startDate, end: w.endDate, id: "mb-wstride-\(key)"))
+                }
             }
             // Per-second HR series recorded during the workout, attached to this HKWorkout so Apple
             // Health shows the in-workout heart-rate graph. Added to the builder collection (before
@@ -326,17 +419,51 @@ final class HealthKitManager {
             if let mx = w.hrMax  { metadata["MiBandMaxHeartRate"] = mx }
             if let mn = w.hrMin  { metadata["MiBandMinHeartRate"] = mn }
             if let style = w.swimStyle { metadata["MiBandSwimStyle"] = style }
+            // Average intensity in METs (same math as the per-minute physicalEffort samples):
+            // resting baseline + active kcal per kg per hour. Health shows it in the workout detail.
+            if let kcal = w.caloriesKcal, let weightKg, weightKg > 0, w.duration > 60 {
+                let met = 1.0 + kcal * 3600.0 / (weightKg * w.duration)
+                if (1.0...30.0).contains(met) {
+                    metadata[HKMetadataKeyAverageMETs] = HKQuantity(unit: Self.metUnit, doubleValue: met)
+                }
+            }
             try await builder.addMetadata(metadata)
 
             try await builder.endCollection(at: w.endDate)
             guard let workout = try await builder.finishWorkout() else { continue }
             written += 1
 
-            // VO₂max is a standalone sample (not a workout statistic).
+            // VO₂max is a standalone sample (not a workout statistic). The test-type metadata tells
+            // Health it's a sub-maximal exercise prediction (which is how the band estimates it),
+            // same as the Apple Watch's own samples.
             if let vo2 = w.vo2Max, (10...90).contains(vo2) {
                 let unit = HKUnit.literUnit(with: .milli)
                     .unitDivided(by: HKUnit.gramUnit(with: .kilo).unitMultiplied(by: .minute()))
-                try await save([quantity(vo2Max, unit, vo2, start: w.endDate, end: w.endDate, id: "mb-vo2-\(key)")])
+                var meta = syncMetadata("mb-vo2-\(key)")
+                meta[HKMetadataKeyVO2MaxTestType] = HKVO2MaxTestType.predictionSubMaxExercise.rawValue
+                try await save([HKQuantitySample(type: vo2Max, quantity: HKQuantity(unit: unit, doubleValue: vo2),
+                                                 start: w.endDate, end: w.endDate, metadata: meta)])
+            }
+
+            // Estimated workout effort (iOS 18): the Fitness app's 1–10 "Effort" scale, derived
+            // from the band's average workout HR as a fraction of the age-estimated max HR
+            // (linear: 45% → 1, 90%+ → 10). The sample must be saved and then *related* to the
+            // workout — the relationship is what Fitness displays. Best-effort: a failure here
+            // must not abort the batch (the workout itself is already saved).
+            if #available(iOS 18.0, *), let avg = w.hrAvg, (60...220).contains(avg),
+               canShare(HKQuantityType(.estimatedWorkoutEffortScore)) {
+                let score = min(10.0, max(1.0, ((avg / estimatedMaxHR - 0.40) * 20).rounded()))
+                let sample = HKQuantitySample(
+                    type: HKQuantityType(.estimatedWorkoutEffortScore),
+                    quantity: HKQuantity(unit: .appleEffortScore(), doubleValue: score),
+                    start: w.startDate, end: w.endDate,
+                    metadata: syncMetadata("mb-weffort-\(key)"))
+                do {
+                    try await save([sample])
+                    _ = try await store.relateWorkoutEffortSample(sample, with: workout, activity: nil)
+                } catch {
+                    log.error("Workout effort score failed (start \(key)): \(error.localizedDescription)")
+                }
             }
 
             // Attach the GPS route, if this workout had one. A route failure must not abort the
@@ -451,6 +578,90 @@ final class HealthKitManager {
         }
     }
 
+    /// Quantity type for the in-workout GPS speed series. Only kinds whose speed has a dedicated
+    /// HealthKit type; walking/hiking return nil on purpose — walkingSpeed would feed the iPhone's
+    /// Mobility metrics, which stay iPhone-authoritative.
+    private static func speedType(_ kind: WorkoutKind) -> HKQuantityType? {
+        switch kind {
+        case .running, .trailRun: HKQuantityType(.runningSpeed)
+        case .outdoorCycling:     HKQuantityType(.cyclingSpeed)
+        default:                  nil
+        }
+    }
+
+    // MARK: - Cardio Recovery (heartRateRecoveryOneMinute)
+    //
+    // The band's 1 Hz workout series stops exactly at the workout end (sample count == duration),
+    // so recovery can't come from the workout file alone. But the daily per-minute file keeps
+    // sampling HR after the workout: once that batch arrives, each recent workout's end-of-exercise
+    // peak (the 1 Hz samples already written to Health) is paired with the per-minute reading
+    // closest to end+60 s. Both readings are real band measurements — nothing synthesized. This
+    // runs on the daily-details path (not writeWorkouts) because the workout may have been written
+    // by an earlier targeted post-workout sync, before the minute file existed.
+
+    func writeHeartRateRecoveries(minutes: [ActivityMinuteSample]) async throws -> Int {
+        guard canShare(hrRecovery) else { return 0 }
+        let hrMinutes = minutes
+            .compactMap { m in m.heartRate.map { (date: m.date, bpm: $0) } }
+            .filter { (30...250).contains($0.bpm) }
+            .sorted { $0.date < $1.date }
+        guard let first = hrMinutes.first?.date, let last = hrMinutes.last?.date else { return 0 }
+
+        // Our workouts whose end+60 s reading could be inside this batch's span.
+        let workouts = try await ownWorkouts(endingBetween: first.addingTimeInterval(-90),
+                                             and: last.addingTimeInterval(-30))
+        let bpm = HKUnit.count().unitDivided(by: .minute())
+        var samples: [HKSample] = []
+        for workout in workouts where workout.duration >= 120 {
+            let target = workout.endDate.addingTimeInterval(60)
+            // Per-minute grid means the reading rarely lands exactly on end+60; ±30 s tolerance.
+            guard let recovery = hrMinutes
+                .filter({ abs($0.date.timeIntervalSince(target)) <= 30 })
+                .min(by: { abs($0.date.timeIntervalSince(target)) < abs($1.date.timeIntervalSince(target)) })
+            else { continue }
+            // try? — a window with no samples (workout without a 1 Hz series) reports errorNoData;
+            // that just means "no recovery for this one", not a batch failure.
+            guard let peak = try? await ownHeartRatePeak(
+                from: workout.endDate.addingTimeInterval(-60), to: workout.endDate) else { continue }
+            let drop = peak - Double(recovery.bpm)
+            guard (1...120).contains(drop) else { continue }   // HR must actually have dropped
+            let key = Int(workout.startDate.timeIntervalSince1970)
+            samples.append(quantity(hrRecovery, bpm, drop, start: target, end: target, id: "mb-hrr-\(key)"))
+        }
+        return try await save(samples)
+    }
+
+    /// Workouts written by this app whose endDate falls in [start, end].
+    private func ownWorkouts(endingBetween start: Date, and end: Date) async throws -> [HKWorkout] {
+        let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
+        let time = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictEndDate)
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [mine, time])
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[HKWorkout], Error>) in
+            let q = HKSampleQuery(sampleType: workoutType, predicate: predicate,
+                                  limit: HKObjectQueryNoLimit, sortDescriptors: nil) { _, samples, error in
+                if let error { cont.resume(throwing: error); return }
+                cont.resume(returning: (samples as? [HKWorkout]) ?? [])
+            }
+            store.execute(q)
+        }
+    }
+
+    /// Peak of this app's own HR samples in [start, end] — the workout's 1 Hz series tail.
+    private func ownHeartRatePeak(from start: Date, to end: Date) async throws -> Double? {
+        let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
+        let time = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [mine, time])
+        let bpm = HKUnit.count().unitDivided(by: .minute())
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Double?, Error>) in
+            let q = HKStatisticsQuery(quantityType: heartRate, quantitySamplePredicate: predicate,
+                                      options: .discreteMax) { _, stats, error in
+                if let error { cont.resume(throwing: error); return }
+                cont.resume(returning: stats?.maximumQuantity()?.doubleValue(for: bpm))
+            }
+            store.execute(q)
+        }
+    }
+
     // MARK: - Helpers
 
     // MARK: - Body mass (scale)
@@ -486,24 +697,46 @@ final class HealthKitManager {
 
     /// Most recent height sample from Apple Health, in metres, or nil if none/denied.
     private func latestHeightMeters() async throws -> Double? {
+        try await latestQuantity(of: height, unit: .meter())
+    }
+
+    /// Most recent body-mass sample from Apple Health (the BLE scale keeps it fresh), in kg.
+    /// Feeds the MET math (physical effort, average workout METs); nil when none/denied.
+    private func latestBodyMassKg() async throws -> Double? {
+        try await latestQuantity(of: bodyMass, unit: .gramUnit(with: .kilo))
+    }
+
+    private func latestQuantity(of type: HKQuantityType, unit: HKUnit) async throws -> Double? {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Double?, Error>) in
             let sort = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
-            let q = HKSampleQuery(sampleType: height, predicate: nil, limit: 1, sortDescriptors: [sort]) { _, samples, error in
+            let q = HKSampleQuery(sampleType: type, predicate: nil, limit: 1, sortDescriptors: [sort]) { _, samples, error in
                 if let error { cont.resume(throwing: error); return }
-                cont.resume(returning: (samples?.first as? HKQuantitySample)?.quantity.doubleValue(for: .meter()))
+                cont.resume(returning: (samples?.first as? HKQuantitySample)?.quantity.doubleValue(for: unit))
             }
             store.execute(q)
         }
     }
 
-    private func quantity(_ type: HKQuantityType, _ unit: HKUnit, _ value: Double,
-                          start: Date, end: Date, id: String) -> HKQuantitySample {
-        HKQuantitySample(type: type, quantity: HKQuantity(unit: unit, doubleValue: value),
-                         start: start, end: end, metadata: syncMetadata(id))
+    /// Tanaka estimate (208 − 0.7·idade) from the Health profile's date of birth; 190 bpm when
+    /// the characteristic is missing or denied. Drives the workout effort score only — never stored.
+    private func estimatedMaxHeartRate() -> Double {
+        guard let dob = try? store.dateOfBirthComponents(),
+              let birth = Calendar.current.date(from: dob) else { return 190 }
+        let age = Date().timeIntervalSince(birth) / 31_557_600
+        guard (5...120).contains(age) else { return 190 }
+        return 208 - 0.7 * age
     }
 
-    private func syncMetadata(_ id: String) -> [String: Any] {
-        [HKMetadataKeySyncIdentifier: id, HKMetadataKeySyncVersion: syncVersion]
+    private func quantity(_ type: HKQuantityType, _ unit: HKUnit, _ value: Double,
+                          start: Date, end: Date, id: String, version: Int? = nil) -> HKQuantitySample {
+        HKQuantitySample(type: type, quantity: HKQuantity(unit: unit, doubleValue: value),
+                         start: start, end: end, metadata: syncMetadata(id, version: version))
+    }
+
+    /// `version` defaults to the constant syncVersion — fine for immutable data (sleep, manual,
+    /// workout). The reconciled-activity path passes a monotonic version so re-syncs can replace.
+    private func syncMetadata(_ id: String, version: Int? = nil) -> [String: Any] {
+        [HKMetadataKeySyncIdentifier: id, HKMetadataKeySyncVersion: version ?? syncVersion]
     }
 
     @discardableResult

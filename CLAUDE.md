@@ -47,8 +47,8 @@ My Band/
 │
 ├── Auth/
 │   ├── AuthKeyStore.swift        # Armazenamento seguro do AuthKey no Keychain
-│   ├── ManualAuthKeyView.swift   # Tela de input manual do AuthKey (hex 32 chars)
-│   └── XiaomiCloudAuth.swift    # Extração do AuthKey via Xiaomi Cloud API
+│   ├── XiaomiCloudAuth.swift     # Extração do AuthKey via Xiaomi Cloud (login QR → beaconkey)
+│   └── XiaomiCloudCrypto.swift   # RC4/SHA-1/SHA-256 da API de conta (separado do XiaomiCrypto BLE)
 │
 ├── Health/
 │   ├── HealthKitManager.swift    # Autorização e escrita no Apple Health
@@ -266,17 +266,29 @@ Ambos os BGTasks são registrados em `register()` (do `AppDelegate.didFinishLaun
 
 ## Extração do AuthKey
 
-### Método 1 — Input Manual
-- Usuário obtém o AuthKey via ferramentas externas (GadgetBridge export, Xiaomi Cloud scraper Python)
+O onboarding (`UI/Setup/SetupView.swift`) é uma máquina de passos: `intro → choose → (xiaomi | key) → conexão`. A tela `choose` oferece os dois métodos; ambos terminam produzindo um hex de 32 chars que passa por `AuthKeyStore.saveHex` (validação + Keychain) e segue para `ConnectingView` (mesmo `onConnect` no `RootView`).
+
+### Método 1 — Input Manual (`SetupView.keyEntry`)
+- Usuário obtém o AuthKey via ferramentas externas (GadgetBridge export, `token_extractor/`, Xiaomi Cloud) e cola no campo
 - App exibe campo hex de 32 caracteres com validação
 - Salvar no Keychain com `kSecAttrAccessibleAfterFirstUnlock` (acessível em background)
+- É o **fallback** de toda falha do método 2 (link "Inserir AuthKey manualmente" em cada etapa)
 
-### Método 2 — Xiaomi Cloud API
-- Endpoint: `https://account.xiaomi.com` → login → token de sessão
-- Com o token, chamar a API de dispositivos para obter `encryptedAuthKey`
-- Descriptografar com a senha do usuário (AES derivado de MD5 da senha)
-- Referência de implementação: `AstroBox-NG-main/abtools.py` (método `get_auth_key`)
-- **Atenção**: armazenar credenciais Xiaomi apenas na Keychain; nunca logar ou persistir a senha
+### Método 2 — Xiaomi Cloud via QR (`Auth/XiaomiCloudAuth.swift`, `UI/Setup/XiaomiLoginView.swift`)
+Porta o `QrCodeXiaomiCloudConnector` do `token_extractor/token_extractor.py` — **login por QR**, sem digitar senha no app (a autenticação acontece do lado da Xiaomi). Fluxo (espelha os steps do Python):
+
+1. `GET /longPolling/loginUrl` → `qr` (imagem), `loginUrl` (URL no QR), `lp` (long-polling), `timeout`
+2. App exibe o QR (escaneável por outro aparelho) **e** abre o `loginUrl` **dentro do app** via `SFSafariViewController` (sheet). É **in-app de propósito**: o modelo é long-poll, não há redirect de volta — o app precisa continuar fazendo o polling enquanto o usuário entra na conta. Abrir em navegador externo (`openURL`) jogaria o app para segundo plano e o iOS **suspenderia a tarefa de polling**, então o sucesso do login nunca seria observado (causa do bug inicial). Catalyst/macOS caem no `openURL`.
+3. **Long-poll** no `lp` até `200` → `userId`, `ssecurity`, `location`
+4. `GET location` → cookie `serviceToken`
+5. Para cada região (`cn, de, us, ru, tw, sg, in, i2`), chamadas **cifradas**: `get_homes` + `get_dev_cnt` → casas; `get_devices` → dispositivos; nos `did` que contêm `blt`, `blt_get_beaconkey` → **beaconkey** (= AuthKey)
+6. Uma pulseira → auto-seleciona; várias → usuário escolhe; o beaconkey entra no mesmo `onConnect`
+
+- **Crypto da API** (`Auth/XiaomiCloudCrypto.swift`, separado do `XiaomiCrypto` do BLE): RC4/ARC4 com o **descarte de 1024 bytes de keystream** do pycryptodome, SHA-1 e SHA-256 (CommonCrypto). `signedNonce = base64(SHA256(b64dec(ssecurity) || b64dec(nonce)))`; cada param é `base64(RC4(key=b64dec(signedNonce)))`; assinatura `base64(SHA1("POST&path&k=v&...&signedNonce"))` — **ordem das chaves preservada** e codificação **`quote_plus`** (réplica do `requests.urlencode`, senão `+`/`/`/`=` quebram a assinatura). Path = tudo após o primeiro `"com"`, com `/app/` → `/`.
+- **`URLSession` efêmera** com cookie jar próprio em memória — nada do login persiste em disco; senha nunca toca o app.
+- **`timeout` do long-poll é em SEGUNDOS** (como no `token_extractor`), não ms — com piso generoso (≥300 s) porque o usuário precisa sair para o login e voltar. O loop tolera timeouts/quedas de rede do long-poll (re-tenta até o deadline) e só aborta em cancelamento. Logs de debug (`[XiaomiCloud]`, só DEBUG) imprimem status/cookies/presença de token — **nunca** os valores de `serviceToken`/beaconkey.
+- **A validar (conta real):** os endpoints da Xiaomi Cloud são frágeis e dependentes de região/conta. Portado fielmente da referência, mas sem validação ao vivo ainda. Login por **senha** (captcha/2FA) e **QR** existem no `token_extractor`; só o QR foi portado.
+- **Atenção**: o beaconkey é o segredo de pareamento — tratado como AuthKey (Keychain, nunca logado/persistido fora dele).
 
 ---
 
@@ -300,8 +312,18 @@ Ambos os BGTasks são registrados em `register()` (do `AppDelegate.didFinishLaun
 | Treino | `HKObjectType.workoutType()` via `HKWorkoutBuilder` (mapeado para `HKWorkoutActivityType`) |
 | Rota de treino (GPS) | `HKSeriesType.workoutRoute()` via `HKWorkoutRouteBuilder` |
 | Peso (balança BLE) | `HKQuantityTypeIdentifier.bodyMass` (+ `.bodyMassIndex` derivado de `.height` lida do Health) |
+| Esforço físico (METs/min: kcal ativas da pulseira ÷ peso do Health) | `HKQuantityTypeIdentifier.physicalEffort` |
+| Esforço do treino, escala 1–10 (FC média ÷ FCmáx por idade, Tanaka) | `.estimatedWorkoutEffortScore` (iOS 18+, via `relateWorkoutEffortSample`) |
+| Recuperação cardíaca (pico do fim do treino − FC/min em fim+60 s) | `HKQuantityTypeIdentifier.heartRateRecoveryOneMinute` |
+| Velocidade em treino (pontos GPS V2, m/s) | `.runningSpeed` / `.cyclingSpeed` |
+| Passada média de corrida (distância ÷ passos) | `HKQuantityTypeIdentifier.runningStrideLength` |
+| Distância de remo (iOS 18+; antes caía em distância a pé) | `HKQuantityTypeIdentifier.distanceRowing` |
 
-> **`appleStandHour` NÃO é gravável.** `HKCategoryTypeIdentifier.appleStandHour` é reservado (o sistema o deriva do Apple Watch). Incluí-lo em `requestAuthorization(toShare:)` lança `NSInvalidArgumentException`. A máscara de horas em pé da pulseira fica só local — não há tipo "stand hour" gravável por apps de terceiros.
+> **`appleStandHour` NÃO é gravável.** `HKCategoryTypeIdentifier.appleStandHour` é reservado (o sistema o deriva do Apple Watch). Incluí-lo em `requestAuthorization(toShare:)` lança `NSInvalidArgumentException`. A máscara de horas em pé da pulseira fica só local — não há tipo "stand hour" gravável por apps de terceiros. O mesmo vale para `appleExerciseTime`, `appleMoveTime`, `appleStandTime` (anéis de atividade) e `walkingHeartRateAverage` — todos read-only para terceiros, sem contorno.
+>
+> **Recuperação cardíaca roda no caminho do arquivo diário, não no `writeWorkouts`.** A série 1 Hz do treino termina exatamente no fim do treino (count == duration), então a leitura de fim+60 s só chega no arquivo de detalhe diário seguinte. `writeHeartRateRecoveries` consulta os treinos recentes **do próprio app** no Health (independe de qual sync gravou o treino), casa o pico do último minuto (série 1 Hz, `HKStatisticsQuery` discreteMax) com a leitura por minuto mais próxima de fim+60 s (±30 s) e grava o delta. Best-effort no `BandSyncer` — não bloqueia os ACKs dos arquivos.
+>
+> **Mobilidade continua exclusiva do iPhone.** `walkingSpeed`/`walkingStepLength` são graváveis, mas alimentariam as métricas de Mobilidade que a reconciliação preserva de propósito — por isso a série de velocidade só é escrita para corrida/ciclismo (`speedType(_:)` devolve nil para caminhada/trilha) e a passada usa `runningStrideLength`, não `walkingStepLength`.
 
 ### Permissões (Info.plist)
 ```

@@ -98,7 +98,12 @@ final class BandManager: NSObject {
 
     private var reconnectAttempts = 0
     private let maxReconnectAttempts = 5
+    private var reconnectTask: Task<Void, Never>?
     private var pendingScan = false
+    // While true, an unexpected disconnect (clean OR error) re-arms a standing reconnect, so the link
+    // self-heals across background range loss without any UI. Cleared only on a user-initiated
+    // disconnect (forget), so we stop chasing a band the user deliberately detached.
+    private var autoReconnect = false
     // Set when reconnectToKnownDevice is called before Bluetooth is powered on; consumed in
     // centralManagerDidUpdateState once .poweredOn.
     private var pendingReconnectID: UUID?
@@ -164,6 +169,8 @@ final class BandManager: NSObject {
     /// longer retrieve the peripheral (e.g. it was never connected on this device).
     func reconnectToKnownDevice(identifier: String) {
         guard let uuid = UUID(uuidString: identifier) else { startScan(); return }
+        autoReconnect = true
+        reconnectAttempts = 0
         guard central.state == .poweredOn else { pendingReconnectID = uuid; return }
         performReconnect(uuid)
     }
@@ -181,6 +188,7 @@ final class BandManager: NSObject {
     func startScan() {
         guard central.state == .poweredOn else { pendingScan = true; return }
         pendingScan = false
+        reconnectAttempts = 0   // fresh user-initiated scan gets a full retry budget
         discoveredDevices.removeAll()
         connectionState = .scanning
         central.scanForPeripherals(withServices: MiBandUUID.scanServices,
@@ -197,6 +205,11 @@ final class BandManager: NSObject {
         stopScan()
         peripheral = target
         peripheral?.delegate = self
+        // Fresh connection (user/bootstrap, not the auth-retry reconnect loop): give it a full
+        // auth-retry budget. Otherwise a previous key's exhausted budget makes the next key give up
+        // after a single first-pairing (sub=16) HMAC mismatch — a correct key then looks "incorreto".
+        authRetries = 0
+        autoReconnect = true
         connectionState = .connecting
         central.connect(target, options: BandScanner.reconnectOptions)
         log.info("Connecting to \(target.name ?? target.identifier.uuidString)")
@@ -228,7 +241,14 @@ final class BandManager: NSObject {
         // continuation resumed by handleAuthSuccess() or failAuth()
     }
 
-    func disconnect() {
+    /// `userInitiated` (forget / explicit "disconnect") clears autoReconnect so we stop chasing the
+    /// band. Background teardown (post-sync, BGTask expiry) passes `false`: the active link is
+    /// released to free the radio, but autoReconnect stays on, so didDisconnectPeripheral re-arms a
+    /// standing connect and iOS brings the link back (and wakes us) when the band is in range.
+    func disconnect(userInitiated: Bool = true) {
+        if userInitiated { autoReconnect = false }
+        reconnectTask?.cancel()
+        reconnectTask = nil
         guard let p = peripheral else { return }
         central.cancelPeripheralConnection(p)
     }
@@ -593,6 +613,12 @@ final class BandManager: NSObject {
               let nonce     = phoneNonce,
               let secretKey = try? AuthKeyStore.load() else { return }
 
+        #if DEBUG
+        // Irreversible fingerprint (not the key) to compare an extracted beaconkey against a
+        // known-working AuthKey when diagnosing HMAC mismatches. Remove once auth is settled.
+        log.debug("AuthKey fingerprint sha256[0..12]=\(XiaomiCloudCrypto.sha256(secretKey).hexString.prefix(12)) len=\(secretKey.count)")
+        #endif
+
         guard let resp = BandAuthenticator.parseWatchNonce(from: protoBytes) else {
             log.warning("Could not parse WatchNonce from proto (\(protoBytes.count) bytes)")
             return
@@ -701,17 +727,38 @@ final class BandManager: NSObject {
 
     // MARK: - Reconnect
 
+    /// Arms a no-timeout standing connect to the known peripheral. iOS holds the request pending and
+    /// reconnects — relaunching the app via state restoration if it was suspended — whenever the band
+    /// returns to range, with NO attempt cap. This is what keeps communication alive across
+    /// background range loss: a clean drop, an error drop, the first-pairing auth retry, and an
+    /// exhausted connect backoff all funnel here. Cheap: a pending connect is low power; iOS only
+    /// wakes us on the actual connect event, not while it waits.
+    private func armStandingReconnect() {
+        reconnectTask?.cancel(); reconnectTask = nil
+        reconnectAttempts = 0
+        guard autoReconnect, let p = peripheral else { connectionState = .disconnected; return }
+        connectionState = .connecting
+        central.connect(p, options: BandScanner.reconnectOptions)
+        log.info("Standing reconnect armed for \(p.identifier)")
+    }
+
+    /// Short exponential backoff for an active connect *failure* (didFailToConnect), so a transient
+    /// error doesn't hammer the radio. Once the budget is spent it falls back to a standing connect,
+    /// which never gives up — the app no longer permanently stops trying after a burst of failures.
     private func scheduleReconnect(to target: CBPeripheral) {
+        guard autoReconnect else { connectionState = .disconnected; return }
         guard reconnectAttempts < maxReconnectAttempts else {
-            log.warning("Max reconnect attempts reached")
-            connectionState = .disconnected
+            log.info("Connect backoff spent — falling back to a standing connect")
+            armStandingReconnect()
             return
         }
         let delay = pow(2.0, Double(reconnectAttempts))
         reconnectAttempts += 1
         log.info("Reconnecting in \(delay)s (attempt \(self.reconnectAttempts)/\(self.maxReconnectAttempts))")
-        Task {
+        reconnectTask?.cancel()
+        reconnectTask = Task {
             try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
             self.central.connect(target, options: BandScanner.reconnectOptions)
         }
     }
@@ -749,7 +796,9 @@ extension BandManager: CBCentralManagerDelegate {
             log.info("Bluetooth powered on")
             if let id = pendingReconnectID { pendingReconnectID = nil; performReconnect(id); return }
             if pendingScan { startScan(); return }
-            if connectionState == .disconnected, let p = peripheral { connect(to: p) }
+            // Bluetooth came back (e.g. toggled off/on, or powered on at launch with a known device):
+            // resume chasing the band whenever we want it and aren't already on it.
+            if autoReconnect, !connectionState.isConnected, let p = peripheral { connect(to: p) }
         case .poweredOff:
             connectionState = .bluetoothUnavailable
         case .unauthorized:
@@ -798,19 +847,21 @@ extension BandManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
-        // A deliberate auth-retry disconnect is "clean" (no error), so check the flag explicitly.
-        let shouldReconnect = retryAuthOnDisconnect || (error != nil)
+        // The auth-retry disconnect (first pairing) just wants a fresh connect, which autoReconnect
+        // now provides — so the flag no longer gates reconnection, it's only consumed here.
         retryAuthOnDisconnect = false
         if let error {
             log.warning("Disconnected with error: \(error.localizedDescription)")
         } else {
             log.info("Disconnected cleanly")
         }
-        // resetState() already sets the right state (.error if an auth attempt was pending,
-        // else .disconnected). Don't clobber it — only force .disconnected when we're not retrying.
         resetState()
-        if shouldReconnect {
-            scheduleReconnect(to: peripheral)
+        // Re-arm on ANY non-user disconnect — clean drops included. The previous code reconnected
+        // only on an error, so a clean background drop (app suspended, range loss) stayed dead until
+        // the user reopened the app and retried by hand. autoReconnect is cleared only by a
+        // user-initiated disconnect (forget), so that path still settles to .disconnected.
+        if autoReconnect {
+            armStandingReconnect()
         } else {
             connectionState = .disconnected
         }

@@ -54,7 +54,7 @@
 	<key>NSLocationAlwaysUsageDescription</key>
 	<string>Permita "Sempre" para que a Mi Band 10 continue recebendo o GPS do iPhone quando a tela estiver bloqueada ou o app em segundo plano durante um treino ao ar livre.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>O My Band envia a localização do iPhone para a Mi Band 10 durante treinos ao ar livre, permitindo que a pulseira registre a rota com GPS.</string>
+	<string>O My Band usa sua localização para enviar à Mi Band 10 a previsão do tempo de onde você está e, durante treinos ao ar livre, a rota com GPS.</string>
 	<key>NSRemindersFullAccessUsageDescription</key>
 	<string>O My Band envia seus lembretes com data para a Mi Band 10, para que a pulseira avise você na hora certa.</string>
 	<key>NSRemindersUsageDescription</key>

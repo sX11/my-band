@@ -11,6 +11,7 @@ struct ConnectingView: View {
     @Environment(BandManager.self) private var band
     var onConnected: () -> Void
     var onRetry: () -> Void
+    var onReconfigure: () -> Void
 
     @State private var ringAnimating = false
 
@@ -56,9 +57,15 @@ struct ConnectingView: View {
             Spacer()
 
             if failed {
-                MBButton(title: "Tentar novamente", variant: .primary, size: .lg,
-                         icon: "arrow.clockwise", block: true, glow: true) {
-                    onRetry()
+                VStack(spacing: MB.Space.x3) {
+                    MBButton(title: "Tentar novamente", variant: .primary, size: .lg,
+                             icon: "arrow.clockwise", block: true, glow: true) {
+                        onRetry()
+                    }
+                    MBButton(title: "Usar outra AuthKey", variant: .ghost, size: .lg,
+                             icon: "key.fill", block: true) {
+                        onReconfigure()
+                    }
                 }
                 .padding(.horizontal, MB.Space.x7)
                 .padding(.bottom, MB.Space.x10)
