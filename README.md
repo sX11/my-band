@@ -1,6 +1,21 @@
 # My Band
 
-App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy usando o AuthKey do dispositivo, eliminando a dependência do app da Xiaomi. Sincroniza dados de saúde com o Apple Health, dispara automações no Home Assistant e expõe funcionalidades via Atalhos e Siri.
+> A Xiaomi fez a Mi Band. Eu a transformei em My Band.
+
+App nativo **iOS/macOS** (SwiftUI + SwiftData) que conecta o iPhone a uma **Mi Band 10** via Bluetooth Low Energy e sincroniza os dados de saúde com o **Apple Health** — sem a nuvem da Xiaomi no caminho, direto da pulseira para um local centralizado e agnóstico. Também dispara automações no Home Assistant e expõe funcionalidades via Atalhos e Siri.
+
+O app oficial da Mi Band 10 não envia todas as métricas coletadas pelo gadget ao Apple Health. O My Band existe para preencher essa lacuna — e para que os dados de saúde sejam de fato do usuário.
+
+---
+
+## Destaques de engenharia
+
+Este é um projeto pessoal que serviu de laboratório para BLE, criptografia aplicada e integração profunda com o HealthKit. O que o torna interessante do ponto de vista técnico:
+
+- **🔐 Autenticação criptográfica revertida e validada em hardware.** Handshake da Mi Band 10 implementado do zero em Swift: troca de nonce, HMAC-SHA256, derivação de chaves de sessão via HKDF e comunicação cifrada com AES (CTR/CCM). Testado em uma pulseira física, com dados reais.
+- **📡 Engenharia reversa de protocolo binário.** Formato de pacotes (frames, CRC-16/ARC, transporte confiável com ACK, protobuf) e parsers para sono, treinos e rota GPS. Inclusive uma **série de frequência cardíaca por segundo que a implementação de referência open-source (GadgetBridge) não decodifica** — layout revertido a partir de capturas reais e validado por CRC-32.
+- **❤️ Integração profunda com HealthKit.** Sono, passos, FC, SpO₂, treinos com rota GPS, esforço físico, esforço de treino e recuperação cardíaca. Destaque: uma camada de **reconciliação por minuto** que grava apenas o excedente da pulseira sobre o iPhone — sem contar passos em dobro e sem quebrar as métricas de Mobilidade que o iOS reserva.
+- **🏗️ Concorrência moderna e disciplina de arquitetura.** Swift 5.10, `async/await`, `@Observable`, `@MainActor`, BLE em segundo plano com state restoration, testes unitários com fixtures de dados reais e um AuthKey que nunca sai do Keychain.
 
 ---
 
@@ -25,13 +40,16 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 | ✅ | Medições manuais no Apple Health (FC, SpO₂) — **validado em hardware (Mi Band 10)** |
 | ✅ | Treinos no Apple Health (`HKWorkout` + rota GPS + VO₂máx) e handshake GPS com o iPhone (CoreLocation → `workoutLocation` stream) — **validado em hardware** |
 | ✅ | Série de FC por segundo do treino anexada ao `HKWorkout` (gráfico de FC dentro do treino) — **validada em hardware** |
+| ✅ | Métricas ricas no Apple Health — esforço físico (METs/min), esforço de treino (iOS 18+), recuperação cardíaca, velocidade/passada e distância de remo, derivadas de medições reais |
+| ✅ | Reconciliação por minuto (grava só o excedente da pulseira sobre o iPhone — sem contar passos em dobro, Mobilidade preservada) — **validada em hardware** |
 | ✅ | Balança BLE OKOK/Chipsea (broadcast-only) → peso + IMC no Apple Health, com perfil de altura — **validada em hardware** |
+| ✅ | Push app→band de tempo (Open-Meteo, seguindo o GPS do iPhone), calendário e lembretes (EventKit), idioma |
 | ✅ | Instalação de watch faces e apps RPK (upload em chunks) — watch faces a confirmar; RPK rejeitado pela Mi Band 10 (provável trava de modelo) |
-| ✅ | Target de testes unitários (Swift Testing, 23 testes) com fixtures reais — **validado no iPhone** |
+| ✅ | Extração do AuthKey via Xiaomi Cloud (login por QR, sem app Xiaomi) — **a validar com conta real** |
+| ✅ | Target de testes unitários (Swift Testing) com fixtures reais — **validado no iPhone** |
 | 🔜 | Telas SleepDetail (hipnograma) + Settings |
 | 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
 | 🔜 | Integração com Atalhos via App Intents |
-| 🔜 | Extração do AuthKey via Xiaomi Cloud (sem app Xiaomi) |
 | 🔜 | Mini app customizado na pulseira com botões acionáveis |
 
 ---
@@ -52,9 +70,9 @@ App iOS/macOS universal que conecta a **Mi Band 10** via Bluetooth Low Energy us
 
 O AuthKey é uma chave de 16 bytes (32 caracteres hex) vinculada ao seu dispositivo. Métodos para obtê-lo:
 
+- **Via o próprio app** — o Setup guia a extração via **Xiaomi Cloud com login por QR** (sem digitar senha no app; a autenticação ocorre do lado da Xiaomi). O app percorre as regiões Xiaomi e recupera o *beaconkey* da pulseira, que é o AuthKey. Fluxo portado do `token_extractor.py`, **ainda a validar com uma conta real**.
 - **Via Python** — [`huami-token`](https://github.com/argrento/huami-token): faz login na conta Xiaomi e extrai o token
 - **Via GadgetBridge** — exportar o AuthKey do banco de dados do app no Android
-- **Via o próprio app** (futuro) — o My Band incluirá um fluxo de extração via Xiaomi Cloud
 
 ### 2. Inserir o AuthKey no app
 
