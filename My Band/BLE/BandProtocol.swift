@@ -269,6 +269,11 @@ enum XiaomiHealthCmd {
     static let workoutStatus:    UInt32 = 26  // CMD_WORKOUT_WATCH_STATUS  (band → app)
     static let workoutOpen:      UInt32 = 30  // CMD_WORKOUT_WATCH_OPEN    (band → app request / app → band reply)
     static let workoutLocation:  UInt32 = 48  // CMD_WORKOUT_LOCATION      (app → band GPS stream)
+
+    // Real-time stats (live HR/steps over the authenticated channel; GadgetBridge XiaomiHealthService)
+    static let realtimeStart:    UInt32 = 45  // CMD_REALTIME_STATS_START  (app → band)
+    static let realtimeStop:     UInt32 = 46  // CMD_REALTIME_STATS_STOP   (app → band)
+    static let realtimeEvent:    UInt32 = 47  // CMD_REALTIME_STATS_EVENT  (band → app: RealTimeStats)
 }
 
 // MARK: - Watch face command IDs (GadgetBridge XiaomiWatchfaceService, type=4)

@@ -133,6 +133,9 @@ final class BandManager: NSObject {
     /// Called when the band's "find phone" feature is toggled (System, subtype=17).
     /// Param = true to start ringing the phone, false to stop (user dismissed it on the band).
     var onFindPhone:             ((Bool) -> Void)?
+    /// Called for each live real-time stats event (Health, subtype=47) while realtime is enabled.
+    /// Param = the current heart rate in bpm. Driven by setRealtimeStats(enabled:).
+    var onRealtimeStats:         ((Int) -> Void)?
     /// Called with the band-assigned id when a Schedule item (e.g. a reminder) is created
     /// (Schedule command carrying schedule.ackId). CalendarSyncService uses it to track which
     /// reminders to delete on the next sync.
@@ -291,6 +294,14 @@ final class BandManager: NSObject {
         } catch {
             log.error("Encryption failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Turns the band's live real-time stats stream on/off. While on, the band pushes RealTimeStats
+    /// events (subtype 47) that arrive via onRealtimeStats. Used for post-workout HR recovery and the
+    /// live-HR shortcut.
+    func setRealtimeStats(enabled: Bool) {
+        sendEncryptedCommand(protoBytes: XiaomiProto.realtimeStatsCommand(enable: enabled))
+        log.info("Realtime stats \(enabled ? "START" : "STOP") sent")
     }
 
     /// Sends one raw file-upload chunk on the DATA channel (plaintext), pacing against
@@ -574,6 +585,9 @@ final class BandManager: NSObject {
             let fileIds = watch.hasActivityFileIds ? watch.activityFileIds : Data()
             log.info("Workout status update: \(watch.status) (\(fileIds.count / 7) file id(s))")
             onWorkoutStatusWatch?(watch.status, fileIds)
+        case XiaomiHealthCmd.realtimeEvent where cmd.hasHealth && cmd.health.hasRealTimeStats:
+            let stats = cmd.health.realTimeStats
+            if stats.hasHeartRate, stats.heartRate > 0 { onRealtimeStats?(Int(stats.heartRate)) }
         default:
             // All other health subtypes (activity fetch responses etc.) go to BandSyncer.
             onProtoCommandReceived?(protoBytes)

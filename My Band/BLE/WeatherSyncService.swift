@@ -30,6 +30,11 @@ final class WeatherSyncService: NSObject {
     private weak var bandManager: BandManager?
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Weather")
 
+    /// Conditions from the last successful band-sync weather fetch. Reused for workout metadata so
+    /// the health sync doesn't fire its own Open-Meteo request per workout (which was timing out and
+    /// tripping the background watchdog). nil until the first fetch of the session succeeds.
+    private(set) var lastConditions: WorkoutWeather?
+
     // iPhone GPS so the band's weather follows where the user actually is (every request uses it).
     private let locationManager = CLLocationManager()
     private var lastFix: (location: CLLocation, at: Date)?
@@ -76,6 +81,9 @@ final class WeatherSyncService: NSObject {
         let target = await resolveLocation(requestedKey: requestedKey, requestedName: requestedName)
         do {
             let data = try await fetch(latitude: target.lat, longitude: target.lon)
+            lastConditions = WorkoutWeather(wmoCode: data.current.weatherCode,
+                                            temperatureC: data.current.temperature2M,
+                                            humidityPct: data.current.relativeHumidity2M)
             sendToBand(data, name: target.name, code: target.code, isCurrent: target.isCurrent)
             if proactive {
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastProactivePushKey)
@@ -233,14 +241,35 @@ final class WeatherSyncService: NSObject {
             // from current conditions, then 6 forecast days).
             .init(name: "forecast_days", value: "7"),
         ]
-        let (bytes, response) = try await URLSession.shared.data(from: comps.url!)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw URLError(.badServerResponse)
-        }
+        let bytes = try await fetchData(comps.url!)
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return try decoder.decode(OpenMeteoResponse.self, from: bytes)
     }
+
+    /// GETs a URL with a short per-attempt timeout and one retry. The default URLSession timeout is
+    /// 60 s, which — on a flaky link — hangs the sync long enough to trip the "background task over
+    /// 30 s" watchdog. Failing fast (8 s) and retrying once keeps weather best-effort without
+    /// stalling the health sync it piggybacks on.
+    private func fetchData(_ url: URL, timeout: TimeInterval = 8, retries: Int = 1) async throws -> Data {
+        var attempt = 0
+        while true {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = timeout
+            do {
+                let (bytes, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                    throw URLError(.badServerResponse)
+                }
+                return bytes
+            } catch {
+                attempt += 1
+                if attempt > retries { throw error }
+                log.debug("Weather fetch retry \(attempt) after: \(error.localizedDescription)")
+            }
+        }
+    }
+
 
     // MARK: - Build + send
 
@@ -396,6 +425,16 @@ extension WeatherSyncService: CLLocationManagerDelegate {
             }
         }
     }
+}
+
+// MARK: - Workout weather
+
+/// Raw conditions for an HKWorkout. The WMO code is mapped to HKWeatherCondition in HealthKitManager
+/// (which owns the HealthKit dependency); this stays framework-agnostic.
+struct WorkoutWeather {
+    let wmoCode: Int
+    let temperatureC: Double
+    let humidityPct: Double
 }
 
 // MARK: - Open-Meteo response model

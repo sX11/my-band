@@ -140,8 +140,9 @@ enum SleepDetailsParser {
         }
 
         if !stages.isEmpty {
+            let sanitized = sanitizeStages(stages)
             result.sessions = [SleepSession(startDate: sessionStart, endDate: sessionEnd,
-                                            phases: stages, rawDataHash: hashOf(data))]
+                                            phases: sanitized, rawDataHash: hashOf(data))]
         } else if let s = summaryMinutes {
             let phases = buildPhasesFromSummary(start: sessionStart,
                                                 deepMin: s.deep, lightMin: s.light,
@@ -161,13 +162,25 @@ enum SleepDetailsParser {
         let unit = Int(r.u16())
         let count = Int(r.u16())
         guard count > 0 else { return [] }
-        let first = version >= 2 ? Int(r.i32()) : bedTime
+        let rawFirst = version >= 2 ? Int(r.u32()) : bedTime
+        let first: Int
+        if rawFirst > 1_500_000_000 {
+            first = rawFirst
+        } else if bedTime > 1_500_000_000 && rawFirst > 0 && rawFirst < 86400 {
+            let bedDate = Date(timeIntervalSince1970: TimeInterval(bedTime))
+            let dayStart = Calendar.current.startOfDay(for: bedDate).timeIntervalSince1970
+            first = Int(dayStart) + rawFirst
+        } else {
+            first = bedTime
+        }
         var out: [(Date, Int)] = []
         out.reserveCapacity(count)
         for i in 0 ..< count {
             let v = Int(r.u8())
             guard range.contains(v) else { continue }
-            out.append((Date(timeIntervalSince1970: TimeInterval(first + unit * i)), v))
+            let sampleTime = TimeInterval(first + unit * i)
+            guard sampleTime > 1_500_000_000 else { continue }
+            out.append((Date(timeIntervalSince1970: sampleTime), v))
         }
         return out
     }
@@ -262,6 +275,22 @@ enum SleepDetailsParser {
     }
 
     // MARK: - Helpers
+
+    /// Eliminates overlapping phases caused by cumulative Xiaomi stage packets.
+    private static func sanitizeStages(_ stages: [SleepPhase]) -> [SleepPhase] {
+        let sorted = stages.sorted { $0.startDate < $1.startDate }
+        var merged: [SleepPhase] = []
+        for s in sorted {
+            guard s.endDate > s.startDate else { continue }
+            if let last = merged.last, s.startDate < last.endDate {
+                if s.endDate <= last.endDate { continue }
+                merged.append(SleepPhase(startDate: last.endDate, endDate: s.endDate, type: s.type))
+            } else {
+                merged.append(s)
+            }
+        }
+        return merged
+    }
 
     /// header bit `i`: byte `i/8`, MSB-first within the byte.
     private static func validData(_ header: [UInt8], _ i: Int) -> Bool {

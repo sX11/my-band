@@ -394,10 +394,30 @@ final class BandSyncer {
         var detailIds:  [Data] = []
 
         for fileId in fileIds {
+            var retryCount = 0
+            var fetchedData: Data? = nil
+            
+            while retryCount < 3 {
+                do {
+                    let (actualId, data) = try await fetchActivityFile(fileId: fileId, manager: manager)
+                    if actualId != fileId {
+                        log.warning("Unstuck band by ACKing \(actualId.hexString). Now retrying \(fileId.hexString).")
+                        sendAck(fileId: actualId, manager: manager)
+                        retryCount += 1
+                        continue
+                    }
+                    fetchedData = data
+                    break
+                } catch {
+                    log.error("Failed file \(fileId.hexString): \(error.localizedDescription)")
+                    break
+                }
+            }
+            
+            guard let fileData = fetchedData else { continue }
             guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
-            do {
-                let fileData = try await fetchActivityFile(fileId: fileId, manager: manager)
 
+            do {
                 #if DEBUG
                 // Fixture capture: the full reassembled activity file, before any parser
                 // touches it. Sync against real hardware, then copy these blocks from the
@@ -497,7 +517,8 @@ final class BandSyncer {
 
         if !workoutsToWrite.isEmpty {
             outcome.workouts = workoutsToWrite.count
-            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes, heartRates: workoutHeartRates)
+            let result = try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes, heartRates: workoutHeartRates)
+            outcome.healthSamplesWritten += result.written
         }
         // Workout summary + GPS files: a GPS file can be pending without a parseable summary (its
         // summary was ACKed in an earlier sync), which used to leave it dangling forever.
@@ -623,10 +644,10 @@ final class BandSyncer {
 
     // MARK: - Private: fetch individual activity file
 
-    private func fetchActivityFile(fileId: Data, manager: BandManager) async throws -> Data {
+    private func fetchActivityFile(fileId: Data, manager: BandManager) async throws -> (Data, Data) {
         let proto = XiaomiProto.healthCommand(subtype: XiaomiHealthCmd.fetchRequest, fileIds: fileId)
 
-        return try await withThrowingTaskGroup(of: Data.self) { group in
+        return try await withThrowingTaskGroup(of: (Data, Data).self) { group in
             let receiver = ActivityFileReceiver()
             let (stream, cont) = AsyncStream<Data>.makeStream()
 
@@ -648,19 +669,9 @@ final class BandSyncer {
                     if receiver.isComplete {
                         guard receiver.validateCRC() else { throw SyncError.crcMismatch }
                         let file = receiver.assembled()
-                        // Chunks on 0053 carry no file id, so a fetch is correlated to its request
-                        // only by timing through a single callback. When the band is still flushing a
-                        // large file (e.g. a night of sleep) and we've already requested the next one,
-                        // that file's chunk stream lands in this receiver and passes CRC — a *valid*
-                        // file, just the wrong one. Parsing it under the requested file's meta walks
-                        // unrelated bytes as minute records (a sleep file decoded as daily-details
-                        // emitted ~1.4M phantom steps). Every activity file repeats its own 7-byte id
-                        // at the start of the payload, so reject any whose embedded id != the one we
-                        // asked for; not ACKing it lets the band re-offer it on the next sync.
-                        guard file.count >= 7, file.prefix(7).elementsEqual(fileId) else {
-                            throw SyncError.fileIdMismatch
-                        }
-                        return file
+                        guard file.count >= 7 else { throw SyncError.fileIdMismatch }
+                        let actualId = Data(file.prefix(7))
+                        return (actualId, file)
                     }
                 }
                 throw SyncError.emptyPayload

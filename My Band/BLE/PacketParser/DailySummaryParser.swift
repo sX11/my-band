@@ -65,14 +65,14 @@ enum DailySummaryParser {
 
         var s = DailySummary(date: meta.timestamp, steps: max(0, steps),
                              caloriesKcal: max(0, calories))
-        s.restingHR = hrResting > 0 ? Int(hrResting) : nil
-        s.avgHR     = hrAvg > 0 ? Int(hrAvg) : nil
+        s.restingHR = (hrResting > 0 && hrResting < 220) ? Int(hrResting) : nil
+        s.avgHR     = (hrAvg > 0 && hrAvg < 220) ? Int(hrAvg) : nil
         s.avgStress = stressAvg > 0 && stressAvg != 255 ? Int(stressAvg) : nil
-        if hrMax > 0, hrMaxTs > 0 { s.maxHR = (Int(hrMax), Date(timeIntervalSince1970: TimeInterval(hrMaxTs))) }
-        if hrMin > 0, hrMinTs > 0 { s.minHR = (Int(hrMin), Date(timeIntervalSince1970: TimeInterval(hrMinTs))) }
-        if spo2Max > 0, spo2MaxTs > 0 { s.spo2Max = (Int(spo2Max), Date(timeIntervalSince1970: TimeInterval(spo2MaxTs))) }
-        if spo2Min > 0, spo2MinTs > 0 { s.spo2Min = (Int(spo2Min), Date(timeIntervalSince1970: TimeInterval(spo2MinTs))) }
-        s.spo2Avg = spo2Avg > 0 ? Int(spo2Avg) : nil
+        if hrMax > 0, hrMax < 250, hrMaxTs > 1_500_000_000 { s.maxHR = (Int(hrMax), Date(timeIntervalSince1970: TimeInterval(hrMaxTs))) }
+        if hrMin > 0, hrMin < 250, hrMinTs > 1_500_000_000 { s.minHR = (Int(hrMin), Date(timeIntervalSince1970: TimeInterval(hrMinTs))) }
+        if (50...100).contains(spo2Max), spo2MaxTs > 1_500_000_000 { s.spo2Max = (Int(spo2Max), Date(timeIntervalSince1970: TimeInterval(spo2MaxTs))) }
+        if (50...100).contains(spo2Min), spo2MinTs > 1_500_000_000 { s.spo2Min = (Int(spo2Min), Date(timeIntervalSince1970: TimeInterval(spo2MinTs))) }
+        s.spo2Avg = (50...100).contains(spo2Avg) ? Int(spo2Avg) : nil
         s.standingHours = standing > 0 ? standing : nil
         return s
     }

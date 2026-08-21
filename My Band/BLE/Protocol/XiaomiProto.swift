@@ -308,6 +308,13 @@ enum XiaomiProto {
         return (try? cmd.serializedData()) ?? Data()
     }
 
+    /// CMD_REALTIME_STATS_START / _STOP — asks the band to stream live stats (heart rate, steps) over
+    /// the authenticated channel. No payload; the band then pushes RealTimeStats events (subtype 47).
+    static func realtimeStatsCommand(enable: Bool) -> Data {
+        bareCommand(type: XiaomiHealthCmd.cmdType,
+                    subtype: enable ? XiaomiHealthCmd.realtimeStart : XiaomiHealthCmd.realtimeStop)
+    }
+
     // MARK: - Watch face command builders
 
     static func watchfaceListCommand() -> Data {

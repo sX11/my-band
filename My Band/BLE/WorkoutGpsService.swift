@@ -25,12 +25,47 @@ final class WorkoutGpsService: NSObject {
     /// files instead of re-listing the whole backlog.
     var onWorkoutFinished: ((Data) -> Void)?
 
+    /// Fired ~3 minutes after a strength workout finishes, carrying the strength workout's start (to
+    /// correlate with the workout) plus the continuously-measured post-workout heart-rate recovery
+    /// samples. BandSyncer appends them to the (window-extended) strength workout's HR graph.
+    var onRecoveryHRRecorded: ((_ strengthStart: Date?, _ samples: [WorkoutHRSample]) -> Void)?
+
+    /// The just-finished strength workout's start, set at finish and cleared when the recovery
+    /// capture completes. BandSyncer reads it during the post-workout sync to extend that workout's
+    /// window by the recovery length, so the recovery HR (appended later) falls inside it.
+    private(set) var recoveryPendingStrengthStart: Date?
+
     private weak var bandManager: BandManager?
     private let locationManager = CLLocationManager()
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "GPS")
 
     private var gpsFixAcquired = false
     private var workoutStarted = false
+
+    // MARK: - Local recording (app-owned, not streamed to the band)
+    //
+    // Two app-owned captures for strength training (which has no band-side GPS file), entirely
+    // separate from the outdoor path (isActive/streamToBand) — for strength we still reply "GPS
+    // disabled" to the band, so its handshake is untouched:
+    //   .strength — a SPARSE GPS route during the workout (1 recorded point / 10 min).
+    //   .recovery — after the workout, 3 min of continuous HEART RATE (realtime stats), NOT GPS.
+    //               Location stays on only as a background keep-alive; it is not recorded.
+
+    private enum LocalMode { case none, strength, recovery }
+    private var localMode: LocalMode = .none
+    private var localStart: Date?
+    private var localRoute: [WorkoutTrackPoint] = []
+    private var recoveryHR: [WorkoutHRSample] = []
+    private var pendingStrengthStart = false
+    private var recoveryTimer: Task<Void, Never>?
+
+    /// Sparse strength routes stashed at finish, keyed by the app-side start epoch, for BandSyncer to
+    /// attach to the strength HKWorkout during the sync that same finish triggers.
+    private(set) var recordedStrengthRoutes: [Int: [WorkoutTrackPoint]] = [:]
+
+    /// The sparse-GPS cadence for strength: one recorded point every 10 minutes.
+    private let strengthFixInterval: TimeInterval = 600
+    private let recoveryDuration: TimeInterval = 180
 
     // MARK: - Setup
 
@@ -42,6 +77,9 @@ final class WorkoutGpsService: NSObject {
         }
         manager.onWorkoutStatusWatch = { [weak self] status, fileIds in
             Task { @MainActor in self?.handleWorkoutStatus(status, fileIds: fileIds) }
+        }
+        manager.onRealtimeStats = { [weak self] hr in
+            Task { @MainActor in self?.ingestRecoveryHR(hr) }
         }
 
         locationManager.delegate = self
@@ -70,6 +108,10 @@ final class WorkoutGpsService: NSObject {
         if let kind = WorkoutSummaryParser.workoutKind(fromCode: Int(sport)), !kind.usesGps {
             log.info("Workout sport=\(sport) (\(String(describing: kind))) doesn't use GPS — replying disabled")
             replyGpsDisabled()
+            // Strength training still gets an app-recorded sparse route + a cooldown trace, without
+            // ever telling the band we have GPS (the reply above stays "disabled"). The band re-sends
+            // workoutOpenWatch every ~5 s; startStrengthRecording is idempotent.
+            if kind == .strengthTraining { startStrengthRecording() }
             return
         }
 
@@ -122,21 +164,152 @@ final class WorkoutGpsService: NSObject {
         // Proto WorkoutStatusWatch.status: 0=started, 1=resumed, 2=paused, 3=finished
         switch status {
         case 0, 1:
-            log.info("Workout started/resumed — GPS stream active")
-            workoutStarted = true
+            if localMode == .strength {
+                // Anchor the workout start; the continuous stream (already running) records the first
+                // point now and then one every strengthFixInterval.
+                if localStart == nil {
+                    localStart = Date()
+                    log.info("Strength workout started — recording sparse GPS")
+                }
+            } else {
+                log.info("Workout started/resumed — GPS stream active")
+                workoutStarted = true
+            }
         case 2:
             // Paused — keep CoreLocation running so a resume gets an instant fix, but stop
             // forwarding locations so the band doesn't fold paused-period drift into the
-            // workout's distance and route.
-            log.info("Workout paused — holding GPS stream")
-            workoutStarted = false
+            // workout's distance and route. Strength (sparse) just keeps recording — harmless.
+            if localMode == .none {
+                log.info("Workout paused — holding GPS stream")
+                workoutStarted = false
+            }
         case 3:
-            log.info("Workout finished — stopping GPS")
-            stopGps()
-            onWorkoutFinished?(fileIds)
+            if localMode == .strength {
+                finalizeStrengthAndStartRecovery(fileIds: fileIds)
+            } else {
+                log.info("Workout finished — stopping GPS")
+                stopGps()
+                onWorkoutFinished?(fileIds)
+            }
         default:
             break
         }
+    }
+
+    // MARK: - Strength recording + cooldown
+
+    private func startStrengthRecording() {
+        guard localMode == .none else { return }   // already recording (band re-sends open every ~5 s)
+        switch locationManager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            beginStrengthRecording()
+        case .notDetermined:
+            pendingStrengthStart = true
+            locationManager.requestWhenInUseAuthorization()
+        default:
+            log.info("Location denied — strength workout recorded without GPS")
+        }
+    }
+
+    private func beginStrengthRecording() {
+        localMode = .strength
+        localStart = nil                 // set at status=started
+        localRoute = []
+        // Continuous updates — NOT requestLocation. One-shot requestLocation doesn't deliver reliably
+        // in the background (phone in pocket during the workout), which left the route with a single
+        // point; startUpdatingLocation (the mechanism the cooldown already proved) keeps delivering
+        // via allowsBackgroundLocationUpdates. Recording is throttled to strengthFixInterval, so the
+        // cadence stays sparse even though the stream is continuous. Coarse accuracy saves power.
+        locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        log.info("Strength GPS armed — recording one point every \(Int(self.strengthFixInterval / 60)) min")
+        locationManager.startUpdatingLocation()
+    }
+
+    private func finalizeStrengthAndStartRecovery(fileIds: Data) {
+        // Close the sparse GPS route with a final fix so even a short workout (shorter than the
+        // 10-min cadence) has a start + end point — the throttle records only the first point
+        // otherwise, and an HKWorkoutRoute needs 2. The continuous stream keeps locationManager
+        // .location fresh, so this end point has a distinct timestamp.
+        let strengthStart = localStart
+        if let last = locationManager.location, localStart != nil {
+            localRoute.append(WorkoutTrackPoint(date: last.timestamp,
+                                                latitude: last.coordinate.latitude,
+                                                longitude: last.coordinate.longitude,
+                                                hdop: nil,
+                                                speed: last.speed >= 0 ? last.speed : nil))
+        }
+        if let start = strengthStart, localRoute.count >= 2 {
+            recordedStrengthRoutes[Int(start.timeIntervalSince1970)] = localRoute
+            log.info("Strength GPS: stashed \(self.localRoute.count) point(s) for the workout")
+        } else {
+            log.info("Strength GPS: \(self.localRoute.count) point(s) — too few for a route (no fix / very short)")
+        }
+
+        // recoveryPendingStrengthStart lets the post-workout sync extend this workout's window so the
+        // recovery HR (appended when the capture completes) falls inside it.
+        recoveryPendingStrengthStart = strengthStart
+        onWorkoutFinished?(fileIds)
+        startRecoveryCapture(strengthStart: strengthStart)
+    }
+
+    private func startRecoveryCapture(strengthStart: Date?) {
+        // 3 minutes of continuous post-workout HEART RATE via realtime stats — the recovery curve.
+        // No GPS is recorded here; location stays on ONLY as a background keep-alive (the proven way
+        // to keep the app running for 3 min in the background), and recordLocalFix ignores .recovery.
+        localMode = .recovery
+        localStart = Date()
+        recoveryHR = []
+        locationManager.startUpdatingLocation()
+        bandManager?.setRealtimeStats(enabled: true)
+        log.info("Strength finished — recording \(Int(self.recoveryDuration))-s HR recovery (realtime)")
+        recoveryTimer?.cancel()
+        recoveryTimer = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(self?.recoveryDuration ?? 180))
+            guard let self, !Task.isCancelled else { return }
+            let samples = self.recoveryHR
+            self.bandManager?.setRealtimeStats(enabled: false)
+            self.stopLocalRecording()
+            self.recoveryPendingStrengthStart = nil
+            self.log.info("HR recovery done — \(samples.count) sample(s)")
+            self.onRecoveryHRRecorded?(strengthStart, samples)
+        }
+    }
+
+    /// Live realtime HR while a recovery capture is running — timestamped on receipt (the events
+    /// carry no timestamp). Physiological guard drops obviously bad values.
+    private func ingestRecoveryHR(_ hr: Int) {
+        guard localMode == .recovery, (30...240).contains(hr) else { return }
+        recoveryHR.append(WorkoutHRSample(date: Date(), bpm: hr))
+    }
+
+    private func recordLocalFix(_ loc: CLLocation) {
+        // Only the strength workout records GPS; .recovery keeps location on purely as a keep-alive.
+        guard localMode == .strength, localStart != nil else { return }
+        // Sparse cadence: the first point, then one every strengthFixInterval.
+        if let last = localRoute.last,
+           loc.timestamp.timeIntervalSince(last.date) < strengthFixInterval { return }
+        localRoute.append(WorkoutTrackPoint(
+            date: loc.timestamp,
+            latitude: loc.coordinate.latitude,
+            longitude: loc.coordinate.longitude,
+            hdop: nil,
+            speed: loc.speed >= 0 ? loc.speed : nil))
+    }
+
+    private func stopLocalRecording() {
+        recoveryTimer?.cancel(); recoveryTimer = nil
+        locationManager.stopUpdatingLocation()
+        localMode = .none
+        localStart = nil
+        localRoute = []
+        recoveryHR = []
+    }
+
+    /// Hands the stashed strength routes to BandSyncer and clears them (one-shot).
+    func consumeStrengthRoutes() -> [Int: [WorkoutTrackPoint]] {
+        let routes = recordedStrengthRoutes
+        recordedStrengthRoutes = [:]
+        return routes
     }
 
     // MARK: - GPS reply helpers
@@ -170,6 +343,12 @@ extension WorkoutGpsService: CLLocationManagerDelegate {
         let status = manager.authorizationStatus
         Task { @MainActor [weak self] in
             guard let self else { return }
+            // A strength workout was waiting on this grant to start recording.
+            if self.pendingStrengthStart,
+               status == .authorizedWhenInUse || status == .authorizedAlways {
+                self.pendingStrengthStart = false
+                self.beginStrengthRecording()
+            }
             switch status {
             case .authorizedWhenInUse:
                 // First prompt accepted; immediately ask for the upgrade to Always so the GPS
@@ -183,6 +362,7 @@ extension WorkoutGpsService: CLLocationManagerDelegate {
                 if self.isActive { manager.startUpdatingLocation() }
             case .denied, .restricted:
                 if self.isActive { self.replyGpsDisabled() }
+                self.pendingStrengthStart = false
             default:
                 break
             }
@@ -199,7 +379,11 @@ extension WorkoutGpsService: CLLocationManagerDelegate {
 
     @MainActor
     private func onLocation(_ loc: CLLocation) {
-        guard isActive else { return }
+        // Strength/cooldown record locally and never touch the band; the outdoor path is isActive.
+        if !isActive {
+            if localMode != .none { recordLocalFix(loc) }
+            return
+        }
 
         if !gpsFixAcquired {
             gpsFixAcquired = true

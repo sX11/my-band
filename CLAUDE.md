@@ -524,8 +524,16 @@ Solução implementada: se `ModelContainer` falhar, deletar os arquivos `.store`
 Ao rodar o app no Mac (iOS app via camada `/System/iOSSupport/`), o debugger do Xcode carrega `libViewDebuggerSupport.dylib` da plataforma MacOSX, que tenta resolver `_OBJC_CLASS_$_AVPlayerView` no AVKit iOS onde a classe não existe. Resulta em "Message from debugger: killed" sem log do app.
 **Não é um bug do app.** Solução: rodar no iPhone físico. Para BLE, o iPhone físico é obrigatório de qualquer forma — o Simulator e o Mac não se conectam com a Mi Band.
 
-### BandManager.handleAuthPayload — Roteamento heurístico
-Durante autenticação, `handleCommandChannelPacket` tenta decodificar o header proto para rotear, mas os primeiros pacotes de resposta de auth podem não seguir o formato esperado. O fallback atual trata qualquer pacote no canal COMMAND durante estado `authenticating` como resposta de auth. **Verificar com hardware real e ajustar se necessário.**
+### HealthKit — Tipos Reservados dos Anéis do Apple Watch
+O HealthKit **proíbe expressamente** que apps de terceiros solicitem permissão de compartilhamento (`toShare`) para identificadores proprietários dos anéis de atividade do Apple Watch:
+- `HKCategoryTypeIdentifierAppleStandHour`
+- `HKQuantityTypeIdentifierAppleExerciseTime`
+- `HKQuantityTypeIdentifierAppleMoveTime`
+
+Passar qualquer um desses tipos em `requestAuthorization(toShare:read:)` lança imediatamente `NSInvalidArgumentException: Authorization to share the following types is disallowed: ...`. O tempo de exercício deve ser contabilizado pelo sistema a partir dos `HKWorkout` gravados, nunca escrito diretamente.
+
+### Sanitização de Pacotes Cumulativos de Sono da Mi Band
+A Mi Band 10 envia os estágios de sono (pacotes do tipo 17) de forma cumulativa. Se múltiplos pacotes forem processados sem deduplicação/mesclagem temporal (`sanitizeStages`), os minutos de sono são somados repetidamente no HealthKit, inflando as sessões. Além disso, timestamps brutos da Xiaomi em `firstRecordTime` exigem decodificação sem sinal (`u32`) e validação de época para evitar anos 1928 e 1970.
 
 ---
 

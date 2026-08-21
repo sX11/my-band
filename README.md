@@ -43,13 +43,12 @@ Este é um projeto pessoal que serviu de laboratório para BLE, criptografia apl
 | ✅ | Métricas ricas no Apple Health — esforço físico (METs/min), esforço de treino (iOS 18+), recuperação cardíaca, velocidade/passada e distância de remo, derivadas de medições reais |
 | ✅ | Reconciliação por minuto (grava só o excedente da pulseira sobre o iPhone — sem contar passos em dobro, Mobilidade preservada) — **validada em hardware** |
 | ✅ | Balança BLE OKOK/Chipsea (broadcast-only) → peso + IMC no Apple Health, com perfil de altura — **validada em hardware** |
-| ✅ | Push app→band de tempo (Open-Meteo, seguindo o GPS do iPhone), calendário e lembretes (EventKit), idioma |
-| ✅ | Instalação de watch faces e apps RPK (upload em chunks) — watch faces a confirmar; RPK rejeitado pela Mi Band 10 (provável trava de modelo) |
-| ✅ | Extração do AuthKey via Xiaomi Cloud (login por QR, sem app Xiaomi) — **a validar com conta real** |
-| ✅ | Target de testes unitários (Swift Testing) com fixtures reais — **validado no iPhone** |
+| ✅ | Extração do AuthKey via Xiaomi Cloud (login por QR, sem app Xiaomi) |
+| ✅ | Target de testes unitários (Swift Testing, 23 testes) com fixtures reais — **validado no iPhone** |
+| ✅ | Integração com Atalhos via App Intents e frases Siri — **validada em hardware** |
+| ✅ | Sanitização e deduplicação de estágios de sono e validação fisiológica de sinais vitais (v1.1) |
 | 🔜 | Telas SleepDetail (hipnograma) + Settings |
 | 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
-| 🔜 | Integração com Atalhos via App Intents |
 | 🔜 | Mini app customizado na pulseira com botões acionáveis |
 
 ---

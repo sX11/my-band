@@ -143,20 +143,22 @@ final class HealthKitManager {
         // iPhone. The daily summary keeps only band-exclusive readings (HR/SpO₂ extremes), which
         // the iPhone never produces and so never conflict.
         let bpm = HKUnit.count().unitDivided(by: .minute())
-        if let resting = s.restingHR {
+        let validDateRange: ClosedRange<Date> = Date(timeIntervalSince1970: 1_600_000_000)...Date().addingTimeInterval(86400)
+
+        if let resting = s.restingHR, (35...150).contains(resting) {
             samples.append(quantity(restingHR, bpm, Double(resting),
                                     start: dayStart, end: dayEnd, id: "mb-hrresting-\(dayKey)"))
         }
-        if let max = s.maxHR {
+        if let max = s.maxHR, (35...220).contains(max.bpm), validDateRange.contains(max.at) {
             samples.append(quantity(heartRate, bpm, Double(max.bpm), start: max.at, end: max.at, id: "mb-hrmax-\(Int(max.at.timeIntervalSince1970))"))
         }
-        if let min = s.minHR {
+        if let min = s.minHR, (35...220).contains(min.bpm), validDateRange.contains(min.at) {
             samples.append(quantity(heartRate, bpm, Double(min.bpm), start: min.at, end: min.at, id: "mb-hrmin-\(Int(min.at.timeIntervalSince1970))"))
         }
-        if let mx = s.spo2Max {
+        if let mx = s.spo2Max, (50...100).contains(mx.pct), validDateRange.contains(mx.at) {
             samples.append(quantity(spo2, .percent(), Double(mx.pct) / 100.0, start: mx.at, end: mx.at, id: "mb-spo2max-\(Int(mx.at.timeIntervalSince1970))"))
         }
-        if let mn = s.spo2Min {
+        if let mn = s.spo2Min, (50...100).contains(mn.pct), validDateRange.contains(mn.at) {
             samples.append(quantity(spo2, .percent(), Double(mn.pct) / 100.0, start: mn.at, end: mn.at, id: "mb-spo2min-\(Int(mn.at.timeIntervalSince1970))"))
         }
         // NOTE: standingHours (DailySummary) is intentionally NOT written. HKCategoryType
@@ -328,8 +330,11 @@ final class HealthKitManager {
 
     func writeWorkouts(_ workouts: [WorkoutSummary],
                        routes: [Int: [WorkoutTrackPoint]],
-                       heartRates: [Int: [WorkoutHRSample]] = [:]) async throws -> Int {
+                       heartRates: [Int: [WorkoutHRSample]] = [:],
+                       weather: [Int: WorkoutWeather] = [:],
+                       endExtension: [Int: TimeInterval] = [:]) async throws -> (written: Int, saved: [Int: HKWorkout]) {
         var written = 0
+        var saved: [Int: HKWorkout] = [:]
         let bpm = HKUnit.count().unitDivided(by: .minute())
         // Weight (average METs) and age (max-HR estimate behind the effort score) are fetched once
         // per batch; both degrade gracefully when absent.
@@ -340,6 +345,10 @@ final class HealthKitManager {
             guard w.endDate > w.startDate else { continue }
             let key = Int(w.startDate.timeIntervalSince1970)
             let track = Self.route(forWorkoutStart: w.startDate, in: routes)
+            // A strength workout with a pending cooldown extends its window by the cooldown length so
+            // the folded-in cooldown route (attached later) falls inside [start, end]. Samples still
+            // span only the real workout window.
+            let workoutEnd = w.endDate.addingTimeInterval(endExtension[key] ?? 0)
 
             let config = HKWorkoutConfiguration()
             config.activityType = Self.activityType(w.kind)
@@ -419,6 +428,14 @@ final class HealthKitManager {
             if let mx = w.hrMax  { metadata["MiBandMaxHeartRate"] = mx }
             if let mn = w.hrMin  { metadata["MiBandMinHeartRate"] = mn }
             if let style = w.swimStyle { metadata["MiBandSwimStyle"] = style }
+            // Weather at the workout's location/time (Open-Meteo). Apple Health shows condition,
+            // temperature and humidity in the workout detail. Humidity is a fraction (0–1) in the
+            // percent unit; condition is the HKWeatherCondition raw value.
+            if let wx = weather[key] {
+                metadata[HKMetadataKeyWeatherCondition] = Self.weatherCondition(wmo: wx.wmoCode).rawValue
+                metadata[HKMetadataKeyWeatherTemperature] = HKQuantity(unit: .degreeCelsius(), doubleValue: wx.temperatureC)
+                metadata[HKMetadataKeyWeatherHumidity] = HKQuantity(unit: .percent(), doubleValue: wx.humidityPct / 100.0)
+            }
             // Average intensity in METs (same math as the per-minute physicalEffort samples):
             // resting baseline + active kcal per kg per hour. Health shows it in the workout detail.
             if let kcal = w.caloriesKcal, let weightKg, weightKg > 0, w.duration > 60 {
@@ -429,9 +446,10 @@ final class HealthKitManager {
             }
             try await builder.addMetadata(metadata)
 
-            try await builder.endCollection(at: w.endDate)
+            try await builder.endCollection(at: workoutEnd)
             guard let workout = try await builder.finishWorkout() else { continue }
             written += 1
+            saved[key] = workout
 
             // VO₂max is a standalone sample (not a workout statistic). The test-type metadata tells
             // Health it's a sub-maximal exercise prediction (which is how the band estimates it),
@@ -474,7 +492,33 @@ final class HealthKitManager {
                 catch { log.error("Workout route attach failed (start \(key)): \(error.localizedDescription)") }
             }
         }
-        return written
+        return (written, saved)
+    }
+
+    // MARK: - HR recovery (post-strength)
+
+    /// Writes the 3-minute post-workout heart-rate recovery samples. When `workout` is given (the
+    /// usual case), they're saved and then associated with it via `add(_:to:)` so they extend the
+    /// workout's HR graph into the recovery period; the workout's window was extended by the recovery
+    /// length at write time so the samples fall inside it. When it's nil (the workout didn't sync in
+    /// time), the samples are still saved as standalone heart rate so the recovery curve isn't lost.
+    /// Sync-ids keep re-writes idempotent.
+    func writeRecoveryHR(_ samples: [WorkoutHRSample], toWorkout workout: HKWorkout?) async throws -> Int {
+        guard !samples.isEmpty else { return 0 }
+        let bpm = HKUnit.count().unitDivided(by: .minute())
+        let hkSamples = samples.map { s in
+            quantity(heartRate, bpm, Double(s.bpm), start: s.date, end: s.date,
+                     id: "mb-recovery-\(Int(s.date.timeIntervalSince1970))")
+        }
+        try await save(hkSamples)
+        if let workout {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                store.add(hkSamples, to: workout) { _, error in
+                    if let error { cont.resume(throwing: error) } else { cont.resume() }
+                }
+            }
+        }
+        return hkSamples.count
     }
 
     // MARK: - GPS route
@@ -551,6 +595,28 @@ final class HealthKitManager {
         case .yoga:                                  .yoga
         case .strengthTraining:                      .traditionalStrengthTraining
         case .freeTraining, .other:                  .other
+        }
+    }
+
+    /// WMO weather code (Open-Meteo) → HKWeatherCondition for workout metadata. Unknown codes map to
+    /// `.none` so Health simply omits the condition icon rather than showing a wrong one.
+    private static func weatherCondition(wmo: Int) -> HKWeatherCondition {
+        switch wmo {
+        case 0:            return .clear
+        case 1:            return .fair
+        case 2:            return .partlyCloudy
+        case 3:            return .cloudy
+        case 45, 48:       return .foggy
+        case 51, 53, 55:   return .drizzle
+        case 56, 57:       return .freezingDrizzle
+        case 61, 63, 65:   return .showers
+        case 66, 67:       return .freezingRain
+        case 71, 73, 75, 77: return .snow
+        case 80, 81:       return .scatteredShowers
+        case 82:           return .showers
+        case 85, 86:       return .snow
+        case 95, 96, 99:   return .thunderstorms
+        default:           return .none
         }
     }
 
