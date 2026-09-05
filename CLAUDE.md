@@ -1,6 +1,6 @@
 # CLAUDE.md — My Band
 
-Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health, integra com Home Assistant e suporta Atalhos via App Intents.
+Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Sem visualização de dados de saúde em tela própria — o Apple Health é a única superfície de dados; o app é só sincronização, configuração e status.
 
 ---
 
@@ -8,14 +8,13 @@ Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS unive
 
 | Item | Detalhe |
 |---|---|
-| Plataformas | iOS 17+ e macOS 14+ (destino universal, um único target Xcode) |
+| Plataformas | iOS 26+ (um único target Xcode; roda no Mac via "Designed for iPad and iPhone", não é target macOS nativo — `IPHONEOS_DEPLOYMENT_TARGET` no pbxproj é a fonte da verdade) |
 | Linguagem | Swift 5.10+ |
-| UI | SwiftUI |
+| UI | SwiftUI, Liquid Glass no chrome/status (`MBStatusPill` etc.) |
 | Persistência | SwiftData |
 | Bluetooth | CoreBluetooth (BLE apenas — Mi Band 10 não usa Classic BT) |
-| Saúde | HealthKit |
+| Saúde | HealthKit — única superfície de visualização de dados (ver ADR 0001) |
 | Automação | App Intents + Shortcuts |
-| Home Assistant | REST API via HTTP/HTTPS (local + túnel Cloudflare) |
 | Distribuição | Uso pessoal — sideload via Apple Developer Program pessoal (sem App Store) |
 
 ---
@@ -47,22 +46,17 @@ My Band/
 │
 ├── Auth/
 │   ├── AuthKeyStore.swift        # Armazenamento seguro do AuthKey no Keychain
-│   ├── XiaomiCloudAuth.swift     # Extração do AuthKey via Xiaomi Cloud (login QR → beaconkey)
+│   ├── XiaomiCloudAuth.swift     # Extração do AuthKey via Xiaomi Cloud (login usuário/senha → beaconkey/token)
 │   └── XiaomiCloudCrypto.swift   # RC4/SHA-1/SHA-256 da API de conta (separado do XiaomiCrypto BLE)
 │
 ├── Health/
 │   ├── HealthKitManager.swift    # Autorização e escrita no Apple Health
 │   └── HealthSyncService.swift  # Conversão dados Mi Band → tipos HealthKit
 │
-├── HomeAssistant/
-│   ├── HAClient.swift            # Cliente REST genérico (local + Cloudflare fallback)
-│   ├── HAConfig.swift            # Configuração: URL local, URL remota, token
-│   └── HATriggers.swift          # Gatilhos predefinidos (sono detectado, HR, etc.)
-│
 ├── Intents/
 │   ├── SyncBandIntent.swift      # App Intent: sincronizar dados agora
-│   ├── GetSleepDataIntent.swift  # App Intent: retornar dados de sono
-│   ├── TriggerHAIntent.swift     # App Intent: disparar ação no Home Assistant
+│   ├── GetSleepStateIntent.swift # App Intent: "você está dormindo?" (pull, não push — ver nota)
+│   ├── CheckBandBatteryIntent.swift # App Intent: notifica só se a bateria estiver abaixo do limite
 │   └── BandShortcuts.swift       # AppShortcutsProvider com frases Siri
 │
 ├── MiniApp/                      # (Fase futura) Mini app na pulseira
@@ -147,9 +141,17 @@ Payload de um pacote DATA (dentro do payload acima):
 10. **Banda responde** `sub=27` → **Autenticado**, comunicação cifrada
 11. **Init pós-auth obrigatório** (`sendPostAuthInit`): `setCurrentTime` + `device info (2/2)` + `device state (2/78)` + `battery (2/1)`. Sem isso a banda re-dispara auth a cada ~6 s.
 
-> **Primeiro pareamento.** Na primeira conexão a banda envia `sub=16` e o primeiro watch-nonce **sempre falha o HMAC**; apenas uma reconexão limpa autentica. `BandManager.retryAuthAfterReconnect()` derruba e reconecta automaticamente (limite `maxAuthRetries`). Confirmado em hardware (Mi Band 10, 2026-06-19).
+> **Primeiro pareamento — o app espera o usuário** (decisão e trade-offs em `docs/adr/0003-patient-band-driven-handshake.md`)**.** Na primeira conexão a banda envia `auth sub=16` (subtype que o GadgetBridge nem trata) e só emite um watch-nonce verificável **depois que o usuário aceita na pulseira e confirma a folha de pareamento Bluetooth do iOS**. Os nonces que chegam antes disso não podem casar o HMAC — a banda os assina com um bond que ainda não existe. `BandManager.beginPairingConfirmationWait()` entra em `.awaitingPairingConfirmation`: a janela do watchdog vai a 120 s, um HMAC divergente é logado e **ignorado** (derrubar o link dispensaria o próprio prompt que estamos esperando), e a UI instrui o usuário a aceitar nos dois lados. Quando a banda reabre a sessão após o aceite, `handleSessionConfigResponse` deixa passar esse novo `session-config-accept` e reinicia a troca de nonce (ver a nota seguinte). O `sub=16` e as divergências pré-aceite estão confirmados em hardware (Mi Band 10, 2026-06-19 e 2026-09-05); o caminho **completo do aceite** — a espera de 120 s terminando num pareamento bem-sucedido — ainda **não** foi exercitado: os logs vieram de uma pulseira já pareada e de tentativas que falhavam.
+
+> **A pulseira reabre a sessão sozinha — e isso invalida as chaves.** Logo depois do init pós-auth ela manda um novo `session-config-accept`, zera o próprio contador de sequência e refaz o handshake (novo watch-nonce, novo `sub=27`). O GadgetBridge (`XiaomiBleProtocolV2.processPacket`, `PACKET_TYPE_SESSION_CONFIG`) chama `startEncryptedHandshake()` a **todo** pacote de session config, sem olhar estado — é por isso. Ignorar esse pacote deixa o app com as chaves antigas: a pulseira ACKa o frame de transporte e **descarta o comando em silêncio**, então o sync fica pendurado até o timeout com o link parecendo perfeito. `handleSessionConfigResponse` refaz o handshake quando o estado é `.connected` (limite `maxBandSessionRestarts`), e só ignora um repeat que chegue com o handshake ainda em voo (`.authenticating`) — que é onde morava o bug do 005F. Confirmado em hardware (2026-09-05).
+
+> **Nonce atrasado ≠ falha.** Depois do `CMD_AUTH`, a banda reemite um watch-nonce próprio — um reinício de handshake do lado dela, não uma resposta ao nosso. Verificá-lo contra o phone-nonce já superado **sempre** falha; a banda confirma o handshake original de qualquer forma. `authStep3Sent` faz o app ignorar nonces com `CMD_AUTH` em voo e esperar o `sub=27`. Pelo mesmo motivo (um nonce já no ar quando o nosso `CMD_NONCE` saiu foi assinado contra um phone-nonce que a banda ainda não viu), `maxNonceMismatches` tolera 2 divergências por troca de nonce antes de escalar — uma AuthKey de fato errada diverge sempre e continua terminando em `AuthError.badHMAC`. Sem isso, o mesmo pacote derrubava um handshake a um passo do sucesso (log de hardware 2026-09-05, onde as duas ordens aparecem: o nonce atrasado antes do `sub=27` matava a conexão, depois do `sub=27` era inofensivo).
+
+> **Watchdog de auth.** `armAuthWatchdog()` — 20 s normal, 120 s durante o pareamento — re-armado por todo pacote de auth que progride. Antes, `AuthError.timeout` só saía de uma desconexão: "Tempo esgotado" na verdade queria dizer "o link caiu" (hoje `AuthError.linkDropped`) e uma banda que emudecesse ficava pendurada. Ao estourar, o watchdog também derruba o link para que o standing reconnect reassuma. `retryAuthAfterReconnect` adia o teardown com atraso crescente (1–4 s) — reconectar na hora gastava as 4 tentativas em segundos.
 
 > O AuthKey (secretKey) tem 16 bytes (hex 32 chars). Keychain com `kSecAttrAccessibleAfterFirstUnlock`. Nunca em SwiftData/UserDefaults/logs. Nonces e HMACs **podem** ser logados em debug (não são segredos); chaves de sessão e AuthKey, nunca.
+
+> **A chave precisa sobreviver a updates, renomeações e relaunches** (ver `docs/adr/0004-authkey-keychain-durability.md`)**.** `AuthKeyStore` indexa o item por um `service` **fixo** (`com.myband.authkey`), não pelo bundle id lido em runtime — senão uma renomeação de bundle/target faria o app se apresentar como não pareado com a chave intacta sob o nome antigo; o item legado (bundle id) é migrado na primeira leitura. `save` atualiza no lugar (o `delete`+`add` anterior perdia a chave se o add falhasse) e o item é fixado como **não-sincronizável**, para que nenhuma entrada do iCloud Keychain sombreie a local. `isStored` distingue `errSecItemNotFound` de `errSecInteractionNotAllowed`: num relaunch em background **antes do primeiro desbloqueio pós-boot** a chave existe mas é ilegível, e responder "não tem chave" ali mandava um usuário já pareado de volta ao setup.
 
 ### Comandos de Sincronização
 
@@ -274,21 +276,23 @@ O onboarding (`UI/Setup/SetupView.swift`) é uma máquina de passos: `intro → 
 - Salvar no Keychain com `kSecAttrAccessibleAfterFirstUnlock` (acessível em background)
 - É o **fallback** de toda falha do método 2 (link "Inserir AuthKey manualmente" em cada etapa)
 
-### Método 2 — Xiaomi Cloud via QR (`Auth/XiaomiCloudAuth.swift`, `UI/Setup/XiaomiLoginView.swift`)
-Porta o `QrCodeXiaomiCloudConnector` do `token_extractor/token_extractor.py` — **login por QR**, sem digitar senha no app (a autenticação acontece do lado da Xiaomi). Fluxo (espelha os steps do Python):
+### Método 2 — Xiaomi Cloud via usuário/senha (`Auth/XiaomiCloudAuth.swift`, `UI/Setup/XiaomiLoginView.swift`)
+Porta o `PasswordXiaomiCloudConnector` do `token_extractor/token_extractor.py` — login com o usuário e a senha da conta Xiaomi, digitados nesta tela. Substituiu o fluxo anterior por QR (`QrCodeXiaomiCloudConnector`): **troca consciente** — a versão QR nunca expunha a senha ao app (autenticação inteira do lado da Xiaomi), mas dependia de um segundo aparelho ou de um long-poll frágil enquanto o usuário saía e voltava ao app. Login+senha é mais direto e não depende de mais nada, ao custo de a senha passar pela memória do processo do My Band — nunca persistida, nunca logada, só usada para montar o hash MD5 e o corpo cifrado do POST de login. Fluxo (espelha os steps do Python):
 
-1. `GET /longPolling/loginUrl` → `qr` (imagem), `loginUrl` (URL no QR), `lp` (long-polling), `timeout`
-2. App exibe o QR (escaneável por outro aparelho) **e** abre o `loginUrl` **dentro do app** via `SFSafariViewController` (sheet). É **in-app de propósito**: o modelo é long-poll, não há redirect de volta — o app precisa continuar fazendo o polling enquanto o usuário entra na conta. Abrir em navegador externo (`openURL`) jogaria o app para segundo plano e o iOS **suspenderia a tarefa de polling**, então o sucesso do login nunca seria observado (causa do bug inicial). Catalyst/macOS caem no `openURL`.
-3. **Long-poll** no `lp` até `200` → `userId`, `ssecurity`, `location`
-4. `GET location` → cookie `serviceToken`
-5. Para cada região (`cn, de, us, ru, tw, sg, in, i2`), chamadas **cifradas**: `get_homes` + `get_dev_cnt` → casas; `get_devices` → dispositivos; nos `did` que contêm `blt`, `blt_get_beaconkey` → **beaconkey** (= AuthKey)
-6. Uma pulseira → auto-seleciona; várias → usuário escolhe; o beaconkey entra no mesmo `onConnect`
+1. `GET serviceLogin` → `_sign` (raramente já vem uma sessão pronta com `ssecurity`)
+2. `POST serviceLoginAuth2` com `user` + `hash=MD5(senha)` + `_sign` → `ssecurity`, `userId`, `location`
+   - Se vier `captchaUrl`: mostra a imagem, usuário digita o texto, reenvia o POST com `captCode`
+   - Se vier `notificationUrl`: é 2FA por e-mail — segue a cadeia `identity/list` → `sendEmailTicket` → usuário digita o código recebido → `verifyEmail` → `identity/result/check` → `Auth2/end` (lê `ssecurity` do header não-padrão `extension-pragma`, por isso essas chamadas usam um delegate que **não segue redirect** — só assim dá pra ler os headers da própria resposta de redirecionamento) → redirect para `sts.api.io.mi.com/sts`, que finalmente grava o cookie `serviceToken`
+3. Se o passo 2 não veio com `serviceToken` já (fluxo sem 2FA): `GET location` → cookie `serviceToken` — é a etapa de **confirmação de que o login realmente aconteceu**, antes de seguir para a busca de dispositivos
+4. Para cada região (`cn, de, us, ru, tw, sg, in, i2`), chamadas **cifradas**: `get_homes` + `get_dev_cnt` → casas; `get_devices` → dispositivos; a Mi Band 10 é `miwear.watch.*` com `did` numérico (não contém `blt`) e já carrega o AuthKey no campo `token` — só cai no `blt_get_beaconkey` para dispositivos BLE legados sem `token` inline
+5. Uma pulseira → auto-seleciona; várias → usuário escolhe; a chave entra no mesmo `onConnect`
 
-- **Crypto da API** (`Auth/XiaomiCloudCrypto.swift`, separado do `XiaomiCrypto` do BLE): RC4/ARC4 com o **descarte de 1024 bytes de keystream** do pycryptodome, SHA-1 e SHA-256 (CommonCrypto). `signedNonce = base64(SHA256(b64dec(ssecurity) || b64dec(nonce)))`; cada param é `base64(RC4(key=b64dec(signedNonce)))`; assinatura `base64(SHA1("POST&path&k=v&...&signedNonce"))` — **ordem das chaves preservada** e codificação **`quote_plus`** (réplica do `requests.urlencode`, senão `+`/`/`/`=` quebram a assinatura). Path = tudo após o primeiro `"com"`, com `/app/` → `/`.
-- **`URLSession` efêmera** com cookie jar próprio em memória — nada do login persiste em disco; senha nunca toca o app.
-- **`timeout` do long-poll é em SEGUNDOS** (como no `token_extractor`), não ms — com piso generoso (≥300 s) porque o usuário precisa sair para o login e voltar. O loop tolera timeouts/quedas de rede do long-poll (re-tenta até o deadline) e só aborta em cancelamento. Logs de debug (`[XiaomiCloud]`, só DEBUG) imprimem status/cookies/presença de token — **nunca** os valores de `serviceToken`/beaconkey.
-- **A validar (conta real):** os endpoints da Xiaomi Cloud são frágeis e dependentes de região/conta. Portado fielmente da referência, mas sem validação ao vivo ainda. Login por **senha** (captcha/2FA) e **QR** existem no `token_extractor`; só o QR foi portado.
-- **Atenção**: o beaconkey é o segredo de pareamento — tratado como AuthKey (Keychain, nunca logado/persistido fora dele).
+- **Máquina de fases** (`XiaomiCloudAuth.Phase`): `idle → enteringCredentials → authenticating → [awaitingCaptcha | awaiting2FA] → confirmingLogin → fetchingDevices → done`. Captcha e 2FA suspendem a `Task` de login numa `CheckedContinuation` guardada na instância; `submitCaptcha`/`submit2FACode` (chamados pela UI) a resolvem — não há polling, é passo a passo.
+- **Crypto da API** (`Auth/XiaomiCloudCrypto.swift`, separado do `XiaomiCrypto` do BLE): RC4/ARC4 com o **descarte de 1024 bytes de keystream** do pycryptodome, SHA-1, SHA-256 e MD5 (CryptoKit `Insecure.MD5` — só para compatibilidade com o hash de senha legado do endpoint, não é escolha de segurança nossa). `signedNonce = base64(SHA256(b64dec(ssecurity) || b64dec(nonce)))`; cada param é `base64(RC4(key=b64dec(signedNonce)))`; assinatura `base64(SHA1("POST&path&k=v&...&signedNonce"))` — **ordem das chaves preservada** e codificação **`quote_plus`** (réplica do `requests.urlencode`, senão `+`/`/`/`=` quebram a assinatura ou o `_sign`/hash da senha, que também passam pela query string do login). Path = tudo após o primeiro `"com"`, com `/app/` → `/`.
+- **`URLSession` efêmera** com cookie jar próprio em memória — nada do login persiste em disco.
+- Logs de debug (`[XiaomiCloud]`, só DEBUG) imprimem status/cookies/presença de token — **nunca** os valores de usuário, senha, `serviceToken` ou beaconkey/token.
+- **A validar (conta real):** os endpoints da Xiaomi Cloud são frágeis e dependentes de região/conta, e a cadeia de 2FA por e-mail em particular persegue vários redirects e um header não-padrão — portada fielmente da referência, mas sem validação ao vivo ainda (login simples, com captcha, e com 2FA).
+- **Atenção**: o token/beaconkey é o segredo de pareamento — tratado como AuthKey (Keychain, nunca logado/persistido fora dele).
 
 ---
 
@@ -352,49 +356,28 @@ NSHealthShareUsageDescription
 
 ---
 
-## Home Assistant
-
-### Configuração
-- URL local: ex. `http://homeassistant.local:8123`
-- URL remota: URL do túnel Cloudflare configurado no HA
-- Token: Long-Lived Access Token (armazenado no Keychain)
-- Lógica de seleção: tentar local primeiro (timeout 2s), fallback para Cloudflare
-
-### Gatilhos Predefinidos
-
-| Evento Mi Band | Ação HA sugerida |
-|---|---|
-| Sono detectado (início) | `light.turn_off` em grupo de luzes do quarto |
-| Sono encerrado (acordou) | `light.turn_on` com cena de manhã |
-| HR acima de limiar | Notificação push via HA |
-| Botão mini app pressionado | `script.run` com script configurável |
-
-### Chamada REST
-
-```swift
-// POST /api/services/{domain}/{service}
-// Authorization: Bearer {token}
-// Content-Type: application/json
-```
-
----
-
 ## App Intents e Atalhos
+
+> **Home Assistant foi cortado do roadmap** (decisão registrada só aqui, nunca chegou a ter código — ver conversa/histórico). A integração REST direta que este documento chegou a especificar não será construída. No lugar dos gatilhos que ela ofereceria (sono detectado, HR acima de limiar), o app expõe **estado via App Intent** e deixa a automação inteiramente a cargo das Automações Pessoais do próprio Atalhos do usuário — sem o app precisar saber nada sobre luzes, cenas ou scripts de terceiros.
 
 ### Intents Disponíveis
 
 | Intent | Parâmetros | Retorno |
 |---|---|---|
 | `SyncBandIntent` | — | Status da sincronização |
-| `GetSleepDataIntent` | `date: Date` | `SleepSummary` (duração, eficiência, fases) |
-| `GetHeartRateIntent` | `period: DateInterval` | `[HeartRateSample]` |
-| `TriggerHAActionIntent` | `actionId: String` | Resultado da chamada |
+| `GetSleepStateIntent` | — | `Bool` (dormindo?) + diálogo com a idade do dado |
+| `CheckBandBatteryIntent` | `threshold: Int` (1–100, padrão 30) | `Int?` (nível) + notificação local **só** se abaixo do limite |
 | `RunBandMiniAppIntent` | `appId: String` | (Fase futura) |
+
+> **`GetSleepStateIntent` é pull, não push.** A pulseira não tem evento de "dormi"/"acordei" (ver "Comandos iniciados pela pulseira" acima) — sono só é conhecido depois que o app sincroniza. O intent força uma sincronização (`BackgroundSyncManager.shared.syncNow()`, best-effort — falha não é fatal) antes de responder, e considera o dado "dormindo" só se a última sessão sincronizada terminar há menos de 1h e sua última fase não for `.awake`. O diálogo sempre declara a idade do dado ("dormindo, dado de X min atrás"), pra uma Automação Pessoal encadeada nunca agir silenciosamente sobre um estado velho.
+
+> **`CheckBandBatteryIntent` é silencioso por padrão.** Pensado para uma Automação Pessoal "ao conectar o carregador do iPhone": lembrar de pôr a pulseira para carregar junto. Um atalho que falasse a cada execução viraria ruído, então ele **não tem diálogo** — sincroniza (best-effort), pede `CMD_BATTERY` explicitamente enquanto o link está aberto (o nível em memória vem do init pós-auth e pode estar velho numa conexão longa), espera 3 s pela resposta e só age se `nível < threshold` **e** a pulseira não estiver já no carregador, postando uma notificação local. O nível também sai como valor de retorno, para quem quiser encadear a própria condição. Pulseira fora de alcance → responde com o último nível conhecido em vez de falhar o atalho (e a automação inteira); sem nenhuma leitura → `nil`, sem notificar.
 
 ### Frases Siri (AppShortcutsProvider)
 - "Sincronizar minha pulseira"
-- "Como foi meu sono?"
-- "Qual minha frequência cardíaca?"
+- "Estou dormindo no My Band"
+- "Ver se estou dormindo no My Band"
+- "Verificar bateria da pulseira no My Band"
 
 ---
 
@@ -402,10 +385,12 @@ NSHealthShareUsageDescription
 
 A UI é construída a partir do handoff do **Claude Design** (`My Band — Design System`, bundle exportado de claude.ai/design). Recriar fielmente em SwiftUI — copiar o **resultado visual**, não a estrutura HTML/JSX dos protótipos.
 
+> **Sem visualização de dados de saúde em tela própria** (ver ADR 0001). O app não mostra sono, FC, passos ou SpO₂ em nenhuma tela — isso é papel do Apple Health e do Atalho `GetSleepStateIntent`. A Dashboard só mostra estado de conexão, frescor do sync, bateria e o botão de sincronizar; não existe (nem está planejada) uma tela `SleepDetail`/hipnograma.
+
 **Princípios fixos do maker:**
 1. **Dark-mode first** — "gosto de modo noturno".
-2. **Simples, direto, glanceável** — o app é um *gateway* em segundo plano; a UI serve para status rápido e configuração, não para tempo de tela.
-3. **Native Apple** — SwiftUI, iOS 17+/macOS 14+, fiel à HIG.
+2. **Simples, direto, glanceável** — o app é um *gateway* em segundo plano; a UI serve para status rápido e configuração, não para tempo de tela — levado ao extremo: nem os próprios dados de saúde aparecem em tela.
+3. **Native Apple** — SwiftUI, iOS 26+, Liquid Glass no chrome/status (ver ADR 0001), fiel à HIG.
 
 **Fundações visuais:**
 - **Paleta midnight** (OLED): base `#0A0B10`, cards `#14161F`, superfícies elevadas `#1A1D27`. Elevação por *lightness + hairline* `rgba(255,255,255,.07)`, não sombra.
@@ -417,9 +402,9 @@ A UI é construída a partir do handoff do **Claude Design** (`My Band — Desig
 - **Cantos** contínuos: cards 16, sheets 20, hero/modal 28, pills redondos. **4-pt grid**, gutter 20, hit target ≥44.
 - **Ícones**: SF Symbols (kit web usa Lucide como substituto). Status sempre cor + símbolo, nunca cor sozinha.
 
-**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "Eficiência 91%"). Número é o herói. Honestidade técnica: AuthKey/BLE/HA mostrados em mono, AuthKey mascarado por padrão.
+**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Sem dado de saúde em tela — o número que aparece é sempre de status/sync, nunca uma métrica de saúde. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
 
-**Telas (`ui_kits/app/`):** `Dashboard` (sono em destaque + status), `SleepDetail` (hipnograma), `Setup` (AuthKey + scan/conexão), `Settings`. **Status de conexão + frescor do sync são first-class em toda tela.**
+**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar — sem dados de saúde, ver ADR 0001), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
 
 **Componentes do kit** (`components/`): core (`Button`, `IconButton`, `StatusPill`, `Badge`), forms (`Switch`, `TextField`, `SegmentedControl`), data (`ListRow`, `Card`, `MetricTile`, `SectionHeader`, `SleepBar`). Cada um tem `.prompt.md` e `.d.ts` descrevendo props/variantes.
 
@@ -473,7 +458,15 @@ O projeto segue [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) e [Sema
 
 Entradas pendentes de release ficam sob `## [Unreleased]`. Ao lançar uma versão, mover para `## [X.Y.Z] - YYYY-MM-DD`.
 
-Versão atual: **0.1.0** (camada BLE completa: auth HMAC-SHA256 validada em hardware, SwiftProtobuf, transporte com ACK, init pós-auth; modelos SwiftData; sincronização com Apple Health cobrindo sono, atividade diária, medições manuais, treinos com rota GPS e **série de FC por segundo do treino**; **balança BLE OKOK/Chipsea → peso/IMC no Apple Health**, com perfil de altura; target de testes unitários validado no iPhone). Próxima fase: UI (SleepDetail/Settings) e demais validações em hardware.
+Versão atual: **1.2.0** — ver `CHANGELOG.md` para o histórico completo. Próxima fase, tudo **a validar em hardware**:
+
+1. O pareamento paciente num pareamento **novo** de verdade (ADR 0003) — a janela de 120 s do `.awaitingPairingConfirmation` e o restart de sessão que a pulseira faz depois do aceite. Os logs de 2026-09-05 vieram de uma pulseira já pareada e de tentativas que falhavam, não de um aceite bem-sucedido.
+2. O sync completo depois do fix de restart de sessão — se a pulseira reabre a sessão e o app rederiva as chaves, o `FETCH_TODAY` deve finalmente receber resposta em vez de só ACKs.
+3. O login Xiaomi Cloud por usuário/senha com captcha e 2FA (ADR 0002; login simples já confirmado).
+4. O `GetSleepStateIntent`.
+5. O `CheckBandBatteryIntent` — em especial o `CMD_BATTERY` sob demanda fora do init pós-auth (a resposta chega no mesmo `handleSystemCommand`, mas nunca foi exercitada com o link já aberto há tempo).
+
+Home Assistant foi cortado do roadmap; UI segue sem visualização de dados de saúde por decisão (ver ADR 0001).
 
 ---
 
@@ -550,6 +543,22 @@ xcodebuild test -scheme "My Band" -destination "platform=iOS Simulator,name=iPho
 - Testar lógica de protocolo BLE com dados capturados reais (fixtures em `Tests/Fixtures/`)
 - Não mockar `CBCentralManager` em testes de unidade — testar apenas camadas de parsing/conversão
 - Testes de integração BLE apenas em dispositivo físico
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues e specs são rastreados como GitHub Issues em `matheusdanoite/my-band`, usando a CLI `gh`. Ver `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Vocabulário padrão de labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). Ver `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` na raiz do repo. Ver `docs/agents/domain.md`.
 
 ---
 

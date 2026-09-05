@@ -9,9 +9,8 @@ Diretrizes para agentes de IA (Claude, Codex, etc.) que trabalham neste projeto.
 **My Band** é um app iOS/macOS universal em SwiftUI que:
 1. Conecta à Mi Band 10 via CoreBluetooth usando protocolo XiaomiSppPacketV2 com autenticação HMAC-SHA256 e AuthKey
 2. Sincroniza dados de sono, frequência cardíaca e atividade para o Apple Health (HealthKit)
-3. Dispara automações no Home Assistant via REST API (local + Cloudflare tunnel)
-4. Expõe funcionalidades via App Intents para integração com Atalhos e Siri
-5. (Futuro) Exibe um mini app customizado na pulseira com botões acionáveis
+3. Expõe estado e ações via App Intents para integração com Atalhos e Siri
+4. (Futuro) Exibe um mini app customizado na pulseira com botões acionáveis
 
 Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 
@@ -40,7 +39,9 @@ Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 - `startScan()` pode ser chamado antes do BT estar pronto — o flag `pendingScan` em `BandManager` lida com isso; não remover essa lógica
 - **ACK obrigatório**: o SPP V2 é um transporte confiável com janela. **Toda frame DATA recebida precisa ser confirmada** com `sendAck(seqNum:)` usando o `seqNum` recebido. Sem isso a pulseira retransmite o handshake inteiro a cada ~6 s. Não remover.
 - **Init pós-auth**: após `Authentication successful`, enviar `sendPostAuthInit()` (setCurrentTime + device info/state/battery). Sem isso a pulseira considera a sessão incompleta e re-dispara auth.
-- **Retry de primeiro pareamento**: no primeiro pareamento o primeiro watch-nonce sempre falha o HMAC; só uma reconexão limpa autentica. `retryAuthAfterReconnect()` trata isso (limite `maxAuthRetries`). Não trocar por `failAuth` direto.
+- **Um HMAC divergente não é sinônimo de AuthKey errada** (ver ADR 0003). Quatro causas, só uma é chave errada: a pulseira ainda espera o aceite do usuário (`sub=16` → `.awaitingPairingConfirmation`), o nonce chegou depois do nosso `CMD_AUTH` (`authStep3Sent` — quem decide é o `sub=27`), corrida de nonce (até `maxNonceMismatches` toleradas), ou a chave está errada mesmo. Só o último caso escala para `retryAuthAfterReconnect()` (limite `maxAuthRetries`, teardown com atraso crescente). Não voltar a derrubar o link na primeira divergência: no pareamento isso dispensa o próprio prompt que estamos esperando.
+- **Session config recebido em `.connected` = a pulseira abriu uma sessão nova.** Refazer o handshake e rederivar as chaves (`maxBandSessionRestarts`), como o GadgetBridge faz a todo pacote de session config. Ignorar deixa o app cifrando com chaves mortas — a pulseira ACKa o transporte e descarta o comando em silêncio, e o sync fica pendurado até o timeout com o link parecendo saudável. A guarda de duplicata vale **apenas** para `.authenticating` (bug do 005F).
+- **Watchdog de auth**: `armAuthWatchdog()` (20 s; 120 s durante o pareamento) re-armado por todo pacote de auth que progride. `AuthError.timeout` é timeout de verdade; queda de link é `AuthError.linkDropped`. Não confundir os dois de novo.
 - Testes de BLE requerem iPhone físico — o Simulator e o Mac não conectam com a Mi Band. **Autenticação confirmada em hardware real (Mi Band 10) em 2026-06-19.**
 
 ### Auth / Keychain (`Auth/`)
@@ -48,6 +49,7 @@ Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 - AuthKey **nunca** em SwiftData, UserDefaults, logs ou prints
 - Credenciais Xiaomi Cloud (email, senha) **nunca** persistidas — usar apenas em memória durante o fluxo de extração
 - Ao escrever no Keychain: usar `kSecAttrAccessibleAfterFirstUnlock` para acessibilidade em background
+- **A AuthKey é o único estado que o app não reconstrói sozinho** (ver ADR 0004). O `service` do item é uma constante fixa, não o bundle id — mudá-la sem migração perde a chave. `save` atualiza no lugar (nunca `delete`+`add`). `isStored` distingue `.notFound` de `.locked`: um Keychain bloqueado (relaunch em background antes do primeiro desbloqueio pós-boot) **não** é "sem chave" — responder `false` ali manda um usuário pareado de volta ao setup.
 
 ### HealthKit (`Health/`)
 
@@ -58,19 +60,14 @@ Plataformas: iOS 17+ e macOS 14+. Distribuição: sideload pessoal.
 - **Nunca** incluir `HKCategoryType(.appleStandHour)` em `requestAuthorization(toShare:)` — é reservado e lança `NSInvalidArgumentException` (apps de terceiros não podem gravá-lo)
 - Treinos: usar `HKWorkoutBuilder` (não o init depreciado de `HKWorkout`); rota GPS via `HKWorkoutRouteBuilder.insertRouteData` + `finishRoute(with:)`
 
-### Home Assistant (`HomeAssistant/`)
-
-- `HAClient` deve tentar URL local primeiro com timeout de 2 segundos, depois fallback para URL Cloudflare
-- Token Long-Lived Access Token armazenado no Keychain, configurável pelo usuário em Settings
-- Chamadas HA são fire-and-forget para automações de sono — não bloquear a UI esperando resposta
-- Logar falhas de chamada HA com `os.Logger`, sem expor o token nos logs
-
 ### App Intents (`Intents/`)
 
 - Cada Intent deve ter `title` e `description` claros para aparecer bem no app Atalhos
 - `perform()` deve retornar resultado útil — não retornar vazio quando há dado disponível
 - Parâmetros de data devem ter valores default razoáveis (ex: "hoje" para `GetSleepDataIntent`)
 - Registrar frases Siri em `BandShortcuts.swift` via `AppShortcutsProvider`
+- Um intent feito para rodar dentro de uma Automação Pessoal (que dispara sozinha, com frequência) deve ser **silencioso no caso comum** — sem diálogo quando não há nada a dizer, como o `CheckBandBatteryIntent`, que só notifica abaixo do limite. Diálogo a cada execução vira ruído e a pessoa desliga a automação.
+- Intent que depende do link BLE não deve falhar quando a pulseira está fora de alcance: sincronizar é best-effort e a resposta cai no último dado conhecido — uma exceção derruba a automação inteira
 
 ### UI (`UI/`)
 
@@ -141,8 +138,7 @@ A Mi Band 10 suporta mini apps via protocolo proprietário ainda em processo de 
 - [x] **Parsers de medição manual + treinos (2026-06-19)** — `ManualSamplesParser` (FC/SpO₂/estresse/temperatura), `WorkoutSummaryParser` (+ builder posicional, todas as modalidades) e `WorkoutGpsParser`; `HealthKitManager` grava `HKWorkout`/rota GPS/VO₂máx/temperatura/FC de repouso. Corrigido crash de autorização do `appleStandHour`. **Pendente validação em hardware.**
 - [ ] **UI: SleepDetail + Settings** → próximas telas do handoff do Claude Design
 - [ ] **Parsers de device info / bateria** → `Proto command type=2` ainda só logados; parsear para alimentar o Dashboard
-- [ ] **HealthKit** → `HealthKitManager` + `HealthSyncService` + deduplicação
-- [ ] **Home Assistant** → `HAClient` + `HATriggers` + configuração em Settings
-- [ ] **App Intents** → `GetSleepDataIntent` + `SyncBandIntent` + `BandShortcuts`
-- [ ] **AuthKey via Xiaomi Cloud** → `XiaomiCloudAuth` (fluxo alternativo ao manual)
+- [x] **HealthKit** → `HealthKitManager` + reconciliação por minuto + deduplicação
+- [x] **App Intents** → `SyncBandIntent` + `GetSleepStateIntent` + `CheckBandBatteryIntent` + `BandShortcuts`
+- [x] **AuthKey via Xiaomi Cloud** → `XiaomiCloudAuth` por usuário/senha (fluxo alternativo ao manual)
 - [ ] **Mini App** → (fase futura, aguardar definição de protocolo)

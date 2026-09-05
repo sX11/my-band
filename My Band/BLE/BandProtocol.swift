@@ -211,6 +211,7 @@ enum XiaomiSppPacket {
 enum XiaomiAuthCmd {
     static let cmdType:      UInt32 = 1
     static let sendUserId:   UInt32 = 5
+    static let pairingRequest: UInt32 = 16 // band-initiated first-pairing announcement (not in GadgetBridge)
     static let nonce:        UInt32 = 26   // CMD_NONCE
     static let auth:         UInt32 = 27   // CMD_AUTH
 }

@@ -23,5 +23,27 @@ struct BandShortcuts: AppShortcutsProvider {
             shortTitle: "Sincronizar pulseira",
             systemImageName: "arrow.triangle.2.circlepath"
         )
+        AppShortcut(
+            intent: GetSleepStateIntent(),
+            phrases: [
+                "Estou dormindo no \(.applicationName)",
+                "Eu estou dormindo no \(.applicationName)",
+                "Ver se estou dormindo no \(.applicationName)",
+                "Verificar meu sono no \(.applicationName)",
+            ],
+            shortTitle: "Ver se estou dormindo",
+            systemImageName: "moon.zzz.fill"
+        )
+        AppShortcut(
+            intent: CheckBandBatteryIntent(),
+            phrases: [
+                "Verificar bateria da pulseira no \(.applicationName)",
+                "Ver a bateria da pulseira no \(.applicationName)",
+                "Quanto tem de bateria na pulseira no \(.applicationName)",
+                "Checar bateria da Mi Band no \(.applicationName)",
+            ],
+            shortTitle: "Verificar bateria",
+            systemImageName: "battery.25"
+        )
     }
 }

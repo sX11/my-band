@@ -2,10 +2,16 @@ import SwiftUI
 
 // MARK: - XiaomiLoginView
 //
-// Guided AuthKey extraction via Xiaomi Cloud QR login (XiaomiCloudAuth). The user scans
-// the QR with the Xiaomi / Mi Home app (or opens the login URL on this device); once they
-// confirm, we pull the band's beaconkey (= AuthKey) and hand it back through `onExtracted`,
-// which feeds the same connect path as manual entry.
+// Guided AuthKey extraction via Xiaomi Cloud login (XiaomiCloudAuth). The user types their
+// Xiaomi account credentials — the same ones used by Mi Home / Mi Fitness — directly here, and
+// we walk whatever extra steps Xiaomi asks for (captcha, emailed 2FA code) before pulling the
+// band's beaconkey and handing it back through `onExtracted`, which feeds the same connect path
+// as manual entry.
+//
+// This replaces the previous QR-based flow, which never had the user type a password into the
+// app at all (only Xiaomi's own page saw it). That property is intentionally traded away here for
+// not depending on a second device or a fragile long-poll — see CLAUDE.md's Xiaomi Cloud section.
+// The password lives only in `XiaomiCloudAuth`'s in-memory login call, never persisted or logged.
 
 struct XiaomiLoginView: View {
 
@@ -15,8 +21,10 @@ struct XiaomiLoginView: View {
 
     @State private var auth = XiaomiCloudAuth()
     @State private var selectionError: String?
-    @State private var showLogin = false
-    @Environment(\.openURL) private var openURL
+    @State private var username = ""
+    @State private var password = ""
+    @State private var captchaCode = ""
+    @State private var twoFACode = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -36,26 +44,23 @@ struct XiaomiLoginView: View {
         .onAppear { if auth.phase == .idle { auth.start() } }
         .onDisappear { auth.cancel() }
         .animation(.easeOut(duration: MB.Motion.durBase), value: auth.phase)
-        .onChange(of: auth.phase) { _, new in
-            // The poll detected the login (or it failed) — close the in-app login sheet.
-            if new != .awaitingScan && new != .requestingCode { showLogin = false }
-        }
-        #if canImport(SafariServices) && !targetEnvironment(macCatalyst)
-        .sheet(isPresented: $showLogin) {
-            if let url = auth.loginURL { SafariView(url: url).ignoresSafeArea() }
-        }
-        #endif
     }
 
     @ViewBuilder
     private var content: some View {
         switch auth.phase {
-        case .idle, .requestingCode:
-            progress(title: "Gerando código", subtitle: "Preparando o login da Xiaomi…")
-        case .awaitingScan:
-            scanStep
+        case .idle:
+            progress(title: "Preparando", subtitle: "Um instante…")
+        case .enteringCredentials:
+            credentialsStep
         case .authenticating:
-            progress(title: "Autenticando", subtitle: "Confirme a leitura no app da Xiaomi.")
+            progress(title: "Autenticando", subtitle: "Verificando usuário e senha…")
+        case .awaitingCaptcha(let imageURL):
+            captchaStep(imageURL)
+        case .awaiting2FA:
+            twoFAStep
+        case .confirmingLogin:
+            progress(title: "Confirmando login", subtitle: "Validando a sessão com a Xiaomi…")
         case .fetchingDevices:
             progress(title: "Buscando pulseira", subtitle: "Lendo a chave da sua conta…")
         case .done:
@@ -65,52 +70,80 @@ struct XiaomiLoginView: View {
         }
     }
 
-    // MARK: - Awaiting scan
+    // MARK: - Credentials
 
-    private var scanStep: some View {
+    private var credentialsStep: some View {
         VStack(alignment: .leading, spacing: 22) {
             header(title: "Entre na conta Xiaomi",
-                   subtitle: "Toque em fazer login para entrar aqui mesmo, sem sair do app. Ou escaneie o QR com o app Xiaomi/Mi Home em outro aparelho.")
+                   subtitle: "Use o mesmo usuário e senha do app Xiaomi Home ou Mi Fitness. A senha é usada só para autenticar com a Xiaomi — nunca fica salva.")
 
-            HStack {
-                Spacer()
-                qrCode
-                Spacer()
+            VStack(spacing: 14) {
+                MBTextField(label: "Usuário", text: $username, icon: "person",
+                            placeholder: "E-mail, telefone ou ID Xiaomi")
+                MBTextField(label: "Senha", text: $password, icon: "lock",
+                            placeholder: "Senha", secure: true)
             }
-
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small).tint(MB.accent)
-                Text("Aguardando confirmação…")
-                    .font(.mbFootnote)
-                    .foregroundStyle(MB.textTertiary)
-            }
-            .frame(maxWidth: .infinity)
 
             Spacer()
 
-            if let url = auth.loginURL {
-                MBButton(title: "Fazer login da Xiaomi", variant: .primary, size: .lg,
-                         icon: "person.crop.circle", block: true, glow: true) {
-                    openLogin(url)
-                }
+            MBButton(title: "Entrar", variant: .primary, size: .lg,
+                     icon: "arrow.right.circle", block: true, glow: true,
+                     disabled: username.isEmpty || password.isEmpty) {
+                auth.submitCredentials(username: username, password: password)
             }
             manualLink
         }
     }
 
-    private var qrCode: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: MB.Radius.xl, style: .continuous)
-                .fill(Color.white)
-                .frame(width: 232, height: 232)
-            if let url = auth.qrImageURL {
-                AsyncImage(url: url) { image in
-                    image.resizable().interpolation(.none).scaledToFit()
-                } placeholder: {
-                    ProgressView().tint(MB.night950)
-                }
-                .frame(width: 196, height: 196)
+    // MARK: - Captcha
+
+    private func captchaStep(_ imageURL: URL) -> some View {
+        VStack(alignment: .leading, spacing: 22) {
+            header(title: "Confirme o captcha",
+                   subtitle: "A Xiaomi pediu essa verificação extra antes de continuar.")
+
+            AsyncImage(url: imageURL) { image in
+                image.resizable().interpolation(.none).scaledToFit()
+            } placeholder: {
+                ProgressView().tint(MB.night950)
             }
+            .frame(height: 90)
+            .frame(maxWidth: .infinity)
+            .background(Color.white)
+            .mbCornerRadius(MB.Radius.md)
+
+            MBTextField(label: "Captcha", text: $captchaCode, icon: "textformat.abc",
+                        placeholder: "Digite o texto da imagem")
+
+            Spacer()
+            MBButton(title: "Confirmar", variant: .primary, size: .lg,
+                     icon: "checkmark", block: true, glow: true,
+                     disabled: captchaCode.isEmpty) {
+                auth.submitCaptcha(captchaCode)
+                captchaCode = ""
+            }
+            manualLink
+        }
+    }
+
+    // MARK: - Email 2FA
+
+    private var twoFAStep: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            header(title: "Verificação em duas etapas",
+                   subtitle: "A Xiaomi enviou um código para o e-mail da conta. Insira-o abaixo para confirmar que é você.")
+
+            MBTextField(label: "Código", text: $twoFACode, icon: "envelope",
+                        placeholder: "Código recebido por e-mail", mono: true)
+
+            Spacer()
+            MBButton(title: "Confirmar", variant: .primary, size: .lg,
+                     icon: "checkmark", block: true, glow: true,
+                     disabled: twoFACode.isEmpty) {
+                auth.submit2FACode(twoFACode)
+                twoFACode = ""
+            }
+            manualLink
         }
     }
 
@@ -170,6 +203,7 @@ struct XiaomiLoginView: View {
             MBButton(title: "Tentar novamente", variant: .primary, size: .lg,
                      icon: "arrow.clockwise", block: true, glow: true) {
                 selectionError = nil
+                password = ""
                 auth.start()
             }
             manualLink
@@ -218,24 +252,4 @@ struct XiaomiLoginView: View {
     private func select(_ band: XiaomiCloudAuth.CloudBand) {
         selectionError = onExtracted(band.beaconKey)
     }
-
-    /// Present the Xiaomi login IN-APP so the long-poll keeps running. Opening it in an external
-    /// browser would background the app and suspend the poll, so the confirmation is never observed.
-    private func openLogin(_ url: URL) {
-        #if canImport(SafariServices) && !targetEnvironment(macCatalyst)
-        showLogin = true
-        #else
-        openURL(url)
-        #endif
-    }
 }
-
-#if canImport(SafariServices) && !targetEnvironment(macCatalyst)
-import SafariServices
-
-private struct SafariView: UIViewControllerRepresentable {
-    let url: URL
-    func makeUIViewController(context: Context) -> SFSafariViewController { SFSafariViewController(url: url) }
-    func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
-}
-#endif

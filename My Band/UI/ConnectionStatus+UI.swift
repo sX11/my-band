@@ -14,6 +14,7 @@ extension ConnectionState {
         case .scanning:            "Procurando…"
         case .connecting, .discoveringServices, .sessionConfig, .authenticating:
                                    "Conectando…"
+        case .awaitingPairingConfirmation: "Confirme na pulseira"
         case .disconnected:        "Desconectada"
         case .bluetoothUnavailable: "Bluetooth desligado"
         case .error:               "Erro de conexão"
@@ -23,7 +24,8 @@ extension ConnectionState {
     var pillTone: MBStatusPill.Tone {
         switch self {
         case .connected: .ok
-        case .scanning, .connecting, .discoveringServices, .sessionConfig, .authenticating: .warn
+        case .scanning, .connecting, .discoveringServices, .sessionConfig, .authenticating,
+             .awaitingPairingConfirmation: .warn
         case .disconnected, .bluetoothUnavailable, .error: .danger
         }
     }
@@ -31,7 +33,8 @@ extension ConnectionState {
     /// Whether the status dot should pulse (transient/in-progress states).
     var pillPulses: Bool {
         switch self {
-        case .scanning, .connecting, .discoveringServices, .sessionConfig, .authenticating: true
+        case .scanning, .connecting, .discoveringServices, .sessionConfig, .authenticating,
+             .awaitingPairingConfirmation: true
         default: false
         }
     }
@@ -44,6 +47,8 @@ extension ConnectionState {
         case .discoveringServices: "Descobrindo serviço FE95…"
         case .sessionConfig:       "Negociando sessão…"
         case .authenticating:      "Handshake HMAC-SHA256…"
+        case .awaitingPairingConfirmation:
+                                   "Aceite o pareamento na pulseira e confirme no iPhone."
         case .connected:           "Conectada."
         case .disconnected:        "Desconectada."
         case .bluetoothUnavailable: "Ative o Bluetooth para continuar."
@@ -53,7 +58,8 @@ extension ConnectionState {
 
     var isConnecting: Bool {
         switch self {
-        case .scanning, .connecting, .discoveringServices, .sessionConfig, .authenticating: true
+        case .scanning, .connecting, .discoveringServices, .sessionConfig, .authenticating,
+             .awaitingPairingConfirmation: true
         default: false
         }
     }

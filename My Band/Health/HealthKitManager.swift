@@ -96,20 +96,39 @@ final class HealthKitManager {
 
     // MARK: - Sleep
 
+    // A resync of a still-in-progress (or previously partial) night reports a superset of what an
+    // earlier sync already wrote, with different boundaries: each `SleepSession` is internally
+    // sanitized (`SleepDetailsParser.sanitizeStages`), but two sessions covering the same/overlapping
+    // window — whether from multiple files in one batch or from separate background-wake resyncs
+    // hours apart — never get sanitized *against each other*. The old per-phase/per-inBed identifier
+    // also baked in `endDate`, which is exactly what changes between resyncs of an ongoing night, so
+    // HealthKit's sync-identifier dedup (see header comment) never recognized them as updates.
+    // Fixed by: (1) pooling and re-sanitizing phases across every session whose window overlaps,
+    // (2) keying identifiers on the phase's own start + type only (stable across a growing end),
+    // and (3) clearing whatever this app already wrote for the window as a backstop, so a
+    // reclassified stage (same start, different type — not caught by a stable id alone) still gets
+    // superseded instead of sitting alongside the old one.
     func writeSleep(_ sessions: [SleepSession]) async throws -> Int {
+        guard !sessions.isEmpty else { return 0 }
         var samples: [HKSample] = []
-        for session in sessions {
-            guard session.endDate > session.startDate else { continue }
+        for group in Self.groupOverlapping(sessions) {
+            guard let start = group.map(\.startDate).min(), let end = group.map(\.endDate).max(),
+                  end > start else { continue }
+
+            try await deleteExistingSleep(overlapping: start, to: end)
+
             // Enclosing in-bed window so Apple Health reports "Time in Bed" alongside the stages.
-            let inBedId = "mb-inbed-\(Int(session.startDate.timeIntervalSince1970))-\(Int(session.endDate.timeIntervalSince1970))"
+            let inBedId = "mb-inbed-\(Int(start.timeIntervalSince1970))"
             samples.append(HKCategorySample(
                 type: sleepType, value: HKCategoryValueSleepAnalysis.inBed.rawValue,
-                start: session.startDate, end: session.endDate,
+                start: start, end: end,
                 metadata: syncMetadata(inBedId)
             ))
-            for phase in session.phases {
+
+            let sanitized = SleepDetailsParser.sanitizeStages(group.flatMap(\.phases))
+            for phase in sanitized {
                 guard phase.endDate > phase.startDate, let value = Self.sleepValue(phase.type) else { continue }
-                let id = "mb-sleep-\(Int(phase.startDate.timeIntervalSince1970))-\(Int(phase.endDate.timeIntervalSince1970))-\(phase.type.rawValue)"
+                let id = "mb-sleep-\(Int(phase.startDate.timeIntervalSince1970))-\(phase.type.rawValue)"
                 samples.append(HKCategorySample(
                     type: sleepType, value: value.rawValue,
                     start: phase.startDate, end: phase.endDate,
@@ -118,6 +137,29 @@ final class HealthKitManager {
             }
         }
         return try await save(samples)
+    }
+
+    /// Groups sessions whose `[startDate, endDate]` windows transitively overlap — incremental
+    /// resyncs of the same night, however many files/sessions it was split across. Public so tests
+    /// can validate grouping independent of HealthKit.
+    static func groupOverlapping(_ sessions: [SleepSession]) -> [[SleepSession]] {
+        let sorted = sessions.sorted { $0.startDate < $1.startDate }
+        var groups: [[SleepSession]] = []
+        for s in sorted {
+            if let lastEnd = groups.last?.map(\.endDate).max(), s.startDate < lastEnd {
+                groups[groups.count - 1].append(s)
+            } else {
+                groups.append([s])
+            }
+        }
+        return groups
+    }
+
+    private func deleteExistingSleep(overlapping start: Date, to end: Date) async throws {
+        let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
+        let time = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [mine, time])
+        _ = try await store.deleteObjects(of: sleepType, predicate: predicate)
     }
 
     private static func sleepValue(_ type: SleepPhaseType) -> HKCategoryValueSleepAnalysis? {
@@ -257,16 +299,26 @@ final class HealthKitManager {
         let end = last.addingTimeInterval(60)
         let iphone = try await otherSourceSumsByMinute(type: type, unit: unit, start: first, end: end)
 
-        var out: [HKSample] = []
-        for p in points {
-            let key = Int(p.date.timeIntervalSince1970)
-            let delta = p.value - (iphone[key] ?? 0)
-            guard delta > 0 else { continue }
-            out.append(quantity(type, unit, delta,
-                                start: p.date, end: p.date.addingTimeInterval(60),
-                                id: "\(idPrefix)-\(key)", version: version))
+        return Self.surplusValues(points, otherSourceSums: iphone).map { key, delta in
+            quantity(type, unit, delta,
+                    start: Date(timeIntervalSince1970: TimeInterval(key)),
+                    end: Date(timeIntervalSince1970: TimeInterval(key)).addingTimeInterval(60),
+                    id: "\(idPrefix)-\(key)", version: version)
         }
-        return out
+    }
+
+    /// Pure delta math for cross-source reconciliation: band value minus the iPhone's sum for the
+    /// same minute, dropped when ≤ 0. Split out from `reconciledSurplus` (which also does the live
+    /// HealthKit query and builds `HKSample`s) so the math itself — the part a re-sync's changing
+    /// iPhone totals can actually get wrong — is testable without HealthKit.
+    static func surplusValues(_ points: [(date: Date, value: Double)],
+                              otherSourceSums: [Int: Double]) -> [(key: Int, delta: Double)] {
+        points.compactMap { p in
+            let key = Int(p.date.timeIntervalSince1970)
+            let delta = p.value - (otherSourceSums[key] ?? 0)
+            guard delta > 0 else { return nil }
+            return (key, delta)
+        }
     }
 
     /// Per-minute cumulative sum of `type` from every source *except this app*, over [start, end).

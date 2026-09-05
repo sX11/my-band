@@ -138,6 +138,8 @@ enum AuthError: LocalizedError {
     case unexpectedPayload(Int)
     case badHMAC
     case timeout
+    case linkDropped
+    case retrying
     case wrongAuthKey
 
     var errorDescription: String? {
@@ -147,6 +149,8 @@ enum AuthError: LocalizedError {
         case .unexpectedPayload(let n):   return "Resposta da pulseira inesperada: \(n) bytes."
         case .badHMAC:                    return "HMAC da pulseira inválido — AuthKey incorreto."
         case .timeout:                    return "Tempo esgotado durante autenticação."
+        case .linkDropped:                return "A pulseira encerrou a conexão durante o pareamento."
+        case .retrying:                   return "Refazendo o handshake."
         case .wrongAuthKey:               return "AuthKey incorreto. Verifique a chave."
         }
     }

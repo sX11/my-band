@@ -9,6 +9,35 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-05
+
+### Added
+
+- **Login Xiaomi Cloud por usuário/senha** (`Auth/XiaomiCloudAuth.swift`, `Auth/XiaomiCloudCrypto.swift`, `UI/Setup/XiaomiLoginView.swift`): substitui o fluxo por QR. Porta `PasswordXiaomiCloudConnector` do `token_extractor.py` — login direto, com captcha e 2FA por e-mail quando a Xiaomi pedir. Troca consciente: a senha passa a tocar o app (nunca persistida/logada) em vez de nunca sair do lado da Xiaomi. Validado em hardware/conta real (2026-09-05): login simples + descoberta de dispositivo confirmados; captcha/2FA ainda não exercitados.
+- **`CheckBandBatteryIntent`** (`Intents/CheckBandBatteryIntent.swift`, `Intents/BandShortcuts.swift`): Atalho "Verificar bateria da pulseira" com parâmetro de limite (padrão 30%). Sincroniza, pede a bateria explicitamente enquanto o link está aberto e **só produz saída se estiver abaixo do limite** — uma notificação local lembrando de carregar (silencioso se acima do limite ou já no carregador). Feito para uma Automação Pessoal do tipo "ao plugar o iPhone no carregador".
+- **`GetSleepStateIntent`** (`Intents/GetSleepStateIntent.swift`): Atalho "Você está dormindo?" — sincroniza e responde com base na sessão de sono mais recente, sempre declarando a idade do dado. Substitui os gatilhos que a integração (cortada) com Home Assistant ofereceria; a automação fica a cargo das Automações Pessoais do próprio usuário.
+
+### Changed
+
+- UI sem visualização de dados de saúde em tela própria — Apple Health é a única superfície de dados (ver `docs/adr/0001-...`). `MBStatusPill` adota Liquid Glass (`glassEffect`).
+
+### Removed
+
+- **Home Assistant** cortado do roadmap — nunca chegou a ter código; documentação e menções removidas.
+
+### Fixed
+
+- **Sync travava até o timeout com o link aparentemente saudável** (`BLE/BandManager.swift`): a pulseira reabre a sessão por conta própria logo depois do init pós-auth (contador de sequência dela volta a 0, novo watch-nonce, novo `sub=27`). O app ignorava esse `session-config-accept` porque já se considerava `.connected`, e seguia usando as chaves de sessão **antigas** — a pulseira ACKava o frame de transporte e descartava o comando em silêncio, sem conseguir decifrá-lo. Resultado: "Health sync started" seguido só de ACKs e "Tempo esgotado durante sincronização". O GadgetBridge (`XiaomiBleProtocolV2.processPacket`) refaz o handshake a **todo** pacote de session config; o app agora faz o mesmo quando a pulseira reabre a sessão (limitado a 3 reinícios por conexão), rederivando as chaves. A guarda de duplicata ficou restrita ao handshake em voo, que é onde o bug do 005F morava. Confirmado no log de hardware de 2026-09-05.
+- **HMAC divergente por corrida de nonce derrubava a conexão** (`BLE/BandManager.swift`): um watch-nonce que a pulseira já tinha posto no ar quando o nosso `CMD_NONCE` saiu não tem como verificar — foi assinado contra um phone-nonce que ela ainda não viu. Agora são tolerados até 2 divergências por troca de nonce antes de escalar para reconexão; uma AuthKey de fato errada diverge sempre e continua terminando em `AuthError.badHMAC`.
+- **Pareamento inicial não esperava o aceite do usuário** (`BLE/BandManager.swift`, `BLE/BandProtocol.swift`, `UI/ConnectionStatus+UI.swift`, `UI/Setup/ConnectingView.swift`): a pulseira anuncia o primeiro pareamento com `auth sub=16` e só emite um watch-nonce verificável depois que o usuário aceita **na pulseira e no iPhone** (folha de pareamento Bluetooth do iOS). O app tratava o nonce pré-aceite como AuthKey errado e derrubava o link para "retentar" — o que dispensa o próprio prompt que estava esperando — e as 4 retentativas queimavam em poucos segundos, antes de qualquer chance de tocar na tela. `sub=16` agora entra num estado `.awaitingPairingConfirmation`: o handshake espera (janela de 120 s), um HMAC divergente durante a espera não derruba nada, e a tela instrui "Aceite o pareamento na pulseira e confirme no iPhone". Confirmado no log de hardware de 2026-09-05.
+- **Handshake bem-sucedido derrubado por um nonce atrasado** (`BLE/BandManager.swift`): depois do `CMD_AUTH`, a pulseira reemite um watch-nonce próprio (reinício de handshake do lado dela). Verificá-lo contra o nosso phone-nonce já superado sempre falha, e o app derrubava o link a um pacote do sucesso. O mesmo nonce atrasado, quando chegava **depois** do `sub=27`, era ignorado e a conexão completava normalmente — os dois casos aparecem no mesmo log. Nonces recebidos com `CMD_AUTH` em voo agora são ignorados; a confirmação `sub=27` decide.
+- **"Tempo esgotado durante autenticação" mentia** (`BLE/BandManager.swift`, `BLE/BandAuthenticator.swift`): `AuthError.timeout` só era lançado a partir de uma desconexão, então a mensagem aparecia para quedas de link e não existia timeout real — uma pulseira que simplesmente emudecesse ficava pendurada. Adicionado um watchdog de verdade (20 s, 120 s durante o pareamento), re-armado a cada pacote de auth que progride, e um `AuthError.linkDropped` distinto para a queda de link.
+- **Retentativas de auth em rajada** (`BLE/BandManager.swift`): `retryAuthAfterReconnect` reconectava na hora, gastando as 4 tentativas em segundos. Agora o teardown é adiado com atraso crescente (1–4 s), uma retentativa já agendada não é reagendada por um segundo nonce, e o teardown deliberado não aparece mais como erro na UI.
+- **AuthKey podia sumir entre versões e sessões** (`Auth/AuthKeyStore.swift`): o item do Keychain era indexado pelo bundle id lido em runtime, então uma renomeação de bundle/target deixaria o app "sem chave" com a chave intacta no Keychain sob o nome antigo — agora usa um `service` fixo, com migração automática do item legado na primeira leitura. Além disso: `save` passou a atualizar no lugar (o `delete`+`add` anterior perdia a chave se o add falhasse), o item é fixado como não-sincronizável (uma entrada do iCloud Keychain não pode mais sombrear a local), e um Keychain **bloqueado** (relaunch em background antes do primeiro desbloqueio pós-boot) deixou de ser lido como "sem chave" — o que mandava um usuário já pareado de volta para o setup.
+
+- **Sono duplicado/sobreposto entre resyncs** (`Health/HealthKitManager.swift`, `BLE/PacketParser/SleepPacketParser.swift`, `BLE/BandSyncer.swift`): resincronizar uma noite ainda em andamento (cada wake por BLE) reportava a mesma fase real com um fim mais tarde a cada vez; o sync-id antigo incluía o fim exato, então o dedup do HealthKit nunca reconhecia a atualização e as sobreposições se acumulavam (~65 dias de InBed duplicado observados num export real). `writeSleep` agora agrupa sessões cujas janelas se sobrepõem, re-sanitiza o conjunto pooled, e usa ids estáveis (início da fase + tipo, sem o fim). Migração de correção histórica de uma vez só (`repairSleepHistoryOnce`) reconstrói o Health a partir do SwiftData local na próxima sincronização.
+- **Auth trava em loop infinito na primeira conexão** (`BLE/BandManager.swift`): a assinatura de notify em 005F (adicionada como diagnóstico) fazia o app processar o aceite de sessão duas vezes — cada vez reiniciando a troca de nonce com um nonce novo. A pulseira nunca respondia a nenhum dos dois e derrubava a conexão; como o reconector automático nunca desiste, o app ficava tentando pra sempre sem nunca autenticar. Confirmado em hardware (2026-09-05). 005F não tem papel de RX no protocolo — parou de assinar notify nele, e `handleSessionConfigResponse` ganhou uma guarda de idempotência contra qualquer entrega duplicada futura. (Essa guarda era ampla demais e foi restrita ao handshake em voo — ver a entrada "Sync travava até o timeout" acima.)
+
 ## [1.1.0] - 2026-08-21
 
 ### Added
@@ -279,6 +308,7 @@ Mi Band 5/6 (AES-128-ECB + UUIDs FEE0/FEE1) e não funcionava com a Mi Band 10.
 - Permissões declaradas via `INFOPLIST_KEY_*` no `project.pbxproj`: `NSBluetoothAlwaysUsageDescription`, `NSHealthUpdateUsageDescription`, `NSHealthShareUsageDescription`, `UIBackgroundModes`
 - Documentação: `CLAUDE.md` (arquitetura, protocolo BLE, armadilhas), `AGENTS.md` (diretrizes para agentes IA), `README.md`, `CHANGELOG.md`
 
-[Unreleased]: https://github.com/matheusdanoite/my-band/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/matheusdanoite/my-band/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/matheusdanoite/my-band/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/matheusdanoite/my-band/compare/v0.1.0...v1.1.0
 [0.1.0]: https://github.com/matheusdanoite/my-band/releases/tag/v0.1.0

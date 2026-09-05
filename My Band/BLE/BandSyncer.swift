@@ -266,6 +266,8 @@ final class BandSyncer {
             throw error
         }
 
+        await repairSleepHistoryOnce(context: context)
+
         log.info("Health sync started (fetching today's activity files)")
         let fileIds = try await fetchFileIds(manager: manager)
         log.info("Received \(fileIds.count) file ID(s)")
@@ -542,6 +544,46 @@ final class BandSyncer {
         detailIds.forEach { sendAck(fileId: $0, manager: manager) }
 
         return outcome
+    }
+
+    // MARK: - One-time sleep history repair
+    //
+    // `HealthKitManager.writeSleep` used to key each phase's sync identifier on its exact
+    // (start, end) pair. A resync of a still-in-progress night reports the same real segment with
+    // a later end, so the identifier changed and the old, shorter write was never superseded —
+    // years of nights ended up with overlapping, double-counted stage/in-bed records in Apple
+    // Health. The write path is now stable/self-healing, but it can only clean up a night the next
+    // time that night's data happens to be resynced. This repairs everything already on disk in
+    // one pass: local SwiftData still holds every synced `SleepSession` (unlike Apple Health, its
+    // `rawDataHash` dedup doesn't collapse multiple files for the same overlapping night), so
+    // feeding the *entire* history back through the fixed `writeSleep` groups and re-sanitizes it
+    // and clears the stale duplicates. Runs once, gated by a flag, and only advances that flag on
+    // success — a failure just retries on the next sync.
+    private static let sleepRepairKey = "sleepHistoryRepairedV1"
+
+    private func repairSleepHistoryOnce(context: ModelContext) async {
+        guard !UserDefaults.standard.bool(forKey: Self.sleepRepairKey) else { return }
+        let all = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
+        guard !all.isEmpty else {
+            UserDefaults.standard.set(true, forKey: Self.sleepRepairKey)
+            return
+        }
+        do {
+            let written = try await HealthKitManager.shared.writeSleep(all)
+            log.info("One-time sleep history repair: rewrote \(written) samples from \(all.count) local session(s)")
+            UserDefaults.standard.set(true, forKey: Self.sleepRepairKey)
+        } catch {
+            log.error("Sleep history repair failed, will retry next sync: \(error.localizedDescription)")
+        }
+    }
+
+    /// Most recent locally-synced sleep session, for `GetSleepStateIntent` — a pull-based read of
+    /// whatever the last sync happened to capture (the band has no "fell asleep"/"woke up" push).
+    func mostRecentSleepSession() -> SleepSession? {
+        guard let context = modelContext else { return nil }
+        var descriptor = FetchDescriptor<SleepSession>(sortBy: [SortDescriptor(\.startDate, order: .reverse)])
+        descriptor.fetchLimit = 1
+        return try? context.fetch(descriptor).first
     }
 
     private func persistIfNew(_ session: SleepSession, _ context: ModelContext) -> Bool {

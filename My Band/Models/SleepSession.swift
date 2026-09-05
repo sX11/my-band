@@ -3,7 +3,7 @@ import SwiftData
 
 // MARK: - Sleep phase types
 
-enum SleepPhaseType: Int, Codable, CaseIterable {
+enum SleepPhaseType: Int, Codable, CaseIterable, Equatable {
     case awake = 0
     case light = 1
     case deep  = 2
@@ -19,7 +19,7 @@ enum SleepPhaseType: Int, Codable, CaseIterable {
     }
 }
 
-struct SleepPhase: Codable {
+struct SleepPhase: Codable, Equatable {
     var startDate: Date
     var endDate: Date
     var type: SleepPhaseType

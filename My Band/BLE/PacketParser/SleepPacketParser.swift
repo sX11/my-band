@@ -276,8 +276,11 @@ enum SleepDetailsParser {
 
     // MARK: - Helpers
 
-    /// Eliminates overlapping phases caused by cumulative Xiaomi stage packets.
-    private static func sanitizeStages(_ stages: [SleepPhase]) -> [SleepPhase] {
+    /// Eliminates overlapping phases caused by cumulative Xiaomi stage packets. Also reused by
+    /// `HealthKitManager.writeSleep` to collapse phases pooled across multiple `SleepSession`s —
+    /// incremental resyncs of the same still-in-progress night arrive as separate sessions, each
+    /// already sanitized on its own, but not against each other.
+    static func sanitizeStages(_ stages: [SleepPhase]) -> [SleepPhase] {
         let sorted = stages.sorted { $0.startDate < $1.startDate }
         var merged: [SleepPhase] = []
         for s in sorted {

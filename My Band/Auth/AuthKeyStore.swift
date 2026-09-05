@@ -6,58 +6,94 @@ import Security
 struct AuthKeyStore {
 
     private static let account = "mi-band-auth-key"
-    private static let service = Bundle.main.bundleIdentifier ?? "com.myband"
+
+    /// Fixed, bundle-id-independent service name. The pairing key has to survive app updates, a
+    /// target/bundle-id rename and a reinstall, so it is deliberately NOT derived from
+    /// `Bundle.main` at runtime: a renamed bundle would silently stop finding the item and the app
+    /// would present itself as unpaired while the real key sat in the keychain under the old name.
+    private static let service = "com.myband.authkey"
+
+    /// Where the key used to live (the runtime bundle id). Read once and migrated on first load.
+    private static var legacyService: String? {
+        let id = Bundle.main.bundleIdentifier ?? "com.myband"
+        return id == service ? nil : id
+    }
+
+    /// Attributes that identify the item. `synchronizable: false` pins it to this device's local
+    /// keychain so an iCloud-synced entry can never shadow or overwrite the pairing key.
+    private static func baseQuery(service: String = AuthKeyStore.service) -> [String: Any] {
+        [
+            kSecClass as String:            kSecClassGenericPassword,
+            kSecAttrService as String:      service,
+            kSecAttrAccount as String:      account,
+            kSecAttrSynchronizable as String: false,
+        ]
+    }
 
     // MARK: - Public API
 
     static func save(_ key: Data) throws {
         guard key.count == 16 else { throw AuthKeyError.invalidLength(key.count) }
 
-        let query: [String: Any] = [
-            kSecClass as String:            kSecClassGenericPassword,
-            kSecAttrService as String:      service,
-            kSecAttrAccount as String:      account,
-            kSecValueData as String:        key,
+        let attributes: [String: Any] = [
+            kSecValueData as String:      key,
             // Accessible in background — required for BLE reconnect while app is suspended
-            kSecAttrAccessible as String:   kSecAttrAccessibleAfterFirstUnlock,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
         ]
 
-        SecItemDelete(query as CFDictionary)
+        // Update in place when the item exists. The previous delete-then-add lost the key outright
+        // if the add failed, turning a transient keychain error into a re-pairing.
+        let updateStatus = SecItemUpdate(baseQuery() as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess { return }
+        guard updateStatus == errSecItemNotFound else { throw AuthKeyError.keychainError(updateStatus) }
 
-        let status = SecItemAdd(query as CFDictionary, nil)
-        guard status == errSecSuccess else { throw AuthKeyError.keychainError(status) }
+        var addQuery = baseQuery()
+        addQuery.merge(attributes) { _, new in new }
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else { throw AuthKeyError.keychainError(addStatus) }
     }
 
     static func load() throws -> Data {
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String:  true,
-            kSecMatchLimit as String:  kSecMatchLimitOne,
-        ]
+        if let key = try read(service: service) { return key }
+
+        // One-time migration from the old bundle-id-keyed item.
+        if let legacyService, let legacy = try read(service: legacyService) {
+            try? save(legacy)
+            SecItemDelete(baseQuery(service: legacyService) as CFDictionary)
+            return legacy
+        }
+        throw AuthKeyError.notFound
+    }
+
+    private static func read(service: String) throws -> Data? {
+        var query = baseQuery(service: service)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String]  = kSecMatchLimitOne
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess, let data = result as? Data else {
-            if status == errSecItemNotFound { throw AuthKeyError.notFound }
-            throw AuthKeyError.keychainError(status)
+        switch status {
+        case errSecSuccess:               return result as? Data
+        case errSecItemNotFound:          return nil
+        case errSecInteractionNotAllowed: throw AuthKeyError.locked
+        default:                          throw AuthKeyError.keychainError(status)
         }
-        return data
     }
 
     static func delete() {
-        let query: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(query as CFDictionary)
+        SecItemDelete(baseQuery() as CFDictionary)
+        if let legacyService {
+            SecItemDelete(baseQuery(service: legacyService) as CFDictionary)
+        }
     }
 
+    /// Whether a pairing key exists. A *locked* keychain reports `true`: on a background relaunch
+    /// before the first unlock after boot the item is present but unreadable, and answering "no
+    /// key" there would send an already-paired user back through setup.
     static var isStored: Bool {
-        (try? load()) != nil
+        do { _ = try load(); return true }
+        catch AuthKeyError.locked { return true }
+        catch { return false }
     }
 
     // MARK: - Hex convenience
@@ -75,6 +111,7 @@ struct AuthKeyStore {
 
 enum AuthKeyError: LocalizedError {
     case notFound
+    case locked
     case invalidLength(Int)
     case invalidHex
     case keychainError(OSStatus)
@@ -82,6 +119,7 @@ enum AuthKeyError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notFound:               return "AuthKey não encontrado. Configure a chave da pulseira."
+        case .locked:                 return "Keychain bloqueado. Desbloqueie o iPhone e tente de novo."
         case .invalidLength(let n):   return "AuthKey deve ter 16 bytes; recebido \(n)."
         case .invalidHex:             return "Formato inválido. Informe 32 caracteres hexadecimais."
         case .keychainError(let s):   return "Erro no Keychain (OSStatus \(s))."

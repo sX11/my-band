@@ -2,7 +2,7 @@
 
 > A Xiaomi fez a Mi Band. Eu a transformei em My Band.
 
-App nativo **iOS/macOS** (SwiftUI + SwiftData) que conecta o iPhone a uma **Mi Band 10** via Bluetooth Low Energy e sincroniza os dados de saúde com o **Apple Health** — sem a nuvem da Xiaomi no caminho, direto da pulseira para um local centralizado e agnóstico. Também dispara automações no Home Assistant e expõe funcionalidades via Atalhos e Siri.
+App nativo **iOS/macOS** (SwiftUI + SwiftData) que conecta o iPhone a uma **Mi Band 10** via Bluetooth Low Energy e sincroniza os dados de saúde com o **Apple Health** — sem a nuvem da Xiaomi no caminho, direto da pulseira para um local centralizado e agnóstico. Também expõe estado e ações via Atalhos e Siri, para automações do próprio iPhone.
 
 O app oficial da Mi Band 10 não envia todas as métricas coletadas pelo gadget ao Apple Health. O My Band existe para preencher essa lacuna — e para que os dados de saúde sejam de fato do usuário.
 
@@ -46,9 +46,9 @@ Este é um projeto pessoal que serviu de laboratório para BLE, criptografia apl
 | ✅ | Extração do AuthKey via Xiaomi Cloud (login por QR, sem app Xiaomi) |
 | ✅ | Target de testes unitários (Swift Testing, 23 testes) com fixtures reais — **validado no iPhone** |
 | ✅ | Integração com Atalhos via App Intents e frases Siri — **validada em hardware** |
+| ✅ | Atalho de bateria da pulseira com limite configurável — notifica só abaixo do limite, feito para a automação "ao plugar o iPhone no carregador" (v1.2) |
 | ✅ | Sanitização e deduplicação de estágios de sono e validação fisiológica de sinais vitais (v1.1) |
 | 🔜 | Telas SleepDetail (hipnograma) + Settings |
-| 🔜 | Automações no Home Assistant (dormir → apagar luzes) |
 | 🔜 | Mini app customizado na pulseira com botões acionáveis |
 
 ---
@@ -119,7 +119,6 @@ My Band/
 │
 ├── Health/
 │   └── HealthKitManager.swift    # Escrita no Apple Health (sono/atividade/treinos/rota)
-├── HomeAssistant/                # REST API local + Cloudflare tunnel (em desenvolvimento)
 ├── Intents/                      # App Intents + Shortcuts (em desenvolvimento)
 └── UI/                           # SwiftUI (em desenvolvimento)
 ```
@@ -150,7 +149,7 @@ A Mi Band 10 utiliza o protocolo **XiaomiSppPacketV2** sobre BLE (confirmado via
 6. Init pós-auth (time + device info/state/battery) — sem isso a banda re-dispara auth
 
 > **Transporte confiável:** toda frame DATA recebida da banda é confirmada com um ACK (mesmo `seqNum`), ou a banda retransmite o handshake a cada ~6 s.
-> **Primeiro pareamento:** o primeiro watch-nonce sempre falha o HMAC; o app reconecta automaticamente e autentica na 2ª tentativa.
+> **Primeiro pareamento:** a pulseira anuncia com `auth sub=16` e só emite um watch-nonce verificável depois que você aceita **na pulseira e no iPhone**. O app espera esse aceite em vez de tratar os nonces anteriores como chave errada (ver [ADR 0003](docs/adr/0003-patient-band-driven-handshake.md)).
 > O AuthKey (secretKey) tem 16 bytes. Fica **apenas no Keychain** — nunca em logs, SwiftData ou UserDefaults.
 
 ---

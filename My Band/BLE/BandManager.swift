@@ -12,11 +12,16 @@ enum ConnectionState: Equatable {
     case discoveringServices
     case sessionConfig       // waiting for band session config response
     case authenticating      // nonce exchange in progress
+    case awaitingPairingConfirmation  // band asked the user to confirm pairing; waiting on a human
     case connected
     case error(String)
 
     var isConnected: Bool { self == .connected }
     var isScanning:  Bool { self == .scanning }
+
+    /// The handshake is running — either exchanging nonces or parked waiting for the user to
+    /// confirm a first-time pairing.
+    var isAuthInProgress: Bool { self == .authenticating || self == .awaitingPairingConfirmation }
 
     static func == (lhs: ConnectionState, rhs: ConnectionState) -> Bool {
         switch (lhs, rhs) {
@@ -27,6 +32,7 @@ enum ConnectionState: Equatable {
              (.discoveringServices,  .discoveringServices),
              (.sessionConfig,        .sessionConfig),
              (.authenticating,       .authenticating),
+             (.awaitingPairingConfirmation, .awaitingPairingConfirmation),
              (.connected,            .connected):      return true
         case (.error(let a), .error(let b)):          return a == b
         default:                                       return false
@@ -114,6 +120,45 @@ final class BandManager: NSObject {
     private var authRetries = 0
     private let maxAuthRetries = 4
     private var retryAuthOnDisconnect = false
+    // A retry teardown is scheduled. Guards the budget: the band can push several nonces inside the
+    // retry delay, and each one used to book its own retry.
+    private var authRetryPending = false
+
+    // CMD_AUTH (step 3) is in flight — we're waiting for the band's sub=27 confirmation. While set,
+    // a further watch nonce is the band re-driving the handshake with a nonce of its own, NOT an
+    // answer to ours: verifying it against our now-superseded phone nonce always mismatches.
+    // Confirmed on hardware (2026-09-05): the same late nonce arrived once before sub=27 (we tore
+    // the link down and lost a handshake that was one packet from success) and once after it (we
+    // ignored it and the band confirmed the original handshake anyway).
+    private var authStep3Sent = false
+
+    // The band announced a first-time pairing (auth sub=16). It puts up its own confirmation prompt
+    // and iOS raises the system Bluetooth pairing sheet — both need a human tap, which takes far
+    // longer than a protocol round trip. While set, the handshake waits patiently: the nonces the
+    // band signs before the bond exists cannot verify, and tearing the link down to "retry" only
+    // dismisses the very prompt we're waiting on.
+    private var awaitingPairingConfirmation = false
+
+    // Real auth watchdog. Before this, AuthError.timeout was only ever thrown from a disconnect, so
+    // "Tempo esgotado" actually meant "the link dropped" and a band that simply went silent hung
+    // until CoreBluetooth noticed. Re-armed by every auth packet that makes progress.
+    // The band can tear down its session and open a new one mid-link (observed right after the
+    // post-auth init). Each restart costs a full re-handshake, so it's bounded — a band that keeps
+    // restarting is a bug to see in the log, not a loop to spin in.
+    private var bandSessionRestarts = 0
+    private let maxBandSessionRestarts = 3
+
+    // Mismatching watch nonces tolerated within one nonce exchange before we escalate to a
+    // reconnect. A nonce the band had already put on the wire when our fresh CMD_NONCE went out
+    // cannot verify — it was signed against a phone nonce the band hasn't seen — so the first one
+    // or two after a restart are a race, not a bad key. A genuinely wrong AuthKey mismatches every
+    // time and still escalates, then exhausts the retry budget into AuthError.badHMAC.
+    private var nonceMismatches = 0
+    private let maxNonceMismatches = 2
+
+    private var authWatchdog: Task<Void, Never>?
+    private let authTimeoutSeconds        = 20
+    private let pairingAuthTimeoutSeconds = 120
 
     // MARK: - Callbacks (consumed by BandSyncer)
 
@@ -228,6 +273,10 @@ final class BandManager: NSObject {
         _ = secretKey  // validated; actual use is inside callbacks
 
         connectionState = .sessionConfig
+        authStep3Sent = false
+        awaitingPairingConfirmation = false
+        authRetryPending = false
+        armAuthWatchdog()
         // Session config always uses seqNum=0 (GadgetBridge: setSequenceNumber(0)).
         // The DATA packet counter is NOT touched here — CMD_NONCE will get seqNum=0 too.
         seqNum = 0
@@ -450,8 +499,44 @@ final class BandManager: NSObject {
             log.warning("Unexpected session config opCode: \(payload.first.map { String($0) } ?? "nil")")
             return
         }
-        log.debug("Session config accepted — starting auth nonce exchange")
-        connectionState = .authenticating
+        // GadgetBridge (XiaomiBleProtocolV2.processPacket, PACKET_TYPE_SESSION_CONFIG) restarts the
+        // handshake on *every* session-config packet: the band uses it to open a new session, and
+        // when it does, its old session keys are gone.
+        //
+        // We deviate in exactly one place — a repeat that lands while the handshake is still in
+        // flight (.authenticating) is ignored. That guards the 005F dual-subscription failure: the
+        // same accept delivered twice, microseconds apart, fired two CMD_NONCEs with two different
+        // phone nonces and the band answered neither (hardware, 2026-09-05). The root cause is
+        // fixed (005F is no longer subscribed), so this is belt-and-braces.
+        switch connectionState {
+        case .sessionConfig:
+            log.debug("Session config accepted — starting auth nonce exchange")
+            connectionState = .authenticating
+        case .authenticating:
+            log.debug("Ignoring duplicate session-config-accept (handshake already in flight)")
+            return
+        case .awaitingPairingConfirmation:
+            // The band reopens the session once the user accepts the pairing. Swallowing this
+            // would leave us parked until the watchdog.
+            log.info("Session restarted after the pairing accept — new nonce exchange")
+        case .connected:
+            // The band tore down its session and opened a new one under us. Its keys are new; ours
+            // are stale, so every command we send from here on is transport-ACKed and then silently
+            // dropped — which is exactly how a sync hangs until it times out with the link looking
+            // perfectly healthy (hardware, 2026-09-05). Re-run the handshake and re-derive.
+            guard bandSessionRestarts < maxBandSessionRestarts else {
+                log.error("Band restarted the session \(self.bandSessionRestarts)x — not re-handshaking again")
+                return
+            }
+            bandSessionRestarts += 1
+            log.warning("Band reopened the session (restart \(self.bandSessionRestarts)/\(self.maxBandSessionRestarts)) — re-running auth with fresh keys")
+            sessionKeys = nil
+            connectionState = .authenticating
+        default:
+            // No link to run a handshake on (scanning, connecting, error, disconnected).
+            log.debug("Session config in state \(String(describing: self.connectionState)) — ignoring")
+            return
+        }
         startNonceExchange()
     }
 
@@ -459,6 +544,9 @@ final class BandManager: NSObject {
         guard let secretKey = try? AuthKeyStore.load() else {
             failAuth(AuthError.noAuthKey); return
         }
+        authStep3Sent = false
+        nonceMismatches = 0
+        armAuthWatchdog()
         _ = secretKey  // validated; keys used in handleWatchNonce
         let nonce = BandAuthenticator.phoneNonce()
         phoneNonce = nonce
@@ -500,7 +588,7 @@ final class BandManager: NSObject {
     private func handleProtoCommand(_ protoBytes: Data) {
         guard let cmd = XiaomiProto.parseCommand(protoBytes), cmd.hasType, cmd.hasSubtype else {
             // Fallback during auth: route any proto packet as auth response
-            if connectionState == .authenticating {
+            if connectionState.isAuthInProgress {
                 handlePotentialWatchNonce(protoBytes)
             }
             return
@@ -607,25 +695,46 @@ final class BandManager: NSObject {
             // Plaintext auth fallback
             log.info("AUTH response with userId subtype — plaintext mode")
             handleAuthSuccess()
-        case 16:
-            // Band sends subtype=16 during first-time pairing. We don't yet know whether it carries
-            // a usable watch nonce — try to parse one; if it does, the normal path handles it,
-            // otherwise we just wait for sub=26. The hex dump above lets us confirm its contents.
+        case XiaomiAuthCmd.pairingRequest:
+            // Band sends subtype=16 during first-time pairing (GadgetBridge doesn't handle it at
+            // all). Some payloads carry a usable watch nonce — take it if so; otherwise this is the
+            // band telling us it has raised its pairing prompt, and the right move is to wait for
+            // the user rather than race the bond.
             if let resp = BandAuthenticator.parseWatchNonce(from: protoBytes) {
                 log.info("sub=16 carries a watch nonce (nonce=\(resp.watchNonce.hex.prefix(8))…) — processing as auth")
                 handlePotentialWatchNonce(protoBytes)
             } else {
-                log.info("Band pairing packet (sub=16, no watch nonce) — waiting for sub=26")
+                beginPairingConfirmationWait()
             }
         default:
             log.debug("Unknown auth subtype \(subtype) — \(protoBytes.count) bytes")
         }
     }
 
+    /// The band asked the user to confirm the pairing. Stop racing it: widen the watchdog to a
+    /// human-scale window and surface the wait in the UI, so the user knows to accept on the band
+    /// and on the iPhone instead of watching a screen that looks stuck.
+    private func beginPairingConfirmationWait() {
+        guard !awaitingPairingConfirmation else { return }
+        awaitingPairingConfirmation = true
+        connectionState = .awaitingPairingConfirmation
+        log.info("Band pairing packet (sub=16) — waiting for the user to accept on the band and on iPhone")
+        armAuthWatchdog()
+    }
+
     private func handlePotentialWatchNonce(_ protoBytes: Data) {
-        guard connectionState == .authenticating,
-              let nonce     = phoneNonce,
-              let secretKey = try? AuthKeyStore.load() else { return }
+        guard connectionState.isAuthInProgress, let nonce = phoneNonce else { return }
+
+        // CMD_AUTH already went out: this nonce is the band restarting the handshake on its own,
+        // not a reply to ours. Checking it against our superseded phone nonce always mismatches,
+        // and the band goes on to confirm the original handshake regardless. Wait for sub=27.
+        guard !authStep3Sent else {
+            log.debug("Watch nonce after CMD_AUTH — stale re-drive, ignoring (awaiting sub=27)")
+            armAuthWatchdog()
+            return
+        }
+
+        guard let secretKey = try? AuthKeyStore.load() else { return }
 
         #if DEBUG
         // Irreversible fingerprint (not the key) to compare an extracted beaconkey against a
@@ -656,11 +765,27 @@ final class BandManager: NSObject {
             log.warning("Watch HMAC mismatch — phoneNonce=\(nonce.hex) watchNonce=\(resp.watchNonce.hex)")
             log.warning("  band HMAC=\(resp.bandHMAC.hex)")
             log.warning("  ours HMAC=\(expected.hex)")
+            if awaitingPairingConfirmation {
+                // Expected while the confirmation prompts are still up: the band signs with a bond
+                // it hasn't established yet. Keep the link — dropping it dismisses the prompt — and
+                // wait for the nonce it sends once the user accepts.
+                log.info("Pre-confirmation HMAC mismatch — still waiting for the pairing accept, keeping the link")
+                armAuthWatchdog()
+                return
+            }
+            nonceMismatches += 1
+            if nonceMismatches <= maxNonceMismatches {
+                log.info("HMAC mismatch \(self.nonceMismatches)/\(self.maxNonceMismatches) — likely a nonce the band sent before our CMD_NONCE landed; waiting for the next one")
+                armAuthWatchdog()
+                return
+            }
             retryAuthAfterReconnect(reason: "watch HMAC mismatch (first-pairing transient)")
             return
         }
         log.info("Watch HMAC verified — deriving session, sending CMD_AUTH")
 
+        awaitingPairingConfirmation = false
+        connectionState = .authenticating
         sessionKeys = keys
 
         // Send CMD_AUTH
@@ -672,6 +797,8 @@ final class BandManager: NSObject {
                 seqNum:      nextSeq()
             )
             writeSPP(pkt)
+            authStep3Sent = true
+            armAuthWatchdog()
             log.debug("CMD_AUTH sent — awaiting band confirmation")
             // Auth success confirmed by band's CMD_AUTH response (subtype=27)
             // If band sends no explicit response, consider the handshake done here.
@@ -690,10 +817,14 @@ final class BandManager: NSObject {
             sendPostAuthInit()
             return
         }
+        cancelAuthWatchdog()
         connectionState = .connected
         connectedPeripheral = peripheral
         reconnectAttempts = 0
         authRetries = 0
+        authStep3Sent = false
+        awaitingPairingConfirmation = false
+        authRetryPending = false
         log.info("Authentication successful — communication is now encrypted")
         authContinuation?.resume()
         authContinuation = nil
@@ -717,6 +848,7 @@ final class BandManager: NSObject {
     }
 
     private func failAuth(_ error: Error) {
+        cancelAuthWatchdog()
         log.error("Auth failed: \(error.localizedDescription)")
         lastError = error
         connectionState = .error(error.localizedDescription)
@@ -725,18 +857,52 @@ final class BandManager: NSObject {
         resumeConnectWaiters(throwing: error)
     }
 
+    /// (Re)arms the auth watchdog. Every auth packet that makes progress extends it, so a band that
+    /// is still talking is never cut off, while one that goes silent fails with a real timeout
+    /// instead of hanging until CoreBluetooth notices the link is gone. The window widens to
+    /// human scale while we're waiting on a pairing confirmation.
+    private func armAuthWatchdog() {
+        authWatchdog?.cancel()
+        let seconds = awaitingPairingConfirmation ? pairingAuthTimeoutSeconds : authTimeoutSeconds
+        authWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled, let self, !self.connectionState.isConnected else { return }
+            self.log.error("Auth watchdog fired after \(seconds)s — band went silent")
+            self.failAuth(AuthError.timeout)
+            // Drop the half-open link so didDisconnectPeripheral re-arms the standing connect.
+            // Without this we'd sit in .error on a live but unauthenticated link, with nothing
+            // left to drive it forward.
+            if let p = self.peripheral { self.central.cancelPeripheralConnection(p) }
+        }
+    }
+
+    private func cancelAuthWatchdog() {
+        authWatchdog?.cancel()
+        authWatchdog = nil
+    }
+
     /// Tear down the link and reconnect to retry authentication. Used for the first-pairing
     /// HMAC transient: the band only emits a verifiable watch nonce on a fresh connection.
+    /// The teardown is delayed and grows with each attempt — reconnecting instantly burned the
+    /// whole budget in a couple of seconds, well before the band had settled its bond.
     private func retryAuthAfterReconnect(reason: String) {
-        guard authRetries < maxAuthRetries, let p = peripheral else {
+        guard !authRetryPending else { return }
+        guard authRetries < maxAuthRetries, peripheral != nil else {
             log.error("Auth retry budget exhausted (\(self.authRetries)/\(self.maxAuthRetries)) — giving up")
             failAuth(AuthError.badHMAC)
             return
         }
         authRetries += 1
-        log.warning("Retrying auth via reconnect (\(self.authRetries)/\(self.maxAuthRetries)): \(reason)")
-        retryAuthOnDisconnect = true
-        central.cancelPeripheralConnection(p)
+        authRetryPending = true
+        let delay = Double(authRetries)
+        cancelAuthWatchdog()
+        log.warning("Retrying auth via reconnect (\(self.authRetries)/\(self.maxAuthRetries)) in \(delay)s: \(reason)")
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, let p = self.peripheral, !self.connectionState.isConnected else { return }
+            self.retryAuthOnDisconnect = true
+            self.central.cancelPeripheralConnection(p)
+        }
     }
 
     // MARK: - Reconnect
@@ -779,7 +945,11 @@ final class BandManager: NSObject {
 
     // MARK: - Reset on disconnect
 
-    private func resetState() {
+    /// `deliberateAuthRetry` marks the teardown we asked for in retryAuthAfterReconnect: the link
+    /// is coming straight back, so the in-flight authenticate() is resumed quietly instead of
+    /// flipping the UI to an error the user can't act on.
+    private func resetState(deliberateAuthRetry: Bool = false) {
+        cancelAuthWatchdog()
         connectedPeripheral = nil
         cmdReadChar  = nil
         cmdWriteChar = nil
@@ -787,11 +957,21 @@ final class BandManager: NSObject {
         sessionKeys  = nil
         seqNum       = 0
         rxBuffer     = Data()
+        authStep3Sent = false
+        awaitingPairingConfirmation = false
+        authRetryPending = false
+        bandSessionRestarts = 0
         // Only resume the continuation if one is actually waiting — avoids a spurious
         // "Break on All Swift Errors" exception breakpoint hit in Xcode during BLE bonding
         // disconnects, when no continuation is pending.
         if authContinuation != nil {
-            failAuth(AuthError.timeout)
+            if deliberateAuthRetry {
+                authContinuation?.resume(throwing: AuthError.retrying)
+                authContinuation = nil
+                connectionState = .connecting
+            } else {
+                failAuth(AuthError.linkDropped)
+            }
         } else {
             connectionState = .disconnected
             // Fail any background-sync waiter so it doesn't hang until its own timeout.
@@ -863,13 +1043,14 @@ extension BandManager: CBCentralManagerDelegate {
                         error: Error?) {
         // The auth-retry disconnect (first pairing) just wants a fresh connect, which autoReconnect
         // now provides — so the flag no longer gates reconnection, it's only consumed here.
+        let wasAuthRetry = retryAuthOnDisconnect
         retryAuthOnDisconnect = false
         if let error {
             log.warning("Disconnected with error: \(error.localizedDescription)")
         } else {
             log.info("Disconnected cleanly")
         }
-        resetState()
+        resetState(deliberateAuthRetry: wasAuthRetry)
         // Re-arm on ANY non-user disconnect — clean drops included. The previous code reconnected
         // only on an error, so a clean background drop (app suspended, range loss) stayed dead until
         // the user reopened the app and retried by hand. autoReconnect is cleared only by a
@@ -929,11 +1110,14 @@ extension BandManager: CBPeripheralDelegate {
                 log.debug("005E (RX, band→app) — notify subscribed")
             case MiBandUUID.commandWrite:
                 cmdWriteChar = char
-                // Also subscribe to 005F notifications: both chars have Notify capability on Mi Band 10.
-                // GadgetBridge only subscribes to 005E, but subscribing to both catches any responses
-                // that arrive on the TX characteristic (diagnostic).
-                peripheral.setNotifyValue(true, for: char)
-                log.debug("005F (TX, app→band) — write ready + notify subscribed")
+                // 005F is write-only (app→band) per protocol — do NOT subscribe to its notify.
+                // A prior "diagnostic" subscription to both characteristics turned out to be live-fire:
+                // on hardware, the band's session-config-accept landed on 005E *and* 005F, so the app
+                // processed it twice and fired two CMD_NONCE requests back to back with two different
+                // phone nonces — the band never answered either and dropped the link (confirmed on
+                // real hardware, 2026-09-05: endless "Session config accepted" x2 → timeout → standing
+                // reconnect loop, never completing auth). GadgetBridge only ever subscribes to 005E.
+                log.debug("005F (TX, app→band) — write ready")
             default:
                 break
             }
@@ -950,6 +1134,8 @@ extension BandManager: CBPeripheralDelegate {
             guard let self else { return }
             do {
                 try await self.authenticate()
+            } catch AuthError.retrying {
+                self.log.debug("Handshake torn down for a deliberate retry — reconnecting")
             } catch {
                 self.log.error("Authentication failed: \(error.localizedDescription)")
             }
@@ -960,12 +1146,9 @@ extension BandManager: CBPeripheralDelegate {
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard error == nil, let data = characteristic.value else { return }
-        // All SPP responses arrive on 005E (commandRead) per GadgetBridge.
-        // Also handle 005F notifications in case Mi Band 10 uses the TX char bidirectionally.
+        // All SPP responses arrive on 005E (commandRead) per GadgetBridge — 005F is write-only and
+        // no longer subscribed (see didDiscoverCharacteristicsFor).
         if characteristic.uuid == MiBandUUID.commandRead {
-            handleCmdReadNotification(data)
-        } else if characteristic.uuid == MiBandUUID.commandWrite {
-            log.debug("005F notify (\(data.count)B): \(data.map { String(format: "%02x", $0) }.joined(separator: " "))")
             handleCmdReadNotification(data)
         }
     }
@@ -975,7 +1158,7 @@ extension BandManager: CBPeripheralDelegate {
                     error: Error?) {
         if let error {
             log.error("Write failed on \(characteristic.uuid): \(error.localizedDescription)")
-            if connectionState == .authenticating || connectionState == .sessionConfig {
+            if connectionState.isAuthInProgress || connectionState == .sessionConfig {
                 failAuth(error)
             }
         }

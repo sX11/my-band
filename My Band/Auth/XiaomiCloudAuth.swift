@@ -2,22 +2,29 @@ import Foundation
 
 // MARK: - XiaomiCloudAuth
 //
-// In-app port of token_extractor.py's QR-code login flow (QrCodeXiaomiCloudConnector)
+// In-app port of token_extractor.py's password login flow (PasswordXiaomiCloudConnector)
 // plus the encrypted device API (get_homes / get_dev_cnt / get_devices / get_beaconkey).
 //
-// Goal: let the user authenticate with their Xiaomi account by scanning a QR code, then
-// pull the band's `beaconkey` — which IS the BLE AuthKey (secretKey) the band handshake needs.
-// No password is ever typed into the app; auth happens entirely on Xiaomi's side via the QR.
+// Goal: let the user authenticate with their Xiaomi account (username + password, plus a
+// captcha or emailed 2FA code if Xiaomi asks for one), then pull the band's `token`/`beaconkey`
+// — which IS the BLE AuthKey (secretKey) the band handshake needs.
 //
-// Flow (mirrors the Python steps):
-//   1. GET /longPolling/loginUrl            → qr image url, loginUrl, long-polling url, timeout
-//   2. (user scans the QR with the Xiaomi / Mi Home app on another device, or opens loginUrl)
-//   3. long-poll until 200                  → userId, ssecurity, location
-//   4. GET location                          → serviceToken cookie
-//   5. for each region: encrypted API calls → BLE devices + their beaconkey
+// Flow (mirrors PasswordXiaomiCloudConnector.login):
+//   1. GET  serviceLogin                     → `_sign` (or, rarely, an already-valid session)
+//   2. POST serviceLoginAuth2 (user, pass-md5, _sign) → ssecurity + location,
+//        or a captchaUrl to solve and retry, or a notificationUrl (email 2FA) to complete
+//   3. GET  location                         → serviceToken cookie (skipped if 2FA already got it)
+//   4. for each region: encrypted API calls → BLE devices + their beaconkey/token
 //
-// Status of cloud bits in this project: implemented faithfully from the reference, but the
-// Xiaomi endpoints are fragile and region/account-dependent — VALIDATE against a real account.
+// The username/password only ever live in this object's memory for the duration of the login —
+// never persisted, never logged (see `log`, which only traces presence/shape of secrets, not
+// their values). This intentionally trades the previous QR flow's "password never touches the
+// app" property for not depending on a second device/long-poll — a deliberate choice, not an
+// oversight (see CLAUDE.md).
+//
+// Status: implemented faithfully from the reference, but the Xiaomi endpoints (especially the
+// email 2FA hop chain, which chases redirects and a non-standard response header) are fragile
+// and account/region-dependent — VALIDATE against a real account, captcha, and 2FA.
 
 @MainActor
 @Observable
@@ -35,17 +42,17 @@ final class XiaomiCloudAuth {
 
     enum Phase: Equatable {
         case idle
-        case requestingCode      // fetching the QR
-        case awaitingScan        // QR shown, waiting for the user to scan/confirm
-        case authenticating      // scanned — exchanging for a service token
-        case fetchingDevices     // pulling devices + beaconkeys
-        case done                // see `bands`
+        case enteringCredentials    // form shown, waiting for username/password
+        case authenticating        // submitted — talking to Xiaomi
+        case awaitingCaptcha(URL)  // Xiaomi wants a captcha solved before it'll continue
+        case awaiting2FA           // Xiaomi emailed a verification code
+        case confirmingLogin       // exchanging the login result for a service token
+        case fetchingDevices       // pulling devices + beaconkeys
+        case done                  // see `bands`
         case failed(String)
     }
 
     private(set) var phase: Phase = .idle
-    private(set) var qrImageURL: URL?     // image of the QR code to display/scan
-    private(set) var loginURL: URL?       // URL encoded in the QR (open in the Xiaomi app)
     private(set) var bands: [CloudBand] = []
 
     // Servers a Xiaomi account/device may live on (token_extractor SERVERS).
@@ -55,15 +62,15 @@ final class XiaomiCloudAuth {
     private let agent = XiaomiCloudAuth.generateAgent()
     private let deviceId = XiaomiCloudAuth.generateDeviceId()
 
+    private var username: String?
+    private var sign: String?
     private var ssecurity: String?
     private var userId: String?
     private var location: String?
     private var serviceToken: String?
-    private var longPollingURL: String?
-    // Window the user has to finish the Xiaomi login. The server's `timeout` is in SECONDS
-    // (token_extractor uses it as-is), but we floor it generously: the user has to leave to the
-    // in-app Xiaomi page, sign in, and come back before any poll can observe success.
-    private var pollTimeout: TimeInterval = 300
+
+    private var pendingCaptcha: CheckedContinuation<String, Error>?
+    private var pending2FACode: CheckedContinuation<String, Error>?
 
     private var runTask: Task<Void, Never>?
 
@@ -83,24 +90,51 @@ final class XiaomiCloudAuth {
     func start() {
         cancel()
         bands = []
-        qrImageURL = nil
-        loginURL = nil
-        phase = .requestingCode
-        runTask = Task { await run() }
+        username = nil
+        sign = nil
+        ssecurity = nil
+        userId = nil
+        location = nil
+        serviceToken = nil
+        phase = .enteringCredentials
     }
 
     func cancel() {
         runTask?.cancel()
         runTask = nil
+        pendingCaptcha?.resume(throwing: CancellationError())
+        pendingCaptcha = nil
+        pending2FACode?.resume(throwing: CancellationError())
+        pending2FACode = nil
     }
 
-    private func run() async {
+    /// Kicks off the login with the credentials the user typed. Password is used only to compute
+    /// the request's MD5 hash below and is never stored past this call's stack frame.
+    func submitCredentials(username: String, password: String) {
+        guard phase == .enteringCredentials else { return }
+        self.username = username
+        phase = .authenticating
+        runTask = Task { await run(password: password) }
+    }
+
+    func submitCaptcha(_ code: String) {
+        pendingCaptcha?.resume(returning: code)
+        pendingCaptcha = nil
+    }
+
+    func submit2FACode(_ code: String) {
+        pending2FACode?.resume(returning: code)
+        pending2FACode = nil
+    }
+
+    private func run(password: String) async {
         do {
-            try await requestLoginCode()
-            phase = .awaitingScan
-            try await pollUntilScanned()
-            phase = .authenticating
-            try await fetchServiceToken()
+            try await loginStep1()
+            try await loginStep2(password: password)
+            if serviceToken == nil {
+                phase = .confirmingLogin
+                try await loginStep3()
+            }
             phase = .fetchingDevices
             bands = try await fetchBandDevices()
             phase = .done
@@ -113,90 +147,208 @@ final class XiaomiCloudAuth {
         }
     }
 
-    // MARK: - Step 1: request the QR / login URL
+    // MARK: - Step 1: serviceLogin — grab the `_sign` the auth POST needs
 
-    private func requestLoginCode() async throws {
-        var comps = URLComponents(string: "https://account.xiaomi.com/longPolling/loginUrl")!
-        comps.queryItems = [
-            .init(name: "_qrsize", value: "480"),
-            .init(name: "qs", value: "%3Fsid%3Dxiaomiio%26_json%3Dtrue"),
-            .init(name: "callback", value: "https://sts.api.io.mi.com/sts"),
-            .init(name: "_hasLogo", value: "false"),
-            .init(name: "sid", value: "xiaomiio"),
-            .init(name: "serviceParam", value: ""),
-            .init(name: "_locale", value: "en_GB"),
-            .init(name: "_dc", value: String(Int(Date().timeIntervalSince1970 * 1000))),
-        ]
+    private func loginStep1() async throws {
+        guard let url = URL(string: "https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true")
+        else { throw CloudError.invalidUsername }
 
-        let (data, _) = try await get(comps.url!)
-        guard let json = Self.toJSON(data),
-              let qr = json["qr"] as? String,
-              let login = json["loginUrl"] as? String,
-              let lp = json["lp"] as? String
-        else { throw CloudError.noLoginCode }
+        let (data, response) = try await get(url, headers: ["Cookie": "userId=\(username ?? "")"])
+        guard response.statusCode == 200, let json = Self.toJSON(data) else { throw CloudError.invalidUsername }
 
-        qrImageURL = URL(string: qr)
-        loginURL = URL(string: login)
-        longPollingURL = lp
-        if let timeout = json["timeout"] as? Double { pollTimeout = timeout }   // seconds
-        Self.log("login code ready; pollTimeout=\(Int(pollTimeout))s")
-    }
-
-    // MARK: - Step 3: long-poll until the user confirms the scan
-
-    private func pollUntilScanned() async throws {
-        guard let lp = longPollingURL, let url = URL(string: lp) else { throw CloudError.noLoginCode }
-        let deadline = Date().addingTimeInterval(max(pollTimeout, 300))
-
-        while Date() < deadline {
-            try Task.checkCancellation()
-            do {
-                let (data, response) = try await get(url)
-                let json = Self.toJSON(data)
-                Self.log("poll status=\(response.statusCode) code=\(json?["code"] ?? "?") hasLocation=\(json?["location"] != nil)")
-
-                // Success: the long-poll returns the login result with a `location` to exchange
-                // for the service token. `ssecurity`/`userId` come alongside on completion.
-                if response.statusCode == 200, let json, let loc = json["location"] as? String {
-                    ssecurity = json["ssecurity"] as? String
-                    userId = Self.stringy(json["userId"])
-                    location = loc
-                    Self.log("scan confirmed; have ssecurity=\(ssecurity != nil)")
-                    return
-                }
-                // Still waiting (Xiaomi holds the request or returns a non-final code) — poll again.
-            } catch let urlError as URLError {
-                if urlError.code == .cancelled { throw CancellationError() }
-                // Long-poll naturally times out while waiting, and the request can be dropped when
-                // the app briefly backgrounds; retry until our deadline either way.
-                Self.log("poll retry after URLError \(urlError.code.rawValue)")
-            }
+        if let sign = json["_sign"] as? String {
+            self.sign = sign
+        } else if let ssec = json["ssecurity"] as? String {
+            // Rare: an already-valid session came back directly.
+            self.ssecurity = ssec
+            self.userId = Self.stringy(json["userId"])
+            self.location = json["location"] as? String
+        } else {
+            throw CloudError.invalidUsername
         }
-        throw CloudError.scanTimedOut
     }
 
-    // MARK: - Step 4: exchange the login location for a service token
+    // MARK: - Step 2: serviceLoginAuth2 — the actual credential check
 
-    private func fetchServiceToken() async throws {
+    private func loginStep2(password: String) async throws {
+        let url = "https://account.xiaomi.com/pass/serviceLoginAuth2"
+        var fields: [(String, String)] = [
+            ("sid", "xiaomiio"),
+            ("hash", XiaomiCloudCrypto.md5Hex(Data(password.utf8)).uppercased()),
+            ("callback", "https://sts.api.io.mi.com/sts"),
+            ("qs", "%3Fsid%3Dxiaomiio%26_json%3Dtrue"),
+            ("user", username ?? ""),
+            ("_json", "true"),
+        ]
+        if let sign { fields.append(("_sign", sign)) }
+
+        var json = try await postForm(url, fields: fields)
+
+        // Xiaomi wants a captcha solved before it'll evaluate the credentials.
+        if let captchaPath = json?["captchaUrl"] as? String, !captchaPath.isEmpty {
+            let full = captchaPath.hasPrefix("/") ? "https://account.xiaomi.com" + captchaPath : captchaPath
+            guard let captchaURL = URL(string: full) else { throw CloudError.captchaFailed }
+            let code = try await requestCaptcha(imageURL: captchaURL)
+            fields.append(("captCode", code))
+            json = try await postForm(url, fields: fields)
+            if let code = json?["code"] as? Int, code == 87001 { throw CloudError.invalidCaptcha }
+        }
+
+        if let ssec = json?["ssecurity"] as? String, ssec.count > 4 {
+            self.ssecurity = ssec
+            self.userId = Self.stringy(json?["userId"])
+            self.location = json?["location"] as? String
+            return
+        }
+
+        if let notificationURL = json?["notificationUrl"] as? String {
+            try await do2FAEmailFlow(notificationURL: notificationURL)
+            return
+        }
+
+        throw CloudError.invalidCredentials
+    }
+
+    // MARK: - Step 3: exchange the login location for a service token
+
+    private func loginStep3() async throws {
         guard let loc = location, let url = URL(string: loc) else { throw CloudError.noServiceToken }
         let (_, response) = try await get(url, headers: ["content-type": "application/x-www-form-urlencoded"])
 
-        // Primary: the serviceToken is a Set-Cookie on this response (Python reads response.cookies).
         if let fields = response.allHeaderFields as? [String: String], let responseURL = response.url {
             let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: responseURL)
             serviceToken = cookies.first { $0.name == "serviceToken" }?.value
         }
-        // Fallback: pick it up from the session jar (covers cookies set on intermediate redirects).
-        if serviceToken == nil {
-            let jar = session.configuration.httpCookieStorage?.cookies ?? []
-            serviceToken = jar.first { $0.name == "serviceToken" }?.value
-            Self.log("serviceToken via jar; jar cookies=\(jar.map(\.name))")
-        }
+        if serviceToken == nil { serviceToken = cookieValue(named: "serviceToken") }
         Self.log("serviceToken present=\(serviceToken != nil)")
         if serviceToken == nil { throw CloudError.noServiceToken }
     }
 
-    // MARK: - Step 5: discover BLE bands and their beaconkeys across regions
+    // MARK: - Email 2FA
+    //
+    // Ported from `do_2fa_email_flow`. Several hops here read the `Location`/`extension-pragma`
+    // headers of a redirect *response itself*, so those specific requests must not auto-follow the
+    // redirect (`getWithoutRedirect`) — the same reason the Python side passes `allow_redirects=False`.
+
+    private func do2FAEmailFlow(notificationURL: String) async throws {
+        guard let notifURL = URL(string: notificationURL),
+              let comps = URLComponents(url: notifURL, resolvingAgainstBaseURL: false),
+              let context = comps.queryItems?.first(where: { $0.name == "context" })?.value
+        else { throw CloudError.twoFactorFailed }
+
+        _ = try? await get(notifURL)   // authStart — establishes the identity session cookie
+
+        var listComps = URLComponents(string: "https://account.xiaomi.com/identity/list")!
+        listComps.queryItems = [.init(name: "sid", value: "xiaomiio"), .init(name: "context", value: context),
+                                 .init(name: "_locale", value: "en_US")]
+        _ = try? await get(listComps.url!)
+
+        let ick = cookieValue(named: "ick") ?? ""
+        let sendQuery = "_dc=\(Int(Date().timeIntervalSince1970 * 1000))&sid=xiaomiio&context=\(Self.quotePlus(context))&mask=0&_locale=en_US"
+        guard let sendURL = URL(string: "https://account.xiaomi.com/identity/auth/sendEmailTicket?\(sendQuery)")
+        else { throw CloudError.twoFactorFailed }
+        var sendRequest = URLRequest(url: sendURL)
+        sendRequest.httpMethod = "POST"
+        sendRequest.setValue(agent, forHTTPHeaderField: "User-Agent")
+        sendRequest.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        sendRequest.httpBody = Data("retry=0&icode=&_json=true&ick=\(Self.quotePlus(ick))".utf8)
+        _ = try? await session.data(for: sendRequest)
+
+        // Suspends until the UI calls `submit2FACode`.
+        let code = try await request2FACode()
+
+        let verifyQuery = "_flag=8&_json=true&sid=xiaomiio&context=\(Self.quotePlus(context))&mask=0&_locale=en_US"
+        guard let verifyURL = URL(string: "https://account.xiaomi.com/identity/auth/verifyEmail?\(verifyQuery)")
+        else { throw CloudError.twoFactorFailed }
+        var verifyRequest = URLRequest(url: verifyURL)
+        verifyRequest.httpMethod = "POST"
+        verifyRequest.setValue(agent, forHTTPHeaderField: "User-Agent")
+        verifyRequest.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        verifyRequest.httpBody = Data("_flag=8&ticket=\(Self.quotePlus(code))&trust=false&_json=true&ick=\(Self.quotePlus(ick))".utf8)
+        let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
+        guard (verifyResponse as? HTTPURLResponse)?.statusCode == 200 else { throw CloudError.twoFactorFailed }
+
+        var finishLocation = Self.toJSON(verifyData)?["location"] as? String
+
+        if finishLocation == nil {
+            guard let checkURL = URL(string: "https://account.xiaomi.com/identity/result/check?sid=xiaomiio&context=\(Self.quotePlus(context))&_locale=en_US")
+            else { throw CloudError.twoFactorFailed }
+            let (_, checkResponse) = try await getWithoutRedirect(checkURL)
+            if (checkResponse.statusCode == 301 || checkResponse.statusCode == 302),
+               let loc = checkResponse.value(forHTTPHeaderField: "Location") {
+                finishLocation = loc
+            }
+        }
+        guard var endURLString = finishLocation else { throw CloudError.twoFactorFailed }
+
+        if endURLString.contains("identity/result/check"), let checkURL = URL(string: endURLString) {
+            let (_, r) = try await getWithoutRedirect(checkURL)
+            guard let loc = r.value(forHTTPHeaderField: "Location") else { throw CloudError.twoFactorFailed }
+            endURLString = loc
+        }
+        guard let endURL = URL(string: endURLString) else { throw CloudError.twoFactorFailed }
+
+        var (endData, endResponse) = try await getWithoutRedirect(endURL)
+        // Some servers return a 200 "Tips" interstitial first, then the real 302 on the next call.
+        if endResponse.statusCode == 200, String(decoding: endData, as: UTF8.self).contains("Xiaomi Account - Tips") {
+            (endData, endResponse) = try await getWithoutRedirect(endURL)
+        }
+
+        if let pragma = endResponse.value(forHTTPHeaderField: "extension-pragma"),
+           let pragmaJSON = (try? JSONSerialization.jsonObject(with: Data(pragma.utf8))) as? [String: Any],
+           let ssec = pragmaJSON["ssecurity"] as? String {
+            ssecurity = ssec
+        }
+        guard ssecurity != nil else { throw CloudError.twoFactorFailed }
+
+        var stsURLString = endResponse.value(forHTTPHeaderField: "Location")
+        if stsURLString == nil {
+            let body = String(decoding: endData, as: UTF8.self)
+            if let range = body.range(of: "https://sts.api.io.mi.com/sts") {
+                let rest = body[range.lowerBound...]
+                stsURLString = String(rest[rest.startIndex..<(rest.firstIndex(of: "\"") ?? rest.index(rest.startIndex, offsetBy: min(300, rest.count)))])
+            }
+        }
+        guard let stsURLFinal = stsURLString, let stsURL = URL(string: stsURLFinal) else { throw CloudError.twoFactorFailed }
+
+        let (_, stsResponse) = try await get(stsURL)
+        guard stsResponse.statusCode == 200 else { throw CloudError.twoFactorFailed }
+
+        guard let token = cookieValue(named: "serviceToken") else { throw CloudError.twoFactorFailed }
+        serviceToken = token
+        installServiceTokenCookies(token)
+        if userId == nil { userId = cookieValue(named: "userId") }
+    }
+
+    private func requestCaptcha(imageURL: URL) async throws -> String {
+        phase = .awaitingCaptcha(imageURL)
+        return try await withCheckedThrowingContinuation { pendingCaptcha = $0 }
+    }
+
+    private func request2FACode() async throws -> String {
+        phase = .awaiting2FA
+        return try await withCheckedThrowingContinuation { pending2FACode = $0 }
+    }
+
+    private func installServiceTokenCookies(_ token: String) {
+        guard let storage = session.configuration.httpCookieStorage else { return }
+        for domain in [".api.io.mi.com", ".io.mi.com", ".mi.com"] {
+            for name in ["serviceToken", "yetAnotherServiceToken"] {
+                if let cookie = HTTPCookie(properties: [.domain: domain, .path: "/", .name: name, .value: token]) {
+                    storage.setCookie(cookie)
+                }
+            }
+        }
+    }
+
+    private func cookieValue(named name: String) -> String? {
+        session.configuration.httpCookieStorage?.cookies?.first { $0.name == name }?.value
+    }
+
+    // MARK: - Step 4: discover BLE bands and their beaconkeys across regions
+    //
+    // Unchanged from the previous QR flow — once `ssecurity`/`userId`/`serviceToken` are set, the
+    // rest of the pipeline doesn't care how they were obtained.
 
     private func fetchBandDevices() async throws -> [CloudBand] {
         guard ssecurity != nil else { throw CloudError.noServiceToken }
@@ -394,7 +546,7 @@ final class XiaomiCloudAuth {
         return XiaomiCloudCrypto.sha1(Data(signatureString.utf8)).base64EncodedString()
     }
 
-    // MARK: - HTTP helper
+    // MARK: - HTTP helpers
 
     @discardableResult
     private func get(_ url: URL, headers: [String: String] = [:]) async throws -> (Data, HTTPURLResponse) {
@@ -405,6 +557,42 @@ final class XiaomiCloudAuth {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw CloudError.network }
         return (data, http)
+    }
+
+    /// POST with the fields glued into the query string (`requests.post(url, params=fields)`
+    /// semantics — Xiaomi's login endpoints read form fields from there, not the body).
+    private func postForm(_ urlString: String, fields: [(String, String)]) async throws -> [String: Any]? {
+        let query = fields.map { "\($0.0)=\(Self.quotePlus($0.1))" }.joined(separator: "&")
+        guard let url = URL(string: urlString + "?" + query) else { throw CloudError.network }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(agent, forHTTPHeaderField: "User-Agent")
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let (data, response) = try await session.data(for: request)
+        guard (response as? HTTPURLResponse) != nil else { throw CloudError.network }
+        return Self.toJSON(data)
+    }
+
+    /// A GET that does NOT follow redirects, so the caller can read the redirect response's own
+    /// headers (`Location`, or Xiaomi's non-standard `extension-pragma`) instead of the destination's.
+    private func getWithoutRedirect(_ url: URL) async throws -> (Data, HTTPURLResponse) {
+        var request = URLRequest(url: url)
+        request.setValue(agent, forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await session.data(for: request, delegate: RedirectBlocker())
+        guard let http = response as? HTTPURLResponse else { throw CloudError.network }
+        return (data, http)
+    }
+
+    // Completion-handler form, not the async variant: the async flavor of this delegate method
+    // crashes the Swift 27 compiler's ObjC thunk codegen (SIL emitNativeToForeignThunk) on this
+    // toolchain. `session.data(for:delegate:)` bridges either style fine.
+    private final class RedirectBlocker: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
     }
 
     // MARK: - Static helpers (mirror the Python module functions)
@@ -460,15 +648,19 @@ final class XiaomiCloudAuth {
             || n.contains("band") || n.contains("watch")
     }
 
-    /// Debug-only tracing of the cloud handshake. Never logs the serviceToken or beaconkey values —
-    /// only their presence and non-sensitive structure (status codes, cookie names, response codes).
+    /// Debug-only tracing of the cloud handshake. Never logs the username, password, serviceToken,
+    /// or beaconkey values — only their presence and non-sensitive structure (status codes, cookie
+    /// names, response codes).
     private static func log(_ message: @autoclosure () -> String) {
         #if DEBUG
         print("[XiaomiCloud] \(message())")
         #endif
     }
 
-    /// urlencode/quote_plus-equivalent: keep unreserved chars, percent-encode the rest.
+    /// urlencode/quote_plus-equivalent: keep unreserved chars, percent-encode the rest. Needed
+    /// because several login/API values are base64 (`_sign`, RC4 output) and can contain `+`, `/`,
+    /// `=` — `URLComponents`' own query encoding leaves `+` as a literal plus, which a form-encoded
+    /// parser on the other end reads back as a space, silently corrupting the value.
     private static func quotePlus(_ value: String) -> String {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "_.-")
@@ -479,18 +671,24 @@ final class XiaomiCloudAuth {
 
     enum CloudError: LocalizedError {
         case network
-        case noLoginCode
-        case scanTimedOut
+        case invalidUsername
+        case invalidCredentials
+        case captchaFailed
+        case invalidCaptcha
+        case twoFactorFailed
         case noServiceToken
         case noBandFound
 
         var errorDescription: String? {
             switch self {
-            case .network:        return "Falha de rede ao falar com a Xiaomi."
-            case .noLoginCode:    return "Não foi possível gerar o código QR. Tente novamente."
-            case .scanTimedOut:   return "Tempo esgotado aguardando a leitura do QR."
-            case .noServiceToken: return "Login não concluído. Confirme a leitura no app da Xiaomi."
-            case .noBandFound:    return "Nenhuma pulseira encontrada nesta conta Xiaomi."
+            case .network:             return "Falha de rede ao falar com a Xiaomi."
+            case .invalidUsername:     return "Usuário não reconhecido."
+            case .invalidCredentials:  return "Usuário ou senha incorretos."
+            case .captchaFailed:       return "Não foi possível carregar o captcha. Tente novamente."
+            case .invalidCaptcha:      return "Captcha incorreto."
+            case .twoFactorFailed:     return "Não foi possível confirmar o código de verificação."
+            case .noServiceToken:      return "Login não concluído — a Xiaomi não confirmou a sessão."
+            case .noBandFound:         return "Nenhuma pulseira encontrada nesta conta Xiaomi."
             }
         }
     }

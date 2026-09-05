@@ -1,5 +1,6 @@
 import Foundation
 import CommonCrypto
+import CryptoKit
 
 // MARK: - XiaomiCloudCrypto
 //
@@ -29,6 +30,13 @@ enum XiaomiCloudCrypto {
         var hash = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
         data.withUnsafeBytes { _ = CC_SHA1($0.baseAddress, CC_LONG(data.count), &hash) }
         return Data(hash)
+    }
+
+    /// Lowercase hex MD5 — required by the password-based login endpoint (`hash` field), which
+    /// predates the account API's move to stronger hashing. CryptoKit's `Insecure.MD5` avoids the
+    /// deprecated CommonCrypto entry point; this is protocol compatibility, not a security choice.
+    static func md5Hex(_ data: Data) -> String {
+        Insecure.MD5.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - RC4 (ARC4)

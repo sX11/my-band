@@ -94,14 +94,18 @@ struct ConnectingView: View {
         }
     }
 
+    private var pairing: Bool { band.connectionState == .awaitingPairingConfirmation }
+
     private var title: String {
         if done { return "Pulseira conectada" }
         if failed { return "Não foi possível conectar" }
+        if pairing { return "Confirme o pareamento" }
         return "Conectando…"
     }
     private var tileIcon: String {
         if done { return "checkmark" }
         if failed { return "exclamationmark.triangle.fill" }
+        if pairing { return "hand.tap.fill" }
         return "dot.radiowaves.left.and.right"
     }
     private var tileBackground: Color { done ? MB.okSoft : (failed ? MB.dangerSoft : MB.accentSoft) }

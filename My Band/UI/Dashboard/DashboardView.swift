@@ -21,7 +21,8 @@ struct DashboardView: View {
     /// Mid-handshake (or scanning) — a reconnect is already under way, so the button waits.
     private var connecting: Bool {
         switch band.connectionState {
-        case .connecting, .discoveringServices, .sessionConfig, .authenticating, .scanning: true
+        case .connecting, .discoveringServices, .sessionConfig, .authenticating, .scanning,
+             .awaitingPairingConfirmation: true
         default: false
         }
     }

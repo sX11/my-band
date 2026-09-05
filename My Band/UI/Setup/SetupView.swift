@@ -62,10 +62,8 @@ struct SetupView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     feature(icon: "heart.fill", bg: MB.hrSoft, fg: MB.hr,
                             title: "Apple Health", sub: "Sono, FC, passos e SpO₂")
-                    feature(icon: "house.fill", bg: MB.accentSoft, fg: MB.accent,
-                            title: "Home Assistant", sub: "Automações ao dormir e acordar")
                     feature(icon: "mic.fill", bg: MB.spo2Soft, fg: MB.spo2,
-                            title: "Atalhos e Siri", sub: "“Como foi meu sono?”")
+                            title: "Atalhos e Siri", sub: "“Você está dormindo?”")
                 }
             }
             Spacer()
