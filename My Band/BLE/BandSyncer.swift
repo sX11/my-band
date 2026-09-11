@@ -15,6 +15,7 @@ enum SyncError: LocalizedError {
     case unexpectedResponse
     case crcMismatch
     case fileIdMismatch
+    case sessionRestarted
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +26,7 @@ enum SyncError: LocalizedError {
         case .unexpectedResponse: return "Resposta inesperada da pulseira."
         case .crcMismatch:        return "CRC-32 inválido no arquivo de atividade."
         case .fileIdMismatch:     return "Arquivo recebido não corresponde ao solicitado."
+        case .sessionRestarted:   return "A pulseira reiniciou a sessão no meio da sincronização."
         }
     }
 }
@@ -42,12 +44,15 @@ private final class ActivityFileReceiver {
     private(set) var receivedCount: Int = 0
     private var complete = false
     private var started = false
+    /// Last time the band sent anything for this fetch — drives the idle timeout.
+    private(set) var lastActivity = ContinuousClock.now
 
     /// Completion is signalled by the LAST chunk (num == total), matching GadgetBridge
     /// XiaomiActivityFileFetcher.addChunk — more robust than counting received chunks.
     var isComplete: Bool { complete }
 
     func addChunk(_ payload: Data) {
+        lastActivity = ContinuousClock.now
         // payload (decrypted): [total: UInt16 LE][num: UInt16 LE][data...]
         guard payload.count >= 4 else { return }
         let base    = payload.startIndex
@@ -126,6 +131,16 @@ final class BandSyncer {
     private let calendarSync = CalendarSyncService()
     private let weatherSync  = WeatherSyncService()
 
+    /// Live only while a command/response exchange is pending; BandManager.onSessionRestart yields
+    /// into it so the exchange fails fast instead of waiting out its timeout.
+    private var sessionRestartSignal: AsyncStream<Void>.Continuation?
+    /// Re-sends allowed per exchange. The band restarts once after the post-auth init; the manager
+    /// itself gives up and drops the link past its own limit of 3.
+    private static let maxRestartRetries = 3
+    /// A file fetch fails after this long without a chunk — not after a fixed total, which a large
+    /// file (a night of sleep, with its HR/SpO₂ sections) can legitimately need.
+    private static let fileIdleTimeout: Duration = .seconds(10)
+
     // MARK: - Setup
 
     func setup(manager: BandManager, context: ModelContext) {
@@ -141,6 +156,8 @@ final class BandSyncer {
                 BackgroundSyncManager.shared.syncOnBackgroundWakeIfStale()
             }
         }
+
+        manager.onSessionRestart = { [weak self] in self?.sessionRestartSignal?.yield() }
 
         workoutGps.setup(manager: manager)
         findPhone.setup(manager: manager)
@@ -169,7 +186,7 @@ final class BandSyncer {
             // those — skipping the FETCH_TODAY/PAST listing. Older firmware that omits the ids falls
             // back to a full sync. (Daily totals, which a workout also bumps, are left for the next
             // regular/background sync.)
-            let ids = splitFileIds(fileIds)
+            let ids = Self.splitFileIds(fileIds)
             if ids.isEmpty {
                 log.info("Workout finished (no file ids) — running full Apple Health sync")
                 try await syncToHealth()
@@ -250,7 +267,10 @@ final class BandSyncer {
         // @MainActor serialises overlapping triggers (manual button, BGTask, background-wake) into
         // a single run — the rest see the flag and bail.
         guard !isSyncing else { return HealthSyncOutcome() }
-        guard let manager = bandManager, manager.connectionState.isConnected else {
+        // Mid-handshake counts: the band re-deriving keys under a live link is routine, and every
+        // exchange waits for it to settle (surviveSessionRestart).
+        guard let manager = bandManager,
+              manager.connectionState.isConnected || manager.connectionState.isAuthInProgress else {
             throw SyncError.notConnected
         }
         guard let context = modelContext else { throw SyncError.noDeviceRecord }
@@ -298,7 +318,10 @@ final class BandSyncer {
     @discardableResult
     func syncWorkoutFiles(_ fileIds: [Data]) async throws -> HealthSyncOutcome {
         guard !isSyncing else { return HealthSyncOutcome() }
-        guard let manager = bandManager, manager.connectionState.isConnected else {
+        // Mid-handshake counts: the band re-deriving keys under a live link is routine, and every
+        // exchange waits for it to settle (surviveSessionRestart).
+        guard let manager = bandManager,
+              manager.connectionState.isConnected || manager.connectionState.isAuthInProgress else {
             throw SyncError.notConnected
         }
         guard let context = modelContext else { throw SyncError.noDeviceRecord }
@@ -322,10 +345,17 @@ final class BandSyncer {
         return outcome
     }
 
-    /// Splits a concatenated activity-file-id blob (each id is 7 bytes) into individual ids.
-    private func splitFileIds(_ raw: Data) -> [Data] {
+    /// Splits a concatenated activity-file-id blob (each id is 7 bytes) into individual ids,
+    /// dropping the placeholder ids the band can list with no timestamp and no version —
+    /// GadgetBridge skips them too; fetching one only burns a timeout.
+    static func splitFileIds(_ raw: Data) -> [Data] {
         guard !raw.isEmpty, raw.count % 7 == 0 else { return [] }
-        return stride(from: raw.startIndex, to: raw.endIndex, by: 7).map { Data(raw[$0 ..< $0 + 7]) }
+        return stride(from: raw.startIndex, to: raw.endIndex, by: 7)
+            .map { Data(raw[$0 ..< $0 + 7]) }
+            .filter { id in
+                guard let meta = XiaomiActivityFileMeta(id) else { return false }
+                return !(meta.timestamp.timeIntervalSince1970 == 0 && meta.version == 0)
+            }
     }
 
     private func markSynced(_ context: ModelContext) {
@@ -395,29 +425,9 @@ final class BandSyncer {
         var workoutIds: [Data] = []
         var detailIds:  [Data] = []
 
-        for fileId in fileIds {
-            var retryCount = 0
-            var fetchedData: Data? = nil
-            
-            while retryCount < 3 {
-                do {
-                    let (actualId, data) = try await fetchActivityFile(fileId: fileId, manager: manager)
-                    if actualId != fileId {
-                        log.warning("Unstuck band by ACKing \(actualId.hexString). Now retrying \(fileId.hexString).")
-                        sendAck(fileId: actualId, manager: manager)
-                        retryCount += 1
-                        continue
-                    }
-                    fetchedData = data
-                    break
-                } catch {
-                    log.error("Failed file \(fileId.hexString): \(error.localizedDescription)")
-                    break
-                }
-            }
-            
-            guard let fileData = fetchedData else { continue }
-            guard let meta = XiaomiActivityFileMeta(fileId) else { continue }
+        // Routes one fetched, CRC-valid file into its batch (or writes and ACKs it inline).
+        func route(_ fileId: Data, _ fileData: Data) async {
+            guard let meta = XiaomiActivityFileMeta(fileId) else { return }
 
             do {
                 #if DEBUG
@@ -453,7 +463,11 @@ final class BandSyncer {
                     }
                     workoutIds.append(fileId)
                 } else if meta.isSleep {
-                    let parsed = SleepDetailsParser.parse(fileData, meta: meta)
+                    let parsed = meta.isSleepStages
+                        ? SleepStagesParser.parse(fileData, meta: meta)
+                        : SleepDetailsParser.parse(fileData, meta: meta)
+                    let phaseCount = parsed.sessions.reduce(0) { $0 + $1.phases.count }
+                    log.info("Sleep file \(fileId.hexString) (subtype=\(meta.subtype) v\(meta.version)): \(parsed.sessions.count) session(s), \(phaseCount) phase(s), \(parsed.heartRates.count) HR, \(parsed.spo2.count) SpO₂")
                     for session in parsed.sessions {
                         // Always (re)write to HealthKit — its sync-identifier dedup makes this
                         // idempotent, so data deleted from Apple Health is restored on re-sync.
@@ -496,16 +510,51 @@ final class BandSyncer {
             }
         }
 
-        if !sleepToWrite.isEmpty {
-            outcome.sleepSessions = sleepToWrite.count
-            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite)
+        // A fetch can come back with a different file than the one requested: the band is still
+        // pushing one it hasn't had ACKed. That file is complete and CRC-valid, so it is routed like
+        // any other, then ACKed at once to unstick the band. It used to be ACKed unread, silently
+        // discarding whatever it held — a night's sleep file, the largest, is the likeliest one to be
+        // caught mid-stream. The early ACK's only exposure is a batch write failing later in this sync.
+        var handled = Set<Data>()
+        for fileId in fileIds where !handled.contains(fileId) {
+            for _ in 0 ..< 3 {
+                let delivered: (id: Data, data: Data)
+                do {
+                    let (id, data) = try await surviveSessionRestart("Fetch \(fileId.hexString)", manager: manager) {
+                        try await self.fetchActivityFile(fileId: fileId, manager: manager)
+                    }
+                    delivered = (id, data)
+                } catch {
+                    log.error("Failed file \(fileId.hexString): \(error.localizedDescription)")
+                    break
+                }
+                if handled.insert(delivered.id).inserted {
+                    await route(delivered.id, delivered.data)
+                }
+                if delivered.id == fileId { break }
+                log.warning("Asked for \(fileId.hexString), band sent \(delivered.id.hexString) — routed it, ACKing to unstick, retrying")
+                sendAck(fileId: delivered.id, manager: manager)
+            }
         }
-        if !sleepVitals.isEmpty {
-            outcome.minuteSamples += sleepVitals.count
-            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(sleepVitals)
+
+        // Isolated from the rest of the batch: a throwing sleep write used to propagate out of here,
+        // skipping the manual/workout/daily-detail writes and every ACK after it — so a sleep write
+        // that kept failing stalled the whole sync, every sync. Now only the sleep files stay
+        // un-ACKed (the band re-offers them) and everything else goes through.
+        do {
+            if !sleepToWrite.isEmpty {
+                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite)
+                outcome.sleepSessions = sleepToWrite.count
+            }
+            if !sleepVitals.isEmpty {
+                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(sleepVitals)
+                outcome.minuteSamples += sleepVitals.count
+            }
+            // Sleep files ACK'd after both sessions and vitals are written.
+            sleepIds.forEach { sendAck(fileId: $0, manager: manager) }
+        } catch {
+            log.error("Sleep write failed — \(sleepIds.count) sleep file(s) left un-ACKed for the next sync: \(error.localizedDescription)")
         }
-        // Sleep files ACK'd after both sessions and vitals are written.
-        sleepIds.forEach { sendAck(fileId: $0, manager: manager) }
 
         // ACK every file we successfully fetched — NOT gated on the write batch being non-empty.
         // A fetched file that parsed to nothing (or whose sibling already synced) still has to be
@@ -606,6 +655,42 @@ final class BandSyncer {
         if existing == nil { context.insert(record) }
     }
 
+    // MARK: - Band session restarts
+    //
+    // Right after the post-auth init the band reopens its session and re-derives keys (see
+    // BandManager.handleSessionConfigResponse). A command sent across that boundary is transport-
+    // ACKed and silently dropped, so its reply never comes. A sync that opened the link itself sends
+    // FETCH_TODAY straight into that window — ensureConnected resolves on the first auth — and a lost
+    // listing used to time out and take the whole sync down with it. Each exchange now fails fast on
+    // the restart signal and is re-sent once the new session is up.
+
+    private func surviveSessionRestart<T>(_ label: String, manager: BandManager,
+                                          _ exchange: () async throws -> T) async throws -> T {
+        var restarts = 0
+        while true {
+            try await manager.awaitSession()
+            do {
+                return try await exchange()
+            } catch SyncError.sessionRestarted where restarts < Self.maxRestartRetries {
+                restarts += 1
+                log.warning("\(label) cut short by a band session restart — re-sending after re-auth (\(restarts)/\(Self.maxRestartRetries))")
+            }
+        }
+    }
+
+    /// Yields once if the band restarts its session while the calling exchange is pending.
+    private func watchSessionRestart() -> AsyncStream<Void> {
+        let (stream, cont) = AsyncStream<Void>.makeStream()
+        sessionRestartSignal?.finish()
+        sessionRestartSignal = cont
+        return stream
+    }
+
+    private func endSessionRestartWatch() {
+        sessionRestartSignal?.finish()
+        sessionRestartSignal = nil
+    }
+
     // MARK: - Private: request file IDs
     //
     // Full sync mirrors GadgetBridge: first FETCH_TODAY (today's pending records), then
@@ -619,17 +704,21 @@ final class BandSyncer {
             for id in ids where !seen.contains(id) { seen.insert(id); all.append(id) }
         }
 
-        let today = try await requestFileIds(subtype: XiaomiHealthCmd.fetchToday,
-                                             proto: XiaomiProto.fetchTodayCommand(),
-                                             manager: manager)
+        let today = try await surviveSessionRestart("FETCH_TODAY", manager: manager) {
+            try await self.requestFileIds(subtype: XiaomiHealthCmd.fetchToday,
+                                          proto: XiaomiProto.fetchTodayCommand(),
+                                          manager: manager)
+        }
         log.info("FETCH_TODAY → \(today.count) file ID(s)")
         merge(today)
 
         // The backlog is best-effort: an empty response or timeout shouldn't abort the sync.
         do {
-            let past = try await requestFileIds(subtype: XiaomiHealthCmd.fetchPast,
-                                                proto: XiaomiProto.fetchPastCommand(),
-                                                manager: manager)
+            let past = try await surviveSessionRestart("FETCH_PAST", manager: manager) {
+                try await self.requestFileIds(subtype: XiaomiHealthCmd.fetchPast,
+                                              proto: XiaomiProto.fetchPastCommand(),
+                                              manager: manager)
+            }
             log.info("FETCH_PAST → \(past.count) file ID(s)")
             merge(past)
         } catch {
@@ -647,12 +736,19 @@ final class BandSyncer {
 
             // File IDs come back as a proto Command on 0051, not as activity chunks on 0053.
             manager.onProtoCommandReceived = { data in cont.yield(data) }
+            let restarts = watchSessionRestart()
             defer {
                 manager.onProtoCommandReceived = nil
                 cont.finish()
+                endSessionRestartWatch()
             }
 
             manager.sendEncryptedCommand(protoBytes: proto)
+
+            group.addTask { @MainActor in
+                for await _ in restarts { throw SyncError.sessionRestarted }
+                throw CancellationError()
+            }
 
             // Pinned to the main actor: the proto callback delivers on .main and the parsers are
             // main-actor-isolated (module default), so processing here keeps it all on one actor.
@@ -681,7 +777,7 @@ final class BandSyncer {
               cmd.subtype == subtype else { return nil }
         let raw = cmd.health.activityRequestFileIds
         guard raw.count % 7 == 0 else { return nil }
-        return stride(from: raw.startIndex, to: raw.endIndex, by: 7).map { Data(raw[$0 ..< $0 + 7]) }
+        return Self.splitFileIds(raw)
     }
 
     // MARK: - Private: fetch individual activity file
@@ -694,12 +790,19 @@ final class BandSyncer {
             let (stream, cont) = AsyncStream<Data>.makeStream()
 
             manager.onActivityChunkReceived = { data in cont.yield(data) }
+            let restarts = watchSessionRestart()
             defer {
                 manager.onActivityChunkReceived = nil
                 cont.finish()
+                endSessionRestartWatch()
             }
 
             manager.sendEncryptedCommand(protoBytes: proto)
+
+            group.addTask { @MainActor in
+                for await _ in restarts { throw SyncError.sessionRestarted }
+                throw CancellationError()
+            }
 
             let log = self.log
             // Pinned to the main actor: chunks arrive on .main and ActivityFileReceiver is
@@ -718,12 +821,16 @@ final class BandSyncer {
                 }
                 throw SyncError.emptyPayload
             }
-            group.addTask {
-                try await Task.sleep(for: .seconds(30))
-                throw SyncError.timeout
+            group.addTask { @MainActor in
+                while true {
+                    try await Task.sleep(for: .seconds(1))
+                    if ContinuousClock.now - receiver.lastActivity > Self.fileIdleTimeout {
+                        throw SyncError.timeout
+                    }
+                }
             }
 
-            let result = try await group.next()!
+            guard let result = try await group.next() else { throw SyncError.emptyPayload }
             group.cancelAll()
             return result
         }

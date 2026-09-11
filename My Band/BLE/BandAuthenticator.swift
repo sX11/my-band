@@ -141,6 +141,8 @@ enum AuthError: LocalizedError {
     case linkDropped
     case retrying
     case wrongAuthKey
+    case pairingNotConfirmed
+    case staleBond
 
     var errorDescription: String? {
         switch self {
@@ -152,6 +154,8 @@ enum AuthError: LocalizedError {
         case .linkDropped:                return "A pulseira encerrou a conexão durante o pareamento."
         case .retrying:                   return "Refazendo o handshake."
         case .wrongAuthKey:               return "AuthKey incorreto. Verifique a chave."
+        case .pairingNotConfirmed:        return "O pareamento não foi confirmado a tempo. Toque em conectar para tentar de novo."
+        case .staleBond:                  return "A pulseira esqueceu este iPhone. Abra Ajustes › Bluetooth, toque no (i) da pulseira, escolha \"Esquecer este dispositivo\" e conecte de novo."
         }
     }
 }

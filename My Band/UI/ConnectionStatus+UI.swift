@@ -14,7 +14,7 @@ extension ConnectionState {
         case .scanning:            "Procurando…"
         case .connecting, .discoveringServices, .sessionConfig, .authenticating:
                                    "Conectando…"
-        case .awaitingPairingConfirmation: "Confirme na pulseira"
+        case .awaitingPairingConfirmation: "Confirme o pareamento"
         case .disconnected:        "Desconectada"
         case .bluetoothUnavailable: "Bluetooth desligado"
         case .error:               "Erro de conexão"
@@ -48,7 +48,7 @@ extension ConnectionState {
         case .sessionConfig:       "Negociando sessão…"
         case .authenticating:      "Handshake HMAC-SHA256…"
         case .awaitingPairingConfirmation:
-                                   "Aceite o pareamento na pulseira e confirme no iPhone."
+                                   "Aguardando sua confirmação."
         case .connected:           "Conectada."
         case .disconnected:        "Desconectada."
         case .bluetoothUnavailable: "Ative o Bluetooth para continuar."

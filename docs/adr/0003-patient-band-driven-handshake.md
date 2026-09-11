@@ -39,3 +39,35 @@ Passamos a seguir o GadgetBridge, com **um desvio deliberado**: um repeat que ch
 - **`.awaitingPairingConfirmation` é um estado de UI de primeira classe**, não um detalhe interno: o usuário precisa saber que a bola está com ele.
 
 Nada disso foi exercitado num pareamento novo de verdade — os logs vieram de uma pulseira já pareada e de tentativas que falhavam. A janela de 120 s e o caminho de restart de sessão pós-aceite continuam **a validar em hardware**.
+
+## Adendo (2026-09-09) — a espera é uma janela, não um estado de conexão
+
+A decisão acima trata a espera como um estado da conexão viva. Revendo o fluxo real, isso não cobre o formato do problema: **o pareamento inicial pede duas confirmações, em telas diferentes, e o link não sobrevive intacto entre elas.** A pulseira levanta o próprio diálogo; só depois o iOS levanta a folha de pareamento Bluetooth — e para estabelecer o bond o iOS **derruba a conexão**. Um estado por conexão morre exatamente aí, no meio da sequência, com o usuário ainda parado na frente de um prompt.
+
+O descompasso entre os dois lados produzia quatro finais errados, todos com a mesma assinatura na UI (a tela parece travada e depois acusa chave errada):
+
+1. `resetState` limpava `awaitingPairingConfirmation` na desconexão de bonding; a reconexão voltava com watchdog de 20 s e tolerância normal, com o diálogo da pulseira ainda aceso.
+2. Quando o `sub=16` vinha **com** nonce parseável, `beginPairingConfirmationWait` nunca era chamado — duas divergências depois o link caía, dispensando o diálogo.
+3. `beginPairingConfirmationWait` retornava cedo em repetições, então o `sub=16` reemitido a cada ~6 s não estendia nada e o watchdog de 120 s vencia por baixo de uma pulseira que estava perguntando.
+4. `didWriteValueFor` chamava `failAuth` em `CBATTError.insufficientAuthentication` — isto é, matava o handshake **no instante** em que o iOS subia a folha, já que esse erro é a forma de o iOS dizer "vou pedir o pareamento".
+
+### Decisão
+
+A espera passa a ser um **deadline de 180 s que atravessa conexões** (`pairingDeadline`), não um estado da conexão corrente:
+
+- Sobrevive ao teardown de bonding. `resetState` limpa só o flag por conexão; `startNonceExchange` restaura a postura paciente se a janela ainda estiver aberta.
+- É **estendida** por toda evidência de que o humano ainda está no meio do fluxo (`sub=16` repetido, nonce pré-bond, erro ATT de segurança).
+- Uma divergência de HMAC numa pulseira contra a qual **nunca** autenticamos (`everAuthenticated`, persistido) inicia a espera em vez de contar como chave errada — antes do bond, a pulseira não tem como assinar um nonce verificável.
+- Dentro da janela, o orçamento de `retryAuthAfterReconnect` **não é gasto** e o watchdog se re-arma; só o vencimento da janela falha, com `AuthError.pairingNotConfirmed` (acionável) em vez de `badHMAC` ("AuthKey incorreto").
+- `CBATTError.insufficientAuthentication` deixa de ser falha e vira o sinal de que o segundo prompt está com o usuário.
+
+`PairingStage` (`.band` → `.phone`, **só avança**) existe para a UI dizer onde olhar: a tela de conexão mostra os dois passos como checklist com o ativo destacado e o tempo restante. O estágio é inferido — de `sub=16`, do erro ATT, e (heurística) de uma queda de link durante a espera — e **nunca** decide lógica de protocolo, só copy.
+
+`CBError.peerRemovedPairingInformation` ganhou tratamento próprio: a pulseira esqueceu um bond que o iPhone ainda guarda, e nenhuma reconexão conserta isso — `AuthError.staleBond` manda o usuário esquecer o dispositivo em Ajustes › Bluetooth. `CBError.encryptionTimedOut` (folha dispensada ou expirada) mantém a janela aberta.
+
+### Consequências
+
+- **Uma AuthKey errada demora ainda mais para aparecer num dispositivo novo** — a janela de 180 s tem de vencer antes de qualquer escalada. Num dispositivo já pareado (`everAuthenticated`) nada muda: divergência escala como antes.
+- **`everAuthenticated` é estado novo em `UserDefaults`**, indexado pelo UUID do `CBPeripheral`. Apagar o app o zera, o que só custa uma janela de espera a mais numa reconexão.
+- **O avanço para `.phone` numa queda limpa é heurística.** Assumimos que uma desconexão durante a espera significa "a pulseira foi aceita, o iOS está fazendo o bond". Se estiver errada, a consequência é copy adiantada, não um handshake perdido.
+- Continua tudo **a validar em hardware** — inclusive, agora, se a folha do iOS de fato produz um `insufficientAuthentication` observável neste fluxo, ou se ela sobe sem que nenhum write nosso seja rejeitado.

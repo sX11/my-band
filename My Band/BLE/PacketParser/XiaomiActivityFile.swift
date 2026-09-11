@@ -44,8 +44,17 @@ struct XiaomiActivityFileMeta {
         self.detail  = Detail(rawValue: Int(flags & 3)) ?? .unknown
     }
 
-    var isSleep: Bool {
-        type == .activity && (subtype == Self.subtypeSleepStages || subtype == Self.subtypeSleep)
+    /// Sleep in either format. They are different layouts and need different parsers.
+    var isSleep: Bool { isSleepDetails || isSleepStages }
+    /// Subtype 0x08: duration-encoded stage packets (SleepDetailsParser). GadgetBridge takes it
+    /// under any detail type — it arrives as DETAILS (v2) and as SUMMARY (v4/v5).
+    var isSleepDetails: Bool {
+        type == .activity && subtype == Self.subtypeSleep
+    }
+    /// Subtype 0x03, DETAILS only: phase transition events (SleepStagesParser). Other detail types
+    /// have no parser in GadgetBridge either, so they fall through to the ACK-only branch.
+    var isSleepStages: Bool {
+        type == .activity && subtype == Self.subtypeSleepStages && detail == .details
     }
     var isDailySummary: Bool {
         type == .activity && subtype == Self.subtypeDaily && detail == .summary

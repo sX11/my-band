@@ -26,6 +26,14 @@ enum MiBandUUID {
     /// GadgetBridge: BLE_V2_CHARACTERISTIC_TX_UUID (phone transmits on this)
     static let commandWrite = CBUUID(string: "0000005F-0000-1000-8000-00805F9B34FB")
 
+    // MARK: - Battery Service (standard GATT)
+
+    /// Not part of the Xiaomi protocol — it's what iOS itself reads to show the band in the
+    /// Batteries widget, so reading it keeps the app's number identical to the widget's.
+    static let batteryService = CBUUID(string: "0000180F-0000-1000-8000-00805F9B34FB")
+    /// Battery Level: a single UInt8, 0–100.
+    static let batteryLevel   = CBUUID(string: "00002A19-0000-1000-8000-00805F9B34FB")
+
     // MARK: - Scan
 
     static let scanServices: [CBUUID] = [mainService]

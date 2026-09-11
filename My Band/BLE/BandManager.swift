@@ -40,6 +40,19 @@ enum ConnectionState: Equatable {
     }
 }
 
+/// Which of the two confirmation prompts the user still has to deal with. First pairing puts up
+/// two, in order and on two different screens: the band raises its own accept dialog, and iOS
+/// raises the system Bluetooth pairing sheet when the band demands an encrypted link. They are
+/// minutes apart in the worst case, and the app has no API to read either one — so this is what we
+/// infer from the protocol, and it exists to tell the user where to look, never to gate logic.
+enum PairingStage: Equatable {
+    /// The band asked (auth sub=16, or it is signing nonces with a bond that doesn't exist yet).
+    case band
+    /// iOS is raising, or has raised, its Bluetooth pairing sheet — inferred from an
+    /// insufficient-authentication ATT error or from the bonding link teardown.
+    case phone
+}
+
 // MARK: - BandManager
 //
 // Central BLE orchestrator for Mi Band 10 V2 protocol.
@@ -65,10 +78,17 @@ final class BandManager: NSObject {
     private(set) var connectedPeripheral: CBPeripheral?
     private(set) var lastError: Error?
 
-    /// Latest battery level (0–100) reported by the band, or nil if unknown yet.
+    /// Latest battery level (0–100), or nil if unknown yet. Comes from GATT Battery Level (2A19) —
+    /// the same reading the iOS Batteries widget shows — when the band exposes it, otherwise from
+    /// the protobuf CMD_BATTERY reply.
     private(set) var batteryLevel: Int?
-    /// Whether the band reports it is currently charging.
+    /// Whether the band reports it is currently charging. Protobuf-only: 2A19 carries no state.
     private(set) var batteryCharging: Bool = false
+
+    /// Which confirmation prompt the user is on, while `.awaitingPairingConfirmation` is the state.
+    private(set) var pairingStage: PairingStage?
+    /// When the current pairing wait gives up. Drives the countdown on the connecting screen.
+    private(set) var pairingWaitEndsAt: Date?
 
     // MARK: - BLE objects
 
@@ -82,6 +102,17 @@ final class BandManager: NSObject {
     private var cmdReadChar:  CBCharacteristic?
     // 005E — write  (app → band): SPP V2 frames
     private var cmdWriteChar: CBCharacteristic?
+
+    // 2A19 — standard GATT Battery Level (service 180F), the source the iOS Batteries widget reads.
+    private var batteryLevelChar: CBCharacteristic?
+    // Set once 2A19 has answered on this link. From then on it owns `batteryLevel`, and the
+    // protobuf battery reply only contributes the charging state.
+    private var hasGattBatteryLevel = false
+
+    private enum BatterySource { case gatt, protobuf }
+    // In-flight refreshBattery(): the sources still owed an answer, and the callers awaiting them.
+    private var pendingBatterySources: Set<BatterySource> = []
+    private var batteryWaiters: [CheckedContinuation<Void, Never>] = []
 
     // MARK: - Auth state
 
@@ -160,10 +191,38 @@ final class BandManager: NSObject {
     private let authTimeoutSeconds        = 20
     private let pairingAuthTimeoutSeconds = 120
 
+    // MARK: - Pairing window
+    //
+    // A first pairing is a *human* sequence spread over two prompts on two devices, and the link
+    // does not survive it intact: iOS tears the connection down to bond, which used to wipe
+    // awaitingPairingConfirmation and drop us back into the 20 s watchdog with the band's dialog
+    // still on the user's wrist. So the wait is tracked as a deadline that outlives any single
+    // connection: while it is open, mismatching nonces are expected, the watchdog is human-scale,
+    // and the retry budget is not spent. Extended by every packet that proves the band is still
+    // asking, cleared on success or when it lapses.
+    private let pairingWindowSeconds: TimeInterval = 180
+    private var pairingDeadline: Date?
+    private var isWithinPairingWindow: Bool { (pairingDeadline ?? .distantPast) > .now }
+
+    /// Peripherals that completed auth at least once, so a mismatch on a band we have never paired
+    /// with reads as "the user hasn't tapped yet" instead of "wrong AuthKey".
+    private static let everAuthenticatedKey = "com.myband.everAuthenticated"
+    private var everAuthenticated: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: Self.everAuthenticatedKey) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: Self.everAuthenticatedKey) }
+    }
+    private var isFirstPairing: Bool {
+        guard let p = peripheral else { return false }
+        return !everAuthenticated.contains(p.identifier.uuidString)
+    }
+
     // MARK: - Callbacks (consumed by BandSyncer)
 
     /// Called once authentication succeeds with (deviceName, peripheralUUID).
     var onAuthenticated:         ((String, String) -> Void)?
+    /// The band tore its session down under an authenticated link. Any reply still awaited for a
+    /// command sent before this will never come — the band transport-ACKs and silently drops it.
+    var onSessionRestart:        (() -> Void)?
     /// Called for each decoded (and decrypted) proto Command on 0051 after auth.
     /// Receives raw protobuf bytes of the Command message.
     var onProtoCommandReceived:  ((Data) -> Void)?
@@ -217,6 +276,12 @@ final class BandManager: NSObject {
     /// longer retrieve the peripheral (e.g. it was never connected on this device).
     func reconnectToKnownDevice(identifier: String) {
         guard let uuid = UUID(uuidString: identifier) else { startScan(); return }
+        // A persisted device id means this band paired successfully at least once, even if the
+        // everAuthenticated set predates this install (or the app was reinstalled). Seeding it here
+        // keeps an upgrade from treating the first nonce race on an already-paired band as a
+        // first-time pairing and parking on it for the whole window. A band that really does
+        // re-prompt still enters the wait through sub=16.
+        everAuthenticated.insert(identifier)
         autoReconnect = true
         reconnectAttempts = 0
         guard central.state == .poweredOn else { pendingReconnectID = uuid; return }
@@ -274,7 +339,7 @@ final class BandManager: NSObject {
 
         connectionState = .sessionConfig
         authStep3Sent = false
-        awaitingPairingConfirmation = false
+        awaitingPairingConfirmation = isWithinPairingWindow
         authRetryPending = false
         armAuthWatchdog()
         // Session config always uses seqNum=0 (GadgetBridge: setSequenceNumber(0)).
@@ -310,6 +375,13 @@ final class BandManager: NSObject {
     /// drive the connection to completion before fetching. Returns immediately if already connected.
     func ensureConnected(identifier: String, timeout: Duration = .seconds(25)) async throws {
         if connectionState.isConnected { return }
+        // A link already mid-handshake (usually re-deriving keys after the band reopened its
+        // session) only needs waiting for. Reconnecting on top of it reset the state to .connecting
+        // and re-ran service discovery — and with it a second authenticate() — under the live one.
+        if connectionState.isAuthInProgress || connectionState == .sessionConfig {
+            try await awaitSession(timeout: timeout)
+            return
+        }
 
         let timeoutTask = Task { [weak self] in
             try? await Task.sleep(for: timeout)
@@ -324,6 +396,25 @@ final class BandManager: NSObject {
         }
     }
 
+    /// Waits for a link that is up or mid-handshake — typically re-deriving keys after the band
+    /// reopened its session — to become authenticated. Unlike ensureConnected it never starts a
+    /// connection, so it can't collide with the handshake already in flight.
+    func awaitSession(timeout: Duration = .seconds(20)) async throws {
+        if connectionState.isConnected { return }
+        guard connectionState.isAuthInProgress || connectionState == .sessionConfig else {
+            throw SyncError.notConnected
+        }
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.resumeConnectWaiters(throwing: SyncError.timeout)
+        }
+        defer { timeoutTask.cancel() }
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+            connectWaiters.append(c)
+        }
+    }
+
     private func resumeConnectWaiters(throwing error: Error?) {
         guard !connectWaiters.isEmpty else { return }
         let waiters = connectWaiters
@@ -335,7 +426,12 @@ final class BandManager: NSObject {
 
     /// Sends an already-encrypted command packet (for post-auth use by BandSyncer).
     func sendEncryptedCommand(protoBytes: Data) {
-        guard let keys = sessionKeys else { return }
+        guard let keys = sessionKeys else {
+            // Only happens while keys are being (re-)derived. Worth a line: a dropped fetch here
+            // otherwise surfaces much later as an unexplained sync timeout.
+            log.warning("Command dropped — no session keys (handshake in flight)")
+            return
+        }
         do {
             let encrypted = try XiaomiCrypto.aesCTR(data: protoBytes, key: keys.encryptionKey)
             let packet = XiaomiSppPacket.buildEncryptedCommand(encryptedBytes: encrypted, seqNum: nextSeq())
@@ -351,6 +447,43 @@ final class BandManager: NSObject {
     func setRealtimeStats(enabled: Bool) {
         sendEncryptedCommand(protoBytes: XiaomiProto.realtimeStatsCommand(enable: enabled))
         log.info("Realtime stats \(enabled ? "START" : "STOP") sent")
+    }
+
+    /// Asks for a fresh battery reading and waits (up to `timeout`) for it to land. The level is
+    /// read from GATT 2A19 when the band exposes it, so the app agrees with the iOS Batteries
+    /// widget; CMD_BATTERY goes out regardless, because only its reply carries the charging state.
+    /// Returns without a reading if the link isn't authenticated.
+    func refreshBattery(timeout: Duration = .seconds(3)) async {
+        guard connectionState.isConnected else { return }
+        if let p = peripheral, let char = batteryLevelChar {
+            pendingBatterySources.insert(.gatt)
+            p.readValue(for: char)
+        }
+        pendingBatterySources.insert(.protobuf)
+        sendEncryptedCommand(protoBytes: XiaomiProto.systemCommand(subtype: XiaomiSystemCmd.battery))
+
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            guard !Task.isCancelled else { return }
+            self?.resumeBatteryWaiters()
+        }
+        defer { timeoutTask.cancel() }
+
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            batteryWaiters.append(c)
+        }
+    }
+
+    private func batterySourceReported(_ source: BatterySource) {
+        pendingBatterySources.remove(source)
+        if pendingBatterySources.isEmpty { resumeBatteryWaiters() }
+    }
+
+    private func resumeBatteryWaiters() {
+        pendingBatterySources.removeAll()
+        let waiters = batteryWaiters
+        batteryWaiters.removeAll()
+        for c in waiters { c.resume() }
     }
 
     /// Sends one raw file-upload chunk on the DATA channel (plaintext), pacing against
@@ -525,13 +658,18 @@ final class BandManager: NSObject {
             // dropped — which is exactly how a sync hangs until it times out with the link looking
             // perfectly healthy (hardware, 2026-09-05). Re-run the handshake and re-derive.
             guard bandSessionRestarts < maxBandSessionRestarts else {
-                log.error("Band restarted the session \(self.bandSessionRestarts)x — not re-handshaking again")
+                // Staying up here left a link that looked healthy while the band dropped every
+                // command. A fresh connection gets a fresh session; the standing reconnect brings it.
+                log.error("Band restarted the session \(self.bandSessionRestarts)x — dropping the link for a clean reconnect")
+                onSessionRestart?()
+                disconnect(userInitiated: false)
                 return
             }
             bandSessionRestarts += 1
             log.warning("Band reopened the session (restart \(self.bandSessionRestarts)/\(self.maxBandSessionRestarts)) — re-running auth with fresh keys")
             sessionKeys = nil
             connectionState = .authenticating
+            onSessionRestart?()
         default:
             // No link to run a handshake on (scanning, connecting, error, disconnected).
             log.debug("Session config in state \(String(describing: self.connectionState)) — ignoring")
@@ -547,6 +685,12 @@ final class BandManager: NSObject {
         authStep3Sent = false
         nonceMismatches = 0
         armAuthWatchdog()
+        // Reconnected inside an open pairing window (the usual shape: iOS drops the link to bond,
+        // the standing reconnect brings it straight back). The human is still mid-flow, so restore
+        // the patient posture instead of restarting as if this were a routine handshake.
+        if isWithinPairingWindow {
+            beginPairingConfirmationWait(stage: pairingStage ?? .band, reason: "reconnected mid-pairing")
+        }
         _ = secretKey  // validated; keys used in handleWatchNonce
         let nonce = BandAuthenticator.phoneNonce()
         phoneNonce = nonce
@@ -634,11 +778,33 @@ final class BandManager: NSObject {
         guard cmd.hasSystem, cmd.system.hasPower, cmd.system.power.hasBattery else { return }
         let battery = cmd.system.power.battery
         if battery.hasLevel {
-            batteryLevel = Int(battery.level)
             // state: 1 = charging (GadgetBridge convertBatteryStateFromRawValue)
             batteryCharging = battery.hasState && battery.state == 1
-            log.info("Battery \(self.batteryLevel ?? -1)%\(self.batteryCharging ? " (charging)" : "")")
+            if hasGattBatteryLevel {
+                // 2A19 owns the level (widget parity). Logging both lets a hardware run compare them.
+                log.info("Battery \(battery.level)% via protobuf — keeping GATT \(self.batteryLevel ?? -1)%\(self.batteryCharging ? " (charging)" : "")")
+            } else {
+                batteryLevel = Int(battery.level)
+                log.info("Battery \(self.batteryLevel ?? -1)%\(self.batteryCharging ? " (charging)" : "")")
+            }
         }
+        batterySourceReported(.protobuf)
+    }
+
+    /// GATT Battery Level (2A19): one UInt8, 0–100 — the reading the iOS Batteries widget shows.
+    private func handleGattBatteryLevel(_ value: Data?, error: Error?) {
+        defer { batterySourceReported(.gatt) }
+        if let error {
+            log.warning("Battery Level 2A19 read failed: \(error.localizedDescription)")
+            return
+        }
+        guard let raw = value?.first, raw <= 100 else {
+            log.warning("Battery Level 2A19 unusable: \(value?.hex ?? "nil")")
+            return
+        }
+        batteryLevel = Int(raw)
+        hasGattBatteryLevel = true
+        log.info("Battery \(raw)% via GATT 2A19")
     }
 
     /// Weather is request-driven: the band asks the app to push conditions (subtype=3), and the app's
@@ -704,22 +870,60 @@ final class BandManager: NSObject {
                 log.info("sub=16 carries a watch nonce (nonce=\(resp.watchNonce.hex.prefix(8))…) — processing as auth")
                 handlePotentialWatchNonce(protoBytes)
             } else {
-                beginPairingConfirmationWait()
+                beginPairingConfirmationWait(stage: .band, reason: "auth sub=16 (band raised its dialog)")
             }
         default:
             log.debug("Unknown auth subtype \(subtype) — \(protoBytes.count) bytes")
         }
     }
 
-    /// The band asked the user to confirm the pairing. Stop racing it: widen the watchdog to a
-    /// human-scale window and surface the wait in the UI, so the user knows to accept on the band
-    /// and on the iPhone instead of watching a screen that looks stuck.
-    private func beginPairingConfirmationWait() {
-        guard !awaitingPairingConfirmation else { return }
+    /// The user has to confirm the pairing. Stop racing them: widen the watchdog to a human-scale
+    /// window, remember the wait across the bonding disconnect, and tell the UI which of the two
+    /// prompts is live so the user knows where to look instead of watching a screen that looks stuck.
+    ///
+    /// Re-entrant on purpose. The band re-sends its pairing packet every few seconds while its
+    /// dialog is up; each one is proof the user is still mid-flow and must push the deadline out.
+    /// The earlier version returned early on the second call, so a user who took longer than the
+    /// watchdog to find the dialog timed out while the band was still politely asking.
+    private func beginPairingConfirmationWait(stage: PairingStage, reason: String) {
+        // The stage only ever moves forward: the band's dialog comes first, and a late sub=16 must
+        // not walk the copy back from "confirme no iPhone" while the system sheet is up.
+        if pairingStage != .phone { pairingStage = stage }
+        let deadline = Date.now.addingTimeInterval(pairingWindowSeconds)
+        pairingDeadline = deadline
+        pairingWaitEndsAt = deadline
+        if !awaitingPairingConfirmation {
+            log.info("Pairing wait started (stage=\(String(describing: self.pairingStage))): \(reason)")
+        } else {
+            log.debug("Pairing wait extended (stage=\(String(describing: self.pairingStage))): \(reason)")
+        }
         awaitingPairingConfirmation = true
         connectionState = .awaitingPairingConfirmation
-        log.info("Band pairing packet (sub=16) — waiting for the user to accept on the band and on iPhone")
         armAuthWatchdog()
+    }
+
+    /// Clears the cross-connection pairing window. Only success or a lapsed deadline gets here —
+    /// notably NOT a disconnect, which is a normal step of bonding rather than the end of the wait.
+    private func endPairingWait() {
+        awaitingPairingConfirmation = false
+        pairingDeadline = nil
+        pairingWaitEndsAt = nil
+        pairingStage = nil
+    }
+
+    /// An ATT error that means "this link has to be encrypted first". iOS answers it by raising
+    /// the system Bluetooth pairing sheet — so this is the app's only concrete signal that the
+    /// second prompt is now the user's problem, and the one moment where failing the handshake is
+    /// exactly wrong: the write did not fail because something broke, it failed because iOS is
+    /// asking the user a question.
+    private func isPairingSecurityError(_ error: Error) -> Bool {
+        guard let att = error as? CBATTError else { return false }
+        switch att.code {
+        case .insufficientAuthentication, .insufficientEncryption, .insufficientAuthorization:
+            return true
+        default:
+            return false
+        }
     }
 
     private func handlePotentialWatchNonce(_ protoBytes: Data) {
@@ -765,12 +969,17 @@ final class BandManager: NSObject {
             log.warning("Watch HMAC mismatch — phoneNonce=\(nonce.hex) watchNonce=\(resp.watchNonce.hex)")
             log.warning("  band HMAC=\(resp.bandHMAC.hex)")
             log.warning("  ours HMAC=\(expected.hex)")
-            if awaitingPairingConfirmation {
+            if awaitingPairingConfirmation || isWithinPairingWindow || isFirstPairing {
                 // Expected while the confirmation prompts are still up: the band signs with a bond
                 // it hasn't established yet. Keep the link — dropping it dismisses the prompt — and
                 // wait for the nonce it sends once the user accepts.
-                log.info("Pre-confirmation HMAC mismatch — still waiting for the pairing accept, keeping the link")
-                armAuthWatchdog()
+                //
+                // isFirstPairing is what gets us here on a band whose sub=16 carried a parseable
+                // nonce: that path skips beginPairingConfirmationWait entirely, so the mismatch used
+                // to be counted as evidence of a bad key and, two nonces later, tore down the very
+                // link holding the dialog up. A band we have never authenticated against cannot
+                // produce a verifiable nonce before the bond exists — that is not a wrong key.
+                beginPairingConfirmationWait(stage: .band, reason: "HMAC mismatch before the bond exists")
                 return
             }
             nonceMismatches += 1
@@ -823,8 +1032,9 @@ final class BandManager: NSObject {
         reconnectAttempts = 0
         authRetries = 0
         authStep3Sent = false
-        awaitingPairingConfirmation = false
+        endPairingWait()
         authRetryPending = false
+        if let p = peripheral { everAuthenticated.insert(p.identifier.uuidString) }
         log.info("Authentication successful — communication is now encrypted")
         authContinuation?.resume()
         authContinuation = nil
@@ -833,6 +1043,17 @@ final class BandManager: NSObject {
             onAuthenticated?(p.name ?? "Mi Band 10", p.identifier.uuidString)
         }
         sendPostAuthInit()
+        startGattBatteryUpdates()
+    }
+
+    /// Subscribes to and reads GATT 2A19. Post-auth only, on purpose: if the characteristic needs
+    /// encryption, touching it on a link without a bond makes iOS raise its pairing sheet *before*
+    /// the band's own dialog — inverting the two-prompt order ADR 0003 is built around. By the time
+    /// auth succeeds the bond exists and the read is silent.
+    private func startGattBatteryUpdates() {
+        guard connectionState.isConnected, let p = peripheral, let char = batteryLevelChar else { return }
+        if char.properties.contains(.notify) { p.setNotifyValue(true, for: char) }
+        p.readValue(for: char)
     }
 
     /// Post-auth handshake. Mirrors GadgetBridge XiaomiSupport.onAuthSuccess():
@@ -849,6 +1070,9 @@ final class BandManager: NSObject {
 
     private func failAuth(_ error: Error) {
         cancelAuthWatchdog()
+        // A pairing window that outlived its deadline must not survive into the error state, or the
+        // next connection restores a wait for prompts that are long gone.
+        if !isWithinPairingWindow { endPairingWait() }
         log.error("Auth failed: \(error.localizedDescription)")
         lastError = error
         connectionState = .error(error.localizedDescription)
@@ -863,10 +1087,32 @@ final class BandManager: NSObject {
     /// human scale while we're waiting on a pairing confirmation.
     private func armAuthWatchdog() {
         authWatchdog?.cancel()
-        let seconds = awaitingPairingConfirmation ? pairingAuthTimeoutSeconds : authTimeoutSeconds
+        // During a pairing wait the watchdog tracks the *window*, not a fixed slice of it —
+        // otherwise a 120 s watchdog inside a 180 s window re-arms once and the wait silently
+        // stretches to 240 s.
+        let seconds: Int
+        if awaitingPairingConfirmation, let deadline = pairingDeadline {
+            seconds = max(1, min(pairingAuthTimeoutSeconds, Int(deadline.timeIntervalSinceNow.rounded(.up))))
+        } else {
+            seconds = awaitingPairingConfirmation ? pairingAuthTimeoutSeconds : authTimeoutSeconds
+        }
         authWatchdog = Task { [weak self] in
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled, let self, !self.connectionState.isConnected else { return }
+            if self.isWithinPairingWindow {
+                // Silence during a pairing wait is the normal sound of a person reading a dialog.
+                // Keep the link and the prompts alive until the window itself lapses.
+                self.log.info("Auth watchdog fired mid-pairing — window still open, waiting on the user")
+                self.armAuthWatchdog()
+                return
+            }
+            if self.awaitingPairingConfirmation {
+                self.log.error("Pairing window lapsed — the confirmation never arrived")
+                self.endPairingWait()
+                self.failAuth(AuthError.pairingNotConfirmed)
+                if let p = self.peripheral { self.central.cancelPeripheralConnection(p) }
+                return
+            }
             self.log.error("Auth watchdog fired after \(seconds)s — band went silent")
             self.failAuth(AuthError.timeout)
             // Drop the half-open link so didDisconnectPeripheral re-arms the standing connect.
@@ -887,6 +1133,14 @@ final class BandManager: NSObject {
     /// whole budget in a couple of seconds, well before the band had settled its bond.
     private func retryAuthAfterReconnect(reason: String) {
         guard !authRetryPending else { return }
+        // Never spend the budget on a human. A pairing that takes three minutes would otherwise
+        // exhaust four retries and surface as "AuthKey incorreto" — the one diagnosis that sends
+        // the user off to re-extract a key that was right all along.
+        guard !isWithinPairingWindow else {
+            log.info("Skipping auth retry — pairing window still open (\(reason))")
+            armAuthWatchdog()
+            return
+        }
         guard authRetries < maxAuthRetries, peripheral != nil else {
             log.error("Auth retry budget exhausted (\(self.authRetries)/\(self.maxAuthRetries)) — giving up")
             failAuth(AuthError.badHMAC)
@@ -953,11 +1207,17 @@ final class BandManager: NSObject {
         connectedPeripheral = nil
         cmdReadChar  = nil
         cmdWriteChar = nil
+        batteryLevelChar = nil
+        hasGattBatteryLevel = false
+        resumeBatteryWaiters()
         phoneNonce   = nil
         sessionKeys  = nil
         seqNum       = 0
         rxBuffer     = Data()
         authStep3Sent = false
+        // The pairing window deliberately survives a disconnect: iOS tears the link down *as part
+        // of* bonding, and the user is still standing in front of two prompts. Only the
+        // per-connection flag is cleared here; startNonceExchange restores it on the way back.
         awaitingPairingConfirmation = false
         authRetryPending = false
         bandSessionRestarts = 0
@@ -1026,9 +1286,9 @@ extension BandManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        log.info("Connected — discovering service FE95")
+        log.info("Connected — discovering services FE95 + 180F")
         connectionState = .discoveringServices
-        peripheral.discoverServices([MiBandUUID.mainService])
+        peripheral.discoverServices([MiBandUUID.mainService, MiBandUUID.batteryService])
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
@@ -1050,6 +1310,7 @@ extension BandManager: CBCentralManagerDelegate {
         } else {
             log.info("Disconnected cleanly")
         }
+        classifyPairingDisconnect(error)
         resetState(deliberateAuthRetry: wasAuthRetry)
         // Re-arm on ANY non-user disconnect — clean drops included. The previous code reconnected
         // only on an error, so a clean background drop (app suspended, range loss) stayed dead until
@@ -1059,6 +1320,38 @@ extension BandManager: CBCentralManagerDelegate {
             armStandingReconnect()
         } else {
             connectionState = .disconnected
+        }
+    }
+
+    /// Reads a disconnect for what it says about the two pairing prompts. The link going away
+    /// during a first pairing is usually *progress* — iOS drops it to bond — so the window is kept
+    /// and the standing reconnect brings the link (and the sheet) back. Only a bond the band has
+    /// thrown away is terminal, and it needs the user in Settings, not another retry.
+    private func classifyPairingDisconnect(_ error: Error?) {
+        guard let cbError = error as? CBError else {
+            // A clean drop mid-wait, with the band's dialog answered, is the bonding teardown:
+            // the next thing the user sees is the iOS sheet. Heuristic — it only moves the copy.
+            if awaitingPairingConfirmation, pairingStage == .band {
+                pairingStage = .phone
+                log.info("Clean drop mid-pairing — assuming the band was accepted and iOS is bonding")
+            }
+            return
+        }
+        switch cbError.code {
+        case .peerRemovedPairingInformation:
+            // The band forgot the bond the iPhone still holds. Reconnecting can never fix this;
+            // the stale entry has to go from iOS Settings first.
+            log.error("Band removed its pairing information — the iOS bond is stale")
+            endPairingWait()
+            lastError = AuthError.staleBond
+        case .encryptionTimedOut:
+            log.warning("Encryption timed out — the iOS pairing sheet was dismissed or expired")
+            if isWithinPairingWindow { pairingStage = .phone }
+        default:
+            if awaitingPairingConfirmation, pairingStage == .band {
+                pairingStage = .phone
+                log.info("Link dropped mid-pairing (\(cbError.code.rawValue)) — likely bonding")
+            }
         }
     }
 
@@ -1087,11 +1380,25 @@ extension BandManager: CBPeripheralDelegate {
             connectionState = .error(error.localizedDescription)
             return
         }
-        for service in peripheral.services ?? [] where service.uuid == MiBandUUID.mainService {
-            peripheral.discoverCharacteristics(
-                [MiBandUUID.commandRead, MiBandUUID.commandWrite],
-                for: service
-            )
+        let services = peripheral.services ?? []
+        // Diagnostic until confirmed on hardware: whether the Mi Band 10 exposes the standard
+        // Battery Service to apps (its presence in the iOS Batteries widget suggests it does).
+        log.info("Services: \(services.map(\.uuid.uuidString).joined(separator: ", "))")
+        for service in services {
+            switch service.uuid {
+            case MiBandUUID.mainService:
+                peripheral.discoverCharacteristics(
+                    [MiBandUUID.commandRead, MiBandUUID.commandWrite],
+                    for: service
+                )
+            case MiBandUUID.batteryService:
+                peripheral.discoverCharacteristics([MiBandUUID.batteryLevel], for: service)
+            default:
+                break
+            }
+        }
+        if !services.contains(where: { $0.uuid == MiBandUUID.batteryService }) {
+            log.info("Battery Service 180F not exposed — battery level falls back to CMD_BATTERY")
         }
     }
 
@@ -1100,6 +1407,14 @@ extension BandManager: CBPeripheralDelegate {
                     error: Error?) {
         if let error {
             log.error("Characteristic discovery failed: \(error.localizedDescription)")
+            return
+        }
+        // Must return before the FE95 path below: once 005E/005F are set, its guard would pass for
+        // *this* callback too and fire a second authenticate() in the middle of the handshake.
+        if service.uuid == MiBandUUID.batteryService {
+            batteryLevelChar = service.characteristics?.first { $0.uuid == MiBandUUID.batteryLevel }
+            log.info("Battery Level 2A19 \(self.batteryLevelChar == nil ? "missing" : "found")")
+            startGattBatteryUpdates()
             return
         }
         for char in service.characteristics ?? [] {
@@ -1145,6 +1460,11 @@ extension BandManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
+        if characteristic.uuid == MiBandUUID.batteryLevel {
+            // Errors included: a pending refreshBattery() must hear about a failed read, not time out.
+            handleGattBatteryLevel(characteristic.value, error: error)
+            return
+        }
         guard error == nil, let data = characteristic.value else { return }
         // All SPP responses arrive on 005E (commandRead) per GadgetBridge — 005F is write-only and
         // no longer subscribed (see didDiscoverCharacteristicsFor).
@@ -1156,11 +1476,21 @@ extension BandManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral,
                     didWriteValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        if let error {
-            log.error("Write failed on \(characteristic.uuid): \(error.localizedDescription)")
-            if connectionState.isAuthInProgress || connectionState == .sessionConfig {
-                failAuth(error)
-            }
+        guard let error else { return }
+        if isPairingSecurityError(error) {
+            // iOS is putting the pairing sheet in front of the user. Failing here killed the
+            // handshake at the precise moment the second prompt appeared.
+            log.info("Write rejected pending encryption (\(error.localizedDescription)) — iOS pairing sheet is up")
+            beginPairingConfirmationWait(stage: .phone, reason: "ATT insufficient authentication")
+            return
+        }
+        log.error("Write failed on \(characteristic.uuid): \(error.localizedDescription)")
+        if isWithinPairingWindow {
+            log.info("Write failure inside the pairing window — keeping the wait")
+            return
+        }
+        if connectionState.isAuthInProgress || connectionState == .sessionConfig {
+            failAuth(error)
         }
     }
 

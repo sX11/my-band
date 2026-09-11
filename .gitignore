@@ -67,7 +67,28 @@ PreviewContent/
 *.p12
 *.mobileprovision
 *.provisionprofile
-AuthKey_*.p8
+*.p8
+*.pem
+*.key
+.env
+.env.*
+
+# Logs e capturas de hardware — trazem dados de saúde, ids da pulseira e nonces/HMACs de debug
+*.log
+*.logarchive/
+*.ips
+*.crash
+*.xcresult/
+
+# Exportação do Apple Health (o export.zip já cai no *.zip)
+apple_health_export/
+export.xml
+export_cda.xml
+
+# Artefatos de distribuição
+*.xcarchive/
+*.ipa
+*.dSYM/
 
 # Claude Code — overrides locais da máquina
 .claude/settings.local.json

@@ -159,7 +159,12 @@ final class HealthKitManager {
         let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
         let time = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [mine, time])
-        _ = try await store.deleteObjects(of: sleepType, predicate: predicate)
+        do {
+            _ = try await store.deleteObjects(of: sleepType, predicate: predicate)
+        } catch let error as HKError where error.code == .errorNoData {
+            // Nothing of ours in the window yet — a night's first write. Letting this throw would
+            // fail the save that follows, every time a new night shows up.
+        }
     }
 
     private static func sleepValue(_ type: SleepPhaseType) -> HKCategoryValueSleepAnalysis? {

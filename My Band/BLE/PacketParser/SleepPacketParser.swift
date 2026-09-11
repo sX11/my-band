@@ -55,6 +55,9 @@ enum SleepDetailsParser {
         guard data.count > 4 else { return result }
 
         let version = meta.version
+        // The header layout is only known for 1–5 (GadgetBridge rejects the rest too). Guessing
+        // misreads every offset after it, and the HR/SpO₂ sections would then write garbage to Health.
+        guard (1...5).contains(version) else { return result }
         let headerSize = version == 5 ? 2 : 1
 
         // Strip trailing CRC-32 before parsing fixed-length sections.
@@ -254,7 +257,7 @@ enum SleepDetailsParser {
 
     // MARK: - Fallback: synthesise phases from the summary durations
 
-    private static func buildPhasesFromSummary(
+    fileprivate static func buildPhasesFromSummary(
         start: Date, deepMin: Int, lightMin: Int, remMin: Int, wakeMin: Int
     ) -> [SleepPhase] {
         var phases: [SleepPhase] = []
@@ -305,13 +308,96 @@ enum SleepDetailsParser {
     /// FNV-1a 64-bit over the whole file. The previous XOR-fold collapsed to a single byte
     /// (0–255), so distinct nights collided and `persistIfNew` silently dropped legitimate new
     /// sessions from SwiftData (Apple Health was unaffected — it always rewrites).
-    private static func hashOf(_ data: Data) -> Int {
+    fileprivate static func hashOf(_ data: Data) -> Int {
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325
         for byte in data {
             hash ^= UInt64(byte)
             hash = hash &* 0x0000_0100_0000_01b3
         }
         return Int(bitPattern: UInt(truncatingIfNeeded: hash))
+    }
+}
+
+// MARK: - SleepStagesParser
+//
+// Subtype 0x03 (ACTIVITY_SLEEP_STAGES), version 2. Port of GadgetBridge SleepStagesParser.java.
+// A different layout from 0x08: a fixed summary header, then phase *transition events* instead of
+// duration-encoded packets. Both subtypes used to go through SleepDetailsParser, which read these
+// bytes at the wrong offsets — at best no session, at worst stray bytes passing as HR/SpO₂.
+//
+//   [0..6]   fileId · [7] padding · [8..14] unknown
+//   [15..16] sleepDuration (i16 LE, minutes)
+//   [17..20] bedTime · [21..24] wakeupTime (u32 LE)
+//   [25..27] unknown
+//   [28..35] deep / light / rem / wake durations (i16 LE each, minutes)
+//   [36]     unknown
+//   then 5-byte records [time: u32 LE][phase: u8] — the phase in effect *from* `time`; the last
+//   one runs until wakeupTime.
+//
+// Phase codes are GadgetBridge's own sample codes: 2 deep · 3 light · 4 rem · 5 awake
+// (0 not sleeping, 1 unknown — skipped).
+
+enum SleepStagesParser {
+
+    static func parse(_ data: Data, meta: XiaomiActivityFileMeta) -> ParsedSleep {
+        var result = ParsedSleep()
+        guard meta.version == 2, data.count > 4 else { return result }
+
+        // CRC stripped: GadgetBridge reads records up to the buffer limit, CRC included.
+        let r = LEReader(Data(data.dropLast(4)))
+        r.skip(7 + 1 + 7)                       // fileId, padding, unknown
+        let sleepDuration = Int(r.i16())
+        let bedTime = Int(r.u32())
+        let wakeupTime = Int(r.u32())
+        r.skip(3)
+        let deep = Int(r.i16()), light = Int(r.i16()), rem = Int(r.i16()), wake = Int(r.i16())
+        r.skip(1)
+
+        guard bedTime > 0, wakeupTime > bedTime, sleepDuration > 0 else { return result }
+
+        // The first transition can precede bedTime (the band's "real" sleep start), but not by
+        // hours; anything outside that window is a misread, not a phase.
+        let window = (bedTime - 6 * 3600)...wakeupTime
+        var events: [(time: Int, code: UInt8)] = []
+        while r.remaining >= 5 {
+            let event = (time: Int(r.u32()), code: r.u8())
+            if window.contains(event.time) { events.append(event) }
+        }
+        events.sort { $0.time < $1.time }
+
+        var phases: [SleepPhase] = []
+        for (i, event) in events.enumerated() {
+            let end = i + 1 < events.count ? events[i + 1].time : wakeupTime
+            guard end > event.time, let type = phaseType(event.code) else { continue }
+            phases.append(SleepPhase(startDate: Date(timeIntervalSince1970: TimeInterval(event.time)),
+                                     endDate: Date(timeIntervalSince1970: TimeInterval(end)),
+                                     type: type))
+        }
+
+        let bed = Date(timeIntervalSince1970: TimeInterval(bedTime))
+        let wakeup = Date(timeIntervalSince1970: TimeInterval(wakeupTime))
+        if phases.isEmpty {
+            phases = SleepDetailsParser.buildPhasesFromSummary(start: bed, deepMin: deep, lightMin: light,
+                                                              remMin: rem, wakeMin: wake)
+        }
+        guard let first = phases.first, let last = phases.last else { return result }
+
+        // Widened to enclose every phase — the window becomes the in-bed sample.
+        result.sessions = [SleepSession(startDate: min(bed, first.startDate),
+                                        endDate: max(wakeup, last.endDate),
+                                        phases: phases,
+                                        rawDataHash: SleepDetailsParser.hashOf(data))]
+        return result
+    }
+
+    private static func phaseType(_ code: UInt8) -> SleepPhaseType? {
+        switch code {
+        case 2: .deep
+        case 3: .light
+        case 4: .rem
+        case 5: .awake
+        default: nil
+        }
     }
 }
 

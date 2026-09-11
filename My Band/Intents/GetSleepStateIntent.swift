@@ -1,5 +1,6 @@
 import AppIntents
 import Foundation
+import OSLog
 
 // MARK: - GetSleepStateIntent
 //
@@ -30,14 +31,31 @@ struct GetSleepStateIntent: AppIntent {
     /// woke up since", not just "hasn't synced in a while".
     private static let staleAfter: TimeInterval = 60 * 60
 
+    private static let log = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "SleepIntent"
+    )
+
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog & ReturnsValue<Bool> {
         // Best-effort refresh so the answer isn't working off hours-old data. A failure here (band
-        // out of range, already mid-sync, etc.) isn't fatal — fall through to the last local sync.
-        _ = try? await BackgroundSyncManager.shared.syncNow()
+        // out of range, already mid-sync, etc.) isn't fatal — fall through to the last local sync,
+        // but it IS reported: an answer built on a sync that never happened is exactly the silent
+        // staleness this intent exists to avoid.
+        var syncFailed = false
+        do {
+            _ = try await BackgroundSyncManager.shared.syncNow()
+        } catch {
+            syncFailed = true
+            Self.log.error("Sync do intent de sono falhou: \(error.localizedDescription)")
+        }
 
         guard let session = AppServices.shared.bandSyncer.mostRecentSleepSession() else {
-            return .result(value: false, dialog: "Nenhum dado de sono sincronizado ainda.")
+            return .result(
+                value: false,
+                dialog: syncFailed
+                    ? "Não foi possível sincronizar com a pulseira e não há dado de sono local."
+                    : "Nenhum dado de sono sincronizado ainda."
+            )
         }
 
         let age = Date().timeIntervalSince(session.endDate)
@@ -49,9 +67,10 @@ struct GetSleepStateIntent: AppIntent {
         freshness.unitsStyle = .abbreviated
         let asOf = freshness.localizedString(for: session.endDate, relativeTo: Date())
 
+        let caveat = syncFailed ? ", sem sincronizar agora" : ""
         let dialog = sleeping
-            ? "Sim, dormindo (dado de \(asOf))."
-            : "Não, acordado (dado de \(asOf))."
+            ? "Sim, dormindo (dado de \(asOf)\(caveat))."
+            : "Não, acordado (dado de \(asOf)\(caveat))."
         return .result(value: sleeping, dialog: IntentDialog(stringLiteral: dialog))
     }
 }

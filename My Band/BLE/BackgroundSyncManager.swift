@@ -46,6 +46,11 @@ final class BackgroundSyncManager {
     /// The in-flight sync, shared by every concurrent caller so duplicate triggers coalesce.
     private var inFlight: Task<BandSyncer.HealthSyncOutcome, Error>?
 
+    /// The sync each live BGTask is running; an entry leaves the moment its task is completed.
+    private var backgroundRuns: [ObjectIdentifier: Task<Void, Never>] = [:]
+    /// Tasks whose expiry beat `handle` to the main actor, so `handle` knows not to start them.
+    private var expiredBeforeStart: Set<ObjectIdentifier> = []
+
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "BGSync")
 
     private init() {}
@@ -65,8 +70,11 @@ final class BackgroundSyncManager {
     #if canImport(BackgroundTasks) && os(iOS)
     private func registerTask(_ identifier: String) {
         let ok = BGTaskScheduler.shared.register(forTaskWithIdentifier: identifier, using: nil) { [weak self] task in
-            // BGTaskScheduler delivers on a background queue; hop to the main actor (BandManager
-            // is @MainActor and its CB callbacks run on .main).
+            // The expiration handler goes on right here, on the scheduler's queue — not after the hop
+            // to the main actor below. That hop can lag by seconds on a freshly resumed app (6 s on
+            // hardware, 2026-09-11), and a task that expires with no handler is completed as failed by
+            // iOS, which then schedules the app less often.
+            task.expirationHandler = { Task { @MainActor in self?.expire(task) } }
             Task { @MainActor in self?.handle(task) }
         }
         log.info("BGTask register \(ok ? "succeeded" : "failed") for \(identifier)")
@@ -121,29 +129,47 @@ final class BackgroundSyncManager {
     // MARK: - Execution
 
     private func handle(_ task: BGTask) {
+        let key = ObjectIdentifier(task)
+        // Expired before the main actor got to it — expire(_:) has already completed it.
+        if expiredBeforeStart.remove(key) != nil { return }
+
         log.info("Background task started: \(task.identifier)")
         // Always queue the next run first, so a failure here doesn't break the chain.
         scheduleNext()
 
-        let work = Task { @MainActor in
+        backgroundRuns[key] = Task { @MainActor in
             do {
                 _ = try await syncNow()
                 log.info("Background sync completed")
-                task.setTaskCompleted(success: true)
+                finish(task, success: true)
             } catch is CancellationError {
-                task.setTaskCompleted(success: false)
+                finish(task, success: false)
             } catch {
                 log.error("Background sync failed: \(error.localizedDescription)")
-                task.setTaskCompleted(success: false)
+                finish(task, success: false)
             }
         }
+    }
 
-        task.expirationHandler = { [weak self] in
-            self?.log.warning("Background task expired — tearing down")
-            work.cancel()
-            // Release the link but keep auto-reconnect, so the band can wake us again later.
-            self?.manager?.disconnect(userInitiated: false)
+    private func expire(_ task: BGTask) {
+        let key = ObjectIdentifier(task)
+        log.warning("Background task expired — tearing down")
+        guard let work = backgroundRuns[key] else {
+            expiredBeforeStart.insert(key)
+            task.setTaskCompleted(success: false)
+            return
         }
+        work.cancel()
+        // Release the link but keep auto-reconnect, so the band can wake us again later.
+        manager?.disconnect(userInitiated: false)
+        // Completed now, not when the sync finally unwinds: past expiry iOS expects it at once.
+        finish(task, success: false)
+    }
+
+    /// Completes the task exactly once, whichever of the sync and the expiry gets there first.
+    private func finish(_ task: BGTask, success: Bool) {
+        guard backgroundRuns.removeValue(forKey: ObjectIdentifier(task)) != nil else { return }
+        task.setTaskCompleted(success: success)
     }
     #endif
 
@@ -171,8 +197,10 @@ final class BackgroundSyncManager {
             throw SyncError.noDeviceRecord
         }
 
-        let wasConnected = manager.connectionState.isConnected
-        if !wasConnected { try await manager.ensureConnected(identifier: id) }
+        // A link mid-handshake (the band re-deriving keys) was already up — this sync didn't open it,
+        // so it mustn't be the one to drop it.
+        let wasConnected = manager.connectionState.isConnected || manager.connectionState.isAuthInProgress
+        if !manager.connectionState.isConnected { try await manager.ensureConnected(identifier: id) }
 
         let shouldDisconnect = disconnectWhenDone ?? !wasConnected
         // userInitiated: false — releasing the active link must NOT stop auto-reconnect, or the band
