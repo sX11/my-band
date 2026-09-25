@@ -146,16 +146,16 @@ enum AuthError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .noAuthKey:                  return "AuthKey não encontrado no Keychain."
-        case .noCharacteristics:          return "Características BLE não descobertas ainda."
-        case .unexpectedPayload(let n):   return "Resposta da pulseira inesperada: \(n) bytes."
-        case .badHMAC:                    return "HMAC da pulseira inválido — AuthKey incorreto."
-        case .timeout:                    return "Tempo esgotado durante autenticação."
-        case .linkDropped:                return "A pulseira encerrou a conexão durante o pareamento."
-        case .retrying:                   return "Refazendo o handshake."
-        case .wrongAuthKey:               return "AuthKey incorreto. Verifique a chave."
-        case .pairingNotConfirmed:        return "O pareamento não foi confirmado a tempo. Toque em conectar para tentar de novo."
-        case .staleBond:                  return "A pulseira esqueceu este iPhone. Abra Ajustes › Bluetooth, toque no (i) da pulseira, escolha \"Esquecer este dispositivo\" e conecte de novo."
+        case .noAuthKey:                  return "AuthKey not found in Keychain."
+        case .noCharacteristics:          return "BLE characteristics not discovered yet."
+        case .unexpectedPayload(let n):   return "Unexpected response from the band: \(n) bytes."
+        case .badHMAC:                    return "Invalid HMAC from the band — wrong AuthKey."
+        case .timeout:                    return "Authentication timed out."
+        case .linkDropped:                return "The band dropped the connection during pairing."
+        case .retrying:                   return "Retrying the handshake."
+        case .wrongAuthKey:               return "Wrong AuthKey. Check the key."
+        case .pairingNotConfirmed:        return "Pairing wasn't confirmed in time. Tap Connect to try again."
+        case .staleBond:                  return "The band has forgotten this iPhone. Open Settings › Bluetooth, tap (i) next to the band, choose \"Forget This Device\" and connect again."
         }
     }
 }

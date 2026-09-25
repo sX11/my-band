@@ -1256,9 +1256,9 @@ extension BandManager: CBCentralManagerDelegate {
         case .poweredOff:
             connectionState = .bluetoothUnavailable
         case .unauthorized:
-            connectionState = .error("Acesso Bluetooth não autorizado.")
+            connectionState = .error("Bluetooth access not authorized.")
         case .unsupported:
-            connectionState = .error("Este dispositivo não suporta Bluetooth LE.")
+            connectionState = .error("This device doesn't support Bluetooth LE.")
         default:
             connectionState = .bluetoothUnavailable
         }
@@ -1294,7 +1294,7 @@ extension BandManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         log.error("Failed to connect: \(error?.localizedDescription ?? "unknown")")
         lastError = error
-        connectionState = .error(error?.localizedDescription ?? "Falha na conexão")
+        connectionState = .error(error?.localizedDescription ?? "Connection failed")
         scheduleReconnect(to: peripheral)
     }
 

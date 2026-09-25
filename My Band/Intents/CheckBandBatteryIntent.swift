@@ -18,16 +18,16 @@ import UserNotifications
 
 struct CheckBandBatteryIntent: AppIntent {
 
-    static var title: LocalizedStringResource = "Verificar bateria da pulseira"
+    static var title: LocalizedStringResource = "Check band battery"
     static var description = IntentDescription(
-        "Verifica a bateria da Mi Band 10 e notifica apenas se estiver abaixo da porcentagem informada."
+        "Checks the Mi Band 10 battery and notifies you only if it's below the given percentage."
     )
 
     static var openAppWhenRun = false
 
     @Parameter(
-        title: "Notificar abaixo de",
-        description: "Porcentagem mínima. Acima dela o atalho não produz nenhuma saída.",
+        title: "Notify below",
+        description: "Minimum percentage. Above it, the shortcut produces no output.",
         default: 30,
         inclusiveRange: (1, 100)
     )
@@ -79,8 +79,8 @@ struct CheckBandBatteryIntent: AppIntent {
         _ = try? await center.requestAuthorization(options: [.alert, .sound])
 
         let content = UNMutableNotificationContent()
-        content.title = "Bateria da pulseira baixa"
-        content.body  = "A pulseira está com \(level)%. Coloque para carregar."
+        content.title = "Band battery low"
+        content.body  = "The band is at \(level)%. Put it on the charger."
         content.sound = .default
 
         let request = UNNotificationRequest(identifier: Self.notificationID, content: content, trigger: nil)
