@@ -39,7 +39,10 @@ enum DailySummaryParser {
         guard r.u8() == 0 else { return nil }  // padding must be 0
         r.skip(headerSize)       // header bitmask (unused here)
 
-        guard r.remaining >= 30 else { return nil }
+        // Every field below through spo2Avg (41 bytes) plus the file's trailing CRC-32, which the
+        // assembled buffer keeps. LEReader yields 0 past the end, so a shorter file would otherwise
+        // parse CRC bytes and made-up zeros into SpO₂ and get ACKed.
+        guard r.remaining >= 41 + 4 else { return nil }
 
         let steps = Int(r.i32())
         r.skip(3)                            // unk1..3

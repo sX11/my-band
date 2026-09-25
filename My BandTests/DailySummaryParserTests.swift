@@ -55,6 +55,12 @@ struct DailySummaryParserTests {
         #expect(DailySummaryParser.parse(data, meta: meta(data)) == nil)
     }
 
+    @Test func rejectsFileTruncatedBeforeSpO2Fields() {
+        let full = Fixtures.bytes(Fixtures.dailySummaryV5)
+        let truncated = full.prefix(7 + 1 + 4 + 40)
+        #expect(DailySummaryParser.parse(truncated, meta: meta(truncated)) == nil)
+    }
+
     @Test func datedAtFileTimestamp() throws {
         let data = Fixtures.bytes(Fixtures.dailySummaryV5)
         let m = meta(data)

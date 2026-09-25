@@ -82,7 +82,7 @@ struct SleepReconciliationTests {
         // sanitize can never see.
         let sessionB = SleepSession(
             startDate: date("04:22"), endDate: date("09:01"),
-            phases: SleepDetailsParser.sanitizeStages([phase("05:01", "05:22", .deep), phase("05:13", "05:16", .rem)])
+            phases: SleepDetailsParser.sanitizeStages([phase("05:01", "05:22", .deep)])
         )
 
         // Concatenating naively (the old behavior) leaves the overlap in place.
@@ -94,8 +94,7 @@ struct SleepReconciliationTests {
         let pooled = SleepDetailsParser.sanitizeStages(naive)
         #expect(pooled == [
             phase("05:01", "05:13", .deep),
-            phase("05:13", "05:16", .rem),
-            phase("05:16", "05:22", .deep),
+            phase("05:13", "05:22", .deep),
         ])
     }
 

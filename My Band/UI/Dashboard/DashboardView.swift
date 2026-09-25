@@ -92,6 +92,8 @@ struct DashboardView: View {
                 foot: "last sync"
             )
         }
+        // Tiles stretch to the taller one (a foot line is optional) instead of each hugging its content.
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: Sync

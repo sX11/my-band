@@ -133,14 +133,16 @@ final class BackgroundSyncManager {
         // Expired before the main actor got to it — expire(_:) has already completed it.
         if expiredBeforeStart.remove(key) != nil { return }
 
-        log.info("Background task started: \(task.identifier)")
+        log.notice("Background task started: \(task.identifier)")
         // Always queue the next run first, so a failure here doesn't break the chain.
         scheduleNext()
 
         backgroundRuns[key] = Task { @MainActor in
             do {
-                _ = try await syncNow()
-                log.info("Background sync completed")
+                // An app-refresh task gets ~30 s; a reconnect-and-retry on top of a timed-out sync
+                // would outlive it, and an expired task makes iOS schedule the app less often.
+                _ = try await syncNow(retryStaleLink: !(task is BGAppRefreshTask))
+                log.notice("Background sync completed")
                 finish(task, success: true)
             } catch is CancellationError {
                 finish(task, success: false)
@@ -179,18 +181,20 @@ final class BackgroundSyncManager {
     /// `disconnectWhenDone`: nil = disconnect only if we opened the link (live foreground links stay
     /// up); true/false force the behaviour (background wakes pass true to free the radio).
     @discardableResult
-    func syncNow(disconnectWhenDone: Bool? = nil) async throws -> BandSyncer.HealthSyncOutcome {
+    func syncNow(disconnectWhenDone: Bool? = nil, retryStaleLink: Bool = true) async throws -> BandSyncer.HealthSyncOutcome {
         if let inFlight {
             log.debug("Sync already in flight — coalescing")
             return try await inFlight.value
         }
-        let task = Task { @MainActor in try await self.performSync(disconnectWhenDone: disconnectWhenDone) }
+        let task = Task { @MainActor in
+            try await self.performSync(disconnectWhenDone: disconnectWhenDone, retryStaleLink: retryStaleLink)
+        }
         inFlight = task
         defer { inFlight = nil }
         return try await task.value
     }
 
-    private func performSync(disconnectWhenDone: Bool?) async throws -> BandSyncer.HealthSyncOutcome {
+    private func performSync(disconnectWhenDone: Bool?, retryStaleLink: Bool) async throws -> BandSyncer.HealthSyncOutcome {
         // On a cold launch triggered by a task, the UI .onAppear may not have wired deps yet.
         try await awaitDependencies()
         guard let manager, let syncer, let id = syncer.currentDevice?.peripheralIdentifier else {
@@ -206,7 +210,21 @@ final class BackgroundSyncManager {
         // userInitiated: false — releasing the active link must NOT stop auto-reconnect, or the band
         // could never wake us again. BandManager re-arms a standing connect on the resulting drop.
         defer { if shouldDisconnect { manager.disconnect(userInitiated: false) } }
-        return try await syncer.syncToHealth()
+        do {
+            return try await syncer.syncToHealth()
+        } catch SyncError.timeout where wasConnected && retryStaleLink {
+            // A long-held link can look connected while the band ignores every command (its session
+            // moved on without us). A fresh connection re-derives the keys; retry once on it.
+            log.error("Sync timed out on a link that was already up — reconnecting for a fresh session and retrying")
+            manager.disconnect(userInitiated: false)
+            for _ in 0 ..< 50 where manager.connectionState.isConnected {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            // ensureConnected returns at once on a link still reported up — retrying would reuse it.
+            guard !manager.connectionState.isConnected else { throw SyncError.timeout }
+            try await manager.ensureConnected(identifier: id)
+            return try await syncer.syncToHealth()
+        }
     }
 
     /// Called when the band authenticates while the app is in the background — e.g. CoreBluetooth
@@ -228,7 +246,7 @@ final class BackgroundSyncManager {
                 // the connection is what gives constant background communication (push events: find
                 // phone, workout, weather). A later drop re-arms a standing connect on its own.
                 let outcome = try await syncNow(disconnectWhenDone: false)
-                log.info("Background-wake sync done — \(outcome.healthSamplesWritten) samples")
+                log.notice("Background-wake sync done — \(outcome.healthSamplesWritten) samples")
             } catch {
                 log.error("Background-wake sync failed: \(error.localizedDescription)")
             }

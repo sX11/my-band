@@ -102,6 +102,9 @@ final class DataUploadService {
             chunk.append(uint16LE(UInt16(i + 1)))
             chunk.append(payload[start..<end])
             await manager.sendDataChunk(chunk)
+            // A link drop resumes the paced send without writing anything; stop rather than
+            // "finishing" the upload into a dead link and reporting it installed.
+            guard manager.connectionState.isConnected else { throw UploadError.notConnected }
             onProgress(Double(i + 1) / Double(totalParts))
         }
         log.info("Upload finished — \(totalParts) part(s) sent")

@@ -131,6 +131,10 @@ final class BandManager: NSObject {
     // Resumed by peripheralIsReady(toSendWriteWithoutResponse:) to pace large uploads.
     private var writeReadyContinuation: CheckedContinuation<Void, Never>?
 
+    // Fragments of MTU-split frames waiting for write-without-response buffer space. Every later
+    // write queues behind them: the band reassembles by byte stream, so nothing may interleave.
+    private var pendingWrites: [Data] = []
+
     // MARK: - Reconnect
 
     private var reconnectAttempts = 0
@@ -491,7 +495,8 @@ final class BandManager: NSObject {
     /// it and silently drop frames. Awaits peripheralIsReady when the buffer is full.
     func sendDataChunk(_ chunk: Data) async {
         if let p = peripheral, let char = cmdWriteChar,
-           char.properties.contains(.writeWithoutResponse), !p.canSendWriteWithoutResponse {
+           char.properties.contains(.writeWithoutResponse),
+           !p.canSendWriteWithoutResponse || !pendingWrites.isEmpty {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 writeReadyContinuation = cont
             }
@@ -517,7 +522,8 @@ final class BandManager: NSObject {
         // length (mirrors GadgetBridge's chunked outgoing write). For the small auth/init packets
         // this is a single chunk, so the existing handshake path is unchanged.
         let mtu = max(20, p.maximumWriteValueLength(for: writeType))
-        if packet.count <= mtu {
+        let bufferHasRoom = writeType == .withResponse || p.canSendWriteWithoutResponse
+        if packet.count <= mtu, pendingWrites.isEmpty, bufferHasRoom {
             // Full hex only for small frames (handshake/commands). Upload chunks are large and
             // frequent — building the hex string for every one is wasteful, so log just the length.
             if packet.count <= 64 {
@@ -529,11 +535,28 @@ final class BandManager: NSObject {
             return
         }
         log.debug("005F write (\(packet.count)B in \(mtu)B chunks, \(writeType == .withoutResponse ? "noRsp" : "rsp"))")
+        var fragments: [Data] = []
         var offset = packet.startIndex
         while offset < packet.endIndex {
             let end = packet.index(offset, offsetBy: mtu, limitedBy: packet.endIndex) ?? packet.endIndex
-            p.writeValue(packet.subdata(in: offset..<end), for: char, type: writeType)
+            fragments.append(packet.subdata(in: offset..<end))
             offset = end
+        }
+        guard writeType == .withoutResponse else {
+            // With-response writes are queued by CoreBluetooth itself.
+            fragments.forEach { p.writeValue($0, for: char, type: writeType) }
+            return
+        }
+        // A write-without-response issued while the buffer is full is silently dropped, and one
+        // lost fragment corrupts the whole frame — pace them against peripheralIsReady.
+        pendingWrites += fragments
+        flushPendingWrites()
+    }
+
+    private func flushPendingWrites() {
+        guard let char = cmdWriteChar, let p = peripheral, p.state == .connected else { return }
+        while !pendingWrites.isEmpty, p.canSendWriteWithoutResponse {
+            p.writeValue(pendingWrites.removeFirst(), for: char, type: .withoutResponse)
         }
     }
 
@@ -1210,6 +1233,10 @@ final class BandManager: NSObject {
         batteryLevelChar = nil
         hasGattBatteryLevel = false
         resumeBatteryWaiters()
+        pendingWrites.removeAll()
+        // peripheralIsReady never fires on a dead link; an upload parked here would hang forever.
+        writeReadyContinuation?.resume()
+        writeReadyContinuation = nil
         phoneNonce   = nil
         sessionKeys  = nil
         seqNum       = 0
@@ -1370,6 +1397,8 @@ extension BandManager: CBCentralManagerDelegate {
 extension BandManager: CBPeripheralDelegate {
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        flushPendingWrites()
+        guard pendingWrites.isEmpty else { return }
         writeReadyContinuation?.resume()
         writeReadyContinuation = nil
     }
