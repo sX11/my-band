@@ -876,7 +876,7 @@ enum HealthError: LocalizedError {
     case unavailable
     var errorDescription: String? {
         switch self {
-        case .unavailable: "O Apple Health não está disponível neste dispositivo."
+        case .unavailable: "Apple Health isn't available on this device."
         }
     }
 }

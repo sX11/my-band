@@ -18,9 +18,9 @@ import OSLog
 
 struct GetSleepStateIntent: AppIntent {
 
-    static var title: LocalizedStringResource = "Ver se estou dormindo"
+    static var title: LocalizedStringResource = "Check if I'm asleep"
     static var description = IntentDescription(
-        "Sincroniza com a Mi Band 10 e diz se você está dormindo, segundo o último dado de sono conhecido."
+        "Syncs with the Mi Band 10 and tells you whether you're asleep, based on the latest known sleep data."
     )
 
     // Runs in the background without bringing the app to the foreground.
@@ -53,8 +53,8 @@ struct GetSleepStateIntent: AppIntent {
             return .result(
                 value: false,
                 dialog: syncFailed
-                    ? "Não foi possível sincronizar com a pulseira e não há dado de sono local."
-                    : "Nenhum dado de sono sincronizado ainda."
+                    ? "Couldn't sync with the band and there's no local sleep data."
+                    : "No sleep data synced yet."
             )
         }
 
@@ -63,14 +63,14 @@ struct GetSleepStateIntent: AppIntent {
         let sleeping = age < Self.staleAfter && !lastPhaseIsAwake
 
         let freshness = RelativeDateTimeFormatter()
-        freshness.locale = Locale(identifier: "pt_BR")
+        freshness.locale = Locale(identifier: "en_US")
         freshness.unitsStyle = .abbreviated
         let asOf = freshness.localizedString(for: session.endDate, relativeTo: Date())
 
-        let caveat = syncFailed ? ", sem sincronizar agora" : ""
+        let caveat = syncFailed ? ", not synced just now" : ""
         let dialog = sleeping
-            ? "Sim, dormindo (dado de \(asOf)\(caveat))."
-            : "Não, acordado (dado de \(asOf)\(caveat))."
+            ? "Yes, asleep (data from \(asOf)\(caveat))."
+            : "No, awake (data from \(asOf)\(caveat))."
         return .result(value: sleeping, dialog: IntentDialog(stringLiteral: dialog))
     }
 }

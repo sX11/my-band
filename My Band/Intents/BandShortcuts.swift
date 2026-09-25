@@ -11,38 +11,38 @@ struct BandShortcuts: AppShortcutsProvider {
         AppShortcut(
             intent: SyncBandIntent(),
             phrases: [
-                "Sincronizar \(.applicationName)",
-                "Sincronizar minha pulseira no \(.applicationName)",
-                "Sincronizar a pulseira com o \(.applicationName)",
-                "Sincronizar minha Mi Band no \(.applicationName)",
-                "Atualizar minha pulseira no \(.applicationName)",
-                "Sincronizar dados da pulseira no \(.applicationName)",
-                "Puxar dados da Mi Band no \(.applicationName)",
-                "Sincronizar pulseira com o Apple Health no \(.applicationName)",
+                "Sync \(.applicationName)",
+                "Sync my band in \(.applicationName)",
+                "Sync the band with \(.applicationName)",
+                "Sync my Mi Band in \(.applicationName)",
+                "Update my band in \(.applicationName)",
+                "Sync band data in \(.applicationName)",
+                "Pull Mi Band data in \(.applicationName)",
+                "Sync band to Apple Health in \(.applicationName)",
             ],
-            shortTitle: "Sincronizar pulseira",
+            shortTitle: "Sync band",
             systemImageName: "arrow.triangle.2.circlepath"
         )
         AppShortcut(
             intent: GetSleepStateIntent(),
             phrases: [
-                "Estou dormindo no \(.applicationName)",
-                "Eu estou dormindo no \(.applicationName)",
-                "Ver se estou dormindo no \(.applicationName)",
-                "Verificar meu sono no \(.applicationName)",
+                "Am I asleep in \(.applicationName)",
+                "Am I sleeping in \(.applicationName)",
+                "Check if I'm asleep in \(.applicationName)",
+                "Check my sleep in \(.applicationName)",
             ],
-            shortTitle: "Ver se estou dormindo",
+            shortTitle: "Am I asleep",
             systemImageName: "moon.zzz.fill"
         )
         AppShortcut(
             intent: CheckBandBatteryIntent(),
             phrases: [
-                "Verificar bateria da pulseira no \(.applicationName)",
-                "Ver a bateria da pulseira no \(.applicationName)",
-                "Quanto tem de bateria na pulseira no \(.applicationName)",
-                "Checar bateria da Mi Band no \(.applicationName)",
+                "Check band battery in \(.applicationName)",
+                "Show band battery in \(.applicationName)",
+                "How much battery does my band have in \(.applicationName)",
+                "Check Mi Band battery in \(.applicationName)",
             ],
-            shortTitle: "Verificar bateria",
+            shortTitle: "Check battery",
             systemImageName: "battery.25"
         )
     }

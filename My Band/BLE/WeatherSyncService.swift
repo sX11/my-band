@@ -105,7 +105,7 @@ final class WeatherSyncService: NSObject {
         async -> (lat: Double, lon: Double, name: String, code: String, isCurrent: Bool) {
 
         if let loc = await currentLocation() {
-            let name = await placeName(for: loc) ?? (requestedName.isEmpty ? "Localização atual" : requestedName)
+            let name = await placeName(for: loc) ?? (requestedName.isEmpty ? "Current Location" : requestedName)
             // Echo the requested key so the band binds the reply to the tile it's waiting on; for a
             // proactive push (no request) derive a stable key from the resolved name.
             let code = requestedKey.isEmpty ? locationKey(name) : requestedKey
@@ -165,7 +165,7 @@ final class WeatherSyncService: NSObject {
     private func placeName(for loc: CLLocation) async -> String? {
         let cellKey = String(format: "%.2f,%.2f", loc.coordinate.latitude, loc.coordinate.longitude)
         if let cached = placeNameCache[cellKey] { return cached }
-        guard let placemarks = try? await CLGeocoder().reverseGeocodeLocation(loc, preferredLocale: Locale(identifier: "pt_BR")),
+        guard let placemarks = try? await CLGeocoder().reverseGeocodeLocation(loc, preferredLocale: Locale(identifier: "en_US")),
               let p = placemarks.first else { return nil }
         let name = p.locality ?? p.subAdministrativeArea ?? p.name
         if let name { placeNameCache[cellKey] = name }
