@@ -760,6 +760,7 @@ final class BandSyncer {
             }
             group.addTask {
                 try await Task.sleep(for: .seconds(10))
+                self.log.error("File-id listing (subtype \(subtype)) got no reply in 10 s")
                 throw SyncError.timeout
             }
 
@@ -825,6 +826,7 @@ final class BandSyncer {
                 while true {
                     try await Task.sleep(for: .seconds(1))
                     if ContinuousClock.now - receiver.lastActivity > Self.fileIdleTimeout {
+                        self.log.error("File \(fileId.hexString, privacy: .public) stalled — no chunk for \(Self.fileIdleTimeout, privacy: .public)")
                         throw SyncError.timeout
                     }
                 }

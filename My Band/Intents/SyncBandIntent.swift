@@ -19,7 +19,7 @@ struct SyncBandIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         do {
-            let outcome = try await BackgroundSyncManager.shared.syncNow()
+            let outcome = try await BackgroundSyncManager.shared.syncNow(retryStaleLink: false)
             return .result(dialog: IntentDialog(stringLiteral: Self.summary(outcome)))
         } catch SyncError.noDeviceRecord {
             return .result(dialog: "Nenhuma pulseira pareada. Abra o My Band para configurar.")

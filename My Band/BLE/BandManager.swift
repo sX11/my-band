@@ -358,6 +358,12 @@ final class BandManager: NSObject {
         // continuation resumed by handleAuthSuccess() or failAuth()
     }
 
+    /// A connect already under way (e.g. the standing reconnect armed by a drop). Calling connect
+    /// again on top of it can re-fire didConnect and run a second authenticate() under the first.
+    private var isConnectInProgress: Bool {
+        connectionState == .connecting || connectionState == .discoveringServices
+    }
+
     /// `userInitiated` (forget / explicit "disconnect") clears autoReconnect so we stop chasing the
     /// band. Background teardown (post-sync, BGTask expiry) passes `false`: the active link is
     /// released to free the radio, but autoReconnect stays on, so didDisconnectPeripheral re-arms a
@@ -378,7 +384,7 @@ final class BandManager: NSObject {
         // A link already mid-handshake (usually re-deriving keys after the band reopened its
         // session) only needs waiting for. Reconnecting on top of it reset the state to .connecting
         // and re-ran service discovery — and with it a second authenticate() — under the live one.
-        if connectionState.isAuthInProgress || connectionState == .sessionConfig {
+        if connectionState.isAuthInProgress || connectionState == .sessionConfig || isConnectInProgress {
             try await awaitSession(timeout: timeout)
             return
         }
@@ -401,7 +407,7 @@ final class BandManager: NSObject {
     /// connection, so it can't collide with the handshake already in flight.
     func awaitSession(timeout: Duration = .seconds(20)) async throws {
         if connectionState.isConnected { return }
-        guard connectionState.isAuthInProgress || connectionState == .sessionConfig else {
+        guard connectionState.isAuthInProgress || connectionState == .sessionConfig || isConnectInProgress else {
             throw SyncError.notConnected
         }
         let timeoutTask = Task { [weak self] in
