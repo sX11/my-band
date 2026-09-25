@@ -9,6 +9,10 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Puxar para atualizar na Dashboard** (`UI/Dashboard/DashboardView.swift`): puxar a tela para baixo roda o mesmo sync coalescido do botão, com a pulseira conectada.
+
 ### Changed
 
 - **Textos voltados ao usuário passam a ser em inglês** (UI, erros, notificações, frases da Siri e textos de uso do `Info.plist`).
@@ -18,6 +22,8 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Os dois cards da Dashboard tinham alturas diferentes** (`UI/Dashboard/DashboardView.swift`, `UI/DesignSystem/MBMetricTile.swift`): o de bateria não tem rodapé fora do carregamento. Agora ambos acompanham o mais alto.
+- **O "last sync" da Dashboard congelava** (`UI/Dashboard/DashboardView.swift`): o tempo relativo era calculado no render e nada o re-renderizava; um `TimelineView` de 30 s o mantém atual, e um sync de menos de um minuto aparece como "Just now".
 - **O iOS marcava o BGTask como falho antes de o app começar** (`BLE/BackgroundSyncManager.swift`): o `expirationHandler` só era instalado depois do pulo para o main actor, e esse pulo levou 6 s num app recém-retomado (hardware, 2026-09-11) — a tarefa expirou sem handler e o iOS a completou como falha (`Client didn't provide an expiration handler`), o que reduz a frequência dos próximos agendamentos. O handler agora é instalado no próprio closure do `register`, na fila do scheduler; ao expirar, o app cancela o sync, solta o link e completa a tarefa na hora, e `setTaskCompleted` roda uma única vez, venha do sync ou da expiração.
 - **Sync aberto numa conexão nova morria no restart de sessão da pulseira** (`BLE/BandSyncer.swift`, `BLE/BandManager.swift`): logo depois do init pós-auth a pulseira reabre a sessão e troca as chaves — e o `ensureConnected` resolve justamente na primeira auth, então o `FETCH_TODAY` saía na janela em que a pulseira descarta comandos em silêncio (ou nem saía: sem chaves, `sendEncryptedCommand` retornava calado). A listagem estourava os 10 s e levava o sync inteiro, sono incluído. Agora `BandManager.onSessionRestart` faz a troca em voo falhar na hora (`SyncError.sessionRestarted`) e `BandSyncer.surviveSessionRestart` a reenvia após o re-handshake (`BandManager.awaitSession`), para as listagens e para cada arquivo. Um comando descartado por falta de chaves passa a ser logado.
 - **Arquivo entregue no lugar de outro era confirmado sem ser lido** (`BLE/BandSyncer.swift`): quando a pulseira respondia um fetch com outro arquivo ainda não confirmado, o app o ACKava para "destravar" e seguia — descartando o conteúdo para sempre. O arquivo trocado vem completo e com CRC válido; agora é roteado como qualquer outro antes do ACK. O candidato mais provável a ser pego no meio do caminho era o de sono, o maior da fila.

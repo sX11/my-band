@@ -57,7 +57,7 @@ struct MBMetricTile: View {
                 Text(foot).font(.mbFootnote).foregroundStyle(MB.textTertiary)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(.init(top: 14, leading: 16, bottom: 16, trailing: 16))
         .background(MB.surfaceCard)
         .overlay(
