@@ -58,8 +58,11 @@ struct AuthKeyStore {
 
         // One-time migration from the old bundle-id-keyed item.
         if let legacyService, let legacy = try read(service: legacyService) {
-            try? save(legacy)
-            SecItemDelete(baseQuery(service: legacyService) as CFDictionary)
+            // The legacy item is the only copy until the new one exists: delete it only after a
+            // successful save, and still hand the key back when the save fails (retried next load).
+            if (try? save(legacy)) != nil {
+                SecItemDelete(baseQuery(service: legacyService) as CFDictionary)
+            }
             return legacy
         }
         throw AuthKeyError.notFound

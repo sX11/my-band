@@ -39,7 +39,11 @@ enum DailySummaryParser {
         guard r.u8() == 0 else { return nil }  // padding must be 0
         r.skip(headerSize)       // header bitmask (unused here)
 
-        guard r.remaining >= 30 else { return nil }
+        // The assembled buffer keeps the file's trailing CRC-32, and LEReader yields 0 past the end,
+        // so every block is length-checked against remaining minus those 4 bytes before it is read —
+        // otherwise CRC bytes and made-up zeros would be written as data and the file ACKed.
+        let crcSize = 4
+        guard r.remaining >= 27 + crcSize else { return nil }   // steps … calories
 
         let steps = Int(r.i32())
         r.skip(3)                            // unk1..3
@@ -56,12 +60,17 @@ enum DailySummaryParser {
         let standB0 = Int(r.u8()), standB1 = Int(r.u8()), standB2 = Int(r.u8())
         let standing = (standB0 | (standB1 << 8) | (standB2 << 16)) & 0x00FF_FFFF
         let calories  = Int(r.i16())
-        r.skip(3)                            // unk7..9
-        let spo2Max   = r.u8()
-        let spo2MaxTs = r.u32()
-        let spo2Min   = r.u8()
-        let spo2MinTs = r.u32()
-        let spo2Avg   = r.u8()
+        // SpO₂ block (unk7..9 + 11 bytes). A file that ends before it keeps its steps and HR.
+        var spo2Max: UInt8 = 0, spo2Min: UInt8 = 0, spo2Avg: UInt8 = 0
+        var spo2MaxTs: UInt32 = 0, spo2MinTs: UInt32 = 0
+        if r.remaining >= 3 + 11 + crcSize {
+            r.skip(3)                        // unk7..9
+            spo2Max   = r.u8()
+            spo2MaxTs = r.u32()
+            spo2Min   = r.u8()
+            spo2MinTs = r.u32()
+            spo2Avg   = r.u8()
+        }
 
         var s = DailySummary(date: meta.timestamp, steps: max(0, steps),
                              caloriesKcal: max(0, calories))
