@@ -251,6 +251,10 @@ enum XiaomiWeatherCmd {
 
 enum XiaomiScheduleCmd {
     static let cmdType:        UInt32 = 17
+    static let alarmsGet:      UInt32 = 0    // → schedule.alarms
+    static let alarmCreate:    UInt32 = 1    // schedule.createAlarm (AlarmDetails)
+    static let alarmEdit:      UInt32 = 2    // schedule.editAlarm (id + AlarmDetails)
+    static let alarmDelete:    UInt32 = 4    // schedule.deleteAlarm (ids)
     static let remindersGet:   UInt32 = 14
     static let reminderCreate: UInt32 = 15   // schedule.createReminder (ReminderDetails)
     static let reminderEdit:   UInt32 = 17   // schedule.editReminder

@@ -75,6 +75,7 @@ struct RootView: View {
 
     private func forget() {
         band.disconnect()
+        AppServices.shared.alarms.reset()
         AuthKeyStore.delete()
         phase = .setup
     }

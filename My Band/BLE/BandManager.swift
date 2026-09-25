@@ -254,6 +254,8 @@ final class BandManager: NSObject {
     var onWeatherConditionsRequest: ((String, String) -> Void)?
     /// Called for every Watchface command (type=4) from the band — WatchfaceService handles it.
     var onWatchfaceCommand:      ((Xiaomi_Command) -> Void)?
+    /// Alarm list / create / edit / delete responses (schedule type, alarm subtypes).
+    var onAlarmCommand:          ((Xiaomi_Command) -> Void)?
     /// Called for every Rpk/app command (type=20) from the band — AppInstallService handles it.
     var onRpkCommand:            ((Xiaomi_Command) -> Void)?
     /// Called for every DataUpload command (type=22) from the band — DataUploadService handles it.
@@ -787,6 +789,12 @@ final class BandManager: NSObject {
             onRpkCommand?(cmd)
         case XiaomiDataUploadCmd.cmdType:
             onDataUploadCommand?(cmd)
+        case XiaomiScheduleCmd.cmdType where [XiaomiScheduleCmd.alarmsGet, XiaomiScheduleCmd.alarmCreate,
+                                              XiaomiScheduleCmd.alarmEdit, XiaomiScheduleCmd.alarmDelete]
+                                                .contains(cmd.subtype):
+            // Kept apart from the reminder ack below: an alarm-create ack must not be recorded as a
+            // reminder id, or the next calendar sync would delete a reminder by that number.
+            onAlarmCommand?(cmd)
         case XiaomiScheduleCmd.cmdType where cmd.hasSchedule && cmd.schedule.hasAckID:
             log.debug("Schedule ack id=\(cmd.schedule.ackID)")
             onScheduleAck?(cmd.schedule.ackID)

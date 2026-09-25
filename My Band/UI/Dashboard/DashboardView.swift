@@ -9,6 +9,7 @@ struct DashboardView: View {
 
     @Environment(BandManager.self) private var band
     @Environment(BandSyncer.self) private var syncer
+    @Environment(AlarmService.self) private var alarms
     var onForget: () -> Void
 
     @State private var syncing = false
@@ -16,6 +17,7 @@ struct DashboardView: View {
     @State private var resultIsError = false
     @State private var showCustomize = false
     @State private var showProfile = false
+    @State private var showAlarms = false
 
     private var connected: Bool { band.connectionState.isConnected }
     /// Mid-handshake (or scanning) — a reconnect is already under way, so the button waits.
@@ -55,6 +57,8 @@ struct DashboardView: View {
         }
         .sheet(isPresented: $showCustomize) { CustomizeView() }
         .sheet(isPresented: $showProfile) { ProfileView() }
+        .sheet(isPresented: $showAlarms) { AlarmsView() }
+        .task(id: connected) { if connected { alarms.requestList() } }
     }
 
     // MARK: Header
@@ -81,8 +85,36 @@ struct DashboardView: View {
         // The relative "last sync" text is computed at render time; without a clock nothing
         // re-renders it, so it froze at whatever it read when the view last changed.
         TimelineView(.periodic(from: .now, by: 30)) { context in
-            metricTiles(now: context.date)
+            VStack(spacing: MB.Space.x3) {
+                metricTiles(now: context.date)
+                alarmTile(now: context.date)
+            }
         }
+    }
+
+    private func alarmTile(now: Date) -> some View {
+        let next = alarms.nextAlarm(after: now)
+        return Button { showAlarms = true } label: {
+            MBMetricTile(
+                icon: "alarm.fill", tint: MB.accent, tintSoft: MB.accentSoft,
+                label: "Next alarm",
+                value: next.map { String(format: "%02d:%02d", $0.alarm.hour, $0.alarm.minute) } ?? "—",
+                foot: alarmFoot(next, now: now)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func alarmFoot(_ next: (alarm: AlarmService.Alarm, fires: Date)?, now: Date) -> String {
+        guard let next else {
+            if !alarms.loaded { return connected ? "Loading…" : "Connect the band to see alarms" }
+            return alarms.alarms.isEmpty ? "No alarms · tap to add" : "All alarms off"
+        }
+        let cal = Calendar.current
+        let day = cal.isDate(next.fires, inSameDayAs: now) ? "Today"
+            : cal.isDateInTomorrow(next.fires) ? "Tomorrow"
+            : next.fires.formatted(.dateTime.weekday(.wide))
+        return "\(day) · \(AlarmsView.repeatSummary(next.alarm.repeatDays))"
     }
 
     private func metricTiles(now: Date) -> some View {
