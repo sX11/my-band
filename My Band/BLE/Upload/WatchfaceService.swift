@@ -87,7 +87,7 @@ final class WatchfaceService {
                 Face(id: $0.id, name: $0.name.isEmpty ? $0.id : $0.name,
                      active: $0.active, canDelete: $0.canDelete)
             }
-            log.debug("Watch face list: \(self.faces.count) face(s)")
+            log.info("Watch face list: \(self.faces.map { "\($0.id)\($0.active ? "*" : "")" }.joined(separator: ", "), privacy: .public)")
         case XiaomiWatchfaceCmd.install where cmd.hasWatchface:
             if let cont = statusContinuation {
                 statusContinuation = nil
@@ -96,7 +96,7 @@ final class WatchfaceService {
         case XiaomiWatchfaceCmd.delete:
             requestList()
         default:
-            break
+            log.info("Watch face command subtype=\(cmd.subtype) (unhandled)")
         }
     }
 

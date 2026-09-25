@@ -262,7 +262,9 @@ final class BandSyncer {
     }
 
     @discardableResult
-    func syncToHealth() async throws -> HealthSyncOutcome {
+    /// `stallEndsSync`: a file fetch that times out before anything has arrived throws
+    /// `SyncError.timeout` instead of being skipped, so a caller that can reconnect gets the chance.
+    func syncToHealth(stallEndsSync: Bool = false) async throws -> HealthSyncOutcome {
         // Re-entrancy guard. The guard + flag set run synchronously before the first await, so the
         // @MainActor serialises overlapping triggers (manual button, BGTask, background-wake) into
         // a single run — the rest see the flag and bail.
@@ -292,7 +294,8 @@ final class BandSyncer {
         let fileIds = try await fetchFileIds(manager: manager)
         log.info("Received \(fileIds.count) file ID(s)")
 
-        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context)
+        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context,
+                                                     stallEndsSync: stallEndsSync)
         markSynced(context)
 
         log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
@@ -409,7 +412,8 @@ final class BandSyncer {
 
     private func processActivityFiles(_ fileIds: [Data],
                                       manager: BandManager,
-                                      context: ModelContext) async throws -> HealthSyncOutcome {
+                                      context: ModelContext,
+                                      stallEndsSync: Bool = false) async throws -> HealthSyncOutcome {
         var outcome = HealthSyncOutcome()
         var sleepToWrite: [SleepSession] = []
         var sleepVitals: [ActivityMinuteSample] = []
@@ -516,7 +520,6 @@ final class BandSyncer {
         // discarding whatever it held — a night's sleep file, the largest, is the likeliest one to be
         // caught mid-stream. The early ACK's only exposure is a batch write failing later in this sync.
         var handled = Set<Data>()
-        var stalled = 0
         for fileId in fileIds where !handled.contains(fileId) {
             for _ in 0 ..< 3 {
                 let delivered: (id: Data, data: Data)
@@ -526,7 +529,9 @@ final class BandSyncer {
                     }
                     delivered = (id, data)
                 } catch {
-                    if case SyncError.timeout = error { stalled += 1 }
+                    // A first fetch that stalls with nothing delivered is the band ignoring this
+                    // session; bail now rather than idling out every file. Nothing was routed yet.
+                    if stallEndsSync, handled.isEmpty, case SyncError.timeout = error { throw error }
                     log.error("Failed file \(fileId.hexString): \(error.localizedDescription)")
                     break
                 }
@@ -538,11 +543,6 @@ final class BandSyncer {
                 sendAck(fileId: delivered.id, manager: manager)
             }
         }
-
-        // Every fetch stalled and nothing arrived: the band is ignoring this session. Surfacing it as a
-        // timeout lets the caller reconnect instead of marking an empty sync as done. Nothing was
-        // routed, so there is nothing to write or ACK.
-        if handled.isEmpty, stalled > 0, stalled == fileIds.count { throw SyncError.timeout }
 
         // Isolated from the rest of the batch: a throwing sleep write used to propagate out of here,
         // skipping the manual/workout/daily-detail writes and every ACK after it — so a sleep write
@@ -833,7 +833,7 @@ final class BandSyncer {
                 while true {
                     try await Task.sleep(for: .seconds(1))
                     if ContinuousClock.now - receiver.lastActivity > Self.fileIdleTimeout {
-                        self.log.error("File \(fileId.hexString) stalled — no chunk for \(Self.fileIdleTimeout)")
+                        self.log.error("File \(fileId.hexString, privacy: .public) stalled — no chunk for \(Self.fileIdleTimeout, privacy: .public)")
                         throw SyncError.timeout
                     }
                 }

@@ -51,6 +51,7 @@ struct DashboardView: View {
                 .padding(.top, MB.Space.x6)
                 .padding(.bottom, MB.Space.x10)
             }
+            .refreshable { if connected { await performSync() } }
         }
         .sheet(isPresented: $showCustomize) { CustomizeView() }
         .sheet(isPresented: $showProfile) { ProfileView() }
@@ -77,6 +78,14 @@ struct DashboardView: View {
     // MARK: Metrics
 
     private var metrics: some View {
+        // The relative "last sync" text is computed at render time; without a clock nothing
+        // re-renders it, so it froze at whatever it read when the view last changed.
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            metricTiles(now: context.date)
+        }
+    }
+
+    private func metricTiles(now: Date) -> some View {
         HStack(spacing: MB.Space.x3) {
             MBMetricTile(
                 icon: batteryIcon, tint: batteryTint, tintSoft: batteryTintSoft,
@@ -88,7 +97,7 @@ struct DashboardView: View {
             MBMetricTile(
                 icon: "heart.fill", tint: MB.hr, tintSoft: MB.hrSoft,
                 label: "Apple Health",
-                value: lastSyncText,
+                value: lastSyncText(now: now),
                 foot: "last sync"
             )
         }
@@ -136,31 +145,36 @@ struct DashboardView: View {
     }
 
     private func runSync() {
+        Task { await performSync() }
+    }
+
+    private func performSync() async {
+        guard !syncing else { return }
         syncing = true
         resultText = nil
-        Task {
-            do {
-                // Funnel through the same coalesced entry point as the background/intent triggers,
-                // so a manual tap can't race a sync already in flight.
-                let outcome = try await BackgroundSyncManager.shared.syncNow()
-                resultIsError = false
-                resultText = "Synced · \(outcome.healthSamplesWritten) samples in Apple Health"
-            } catch {
-                resultIsError = true
-                resultText = error.localizedDescription
-            }
-            syncing = false
+        do {
+            // Funnel through the same coalesced entry point as the background/intent triggers,
+            // so a manual tap can't race a sync already in flight.
+            let outcome = try await BackgroundSyncManager.shared.syncNow()
+            resultIsError = false
+            resultText = "Synced · \(outcome.healthSamplesWritten) samples in Apple Health"
+        } catch {
+            resultIsError = true
+            resultText = error.localizedDescription
         }
+        syncing = false
     }
 
     // MARK: Derived
 
-    private var lastSyncText: String {
+    private func lastSyncText(now: Date) -> String {
         guard let date = syncer.lastHealthSync else { return "Never" }
         let f = RelativeDateTimeFormatter()
         f.locale = Locale(identifier: "en_US")
         f.unitsStyle = .abbreviated
-        return f.localizedString(for: date, relativeTo: Date())
+        // Under a minute reads "in 0 sec." / "0 sec. ago" from the formatter.
+        if now.timeIntervalSince(date) < 60 { return "Just now" }
+        return f.localizedString(for: date, relativeTo: now)
     }
 
     private var batteryIcon: String {

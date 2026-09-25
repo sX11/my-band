@@ -46,6 +46,10 @@ final class BackgroundSyncManager {
     /// The in-flight sync, shared by every concurrent caller so duplicate triggers coalesce.
     private var inFlight: Task<BandSyncer.HealthSyncOutcome, Error>?
 
+    /// Whether the in-flight sync may reconnect and retry. Any coalesced caller that can't afford the
+    /// extra time (an app-refresh task, an intent) turns it off for the shared run.
+    private var staleLinkRetryAllowed = true
+
     /// The sync each live BGTask is running; an entry leaves the moment its task is completed.
     private var backgroundRuns: [ObjectIdentifier: Task<Void, Never>] = [:]
     /// Tasks whose expiry beat `handle` to the main actor, so `handle` knows not to start them.
@@ -133,7 +137,7 @@ final class BackgroundSyncManager {
         // Expired before the main actor got to it — expire(_:) has already completed it.
         if expiredBeforeStart.remove(key) != nil { return }
 
-        log.notice("Background task started: \(task.identifier)")
+        log.notice("Background task started: \(task.identifier, privacy: .public)")
         // Always queue the next run first, so a failure here doesn't break the chain.
         scheduleNext()
 
@@ -147,7 +151,7 @@ final class BackgroundSyncManager {
             } catch is CancellationError {
                 finish(task, success: false)
             } catch {
-                log.error("Background sync failed: \(error.localizedDescription)")
+                log.error("Background sync failed: \(error.localizedDescription, privacy: .public)")
                 finish(task, success: false)
             }
         }
@@ -184,17 +188,17 @@ final class BackgroundSyncManager {
     func syncNow(disconnectWhenDone: Bool? = nil, retryStaleLink: Bool = true) async throws -> BandSyncer.HealthSyncOutcome {
         if let inFlight {
             log.debug("Sync already in flight — coalescing")
+            staleLinkRetryAllowed = staleLinkRetryAllowed && retryStaleLink
             return try await inFlight.value
         }
-        let task = Task { @MainActor in
-            try await self.performSync(disconnectWhenDone: disconnectWhenDone, retryStaleLink: retryStaleLink)
-        }
+        staleLinkRetryAllowed = retryStaleLink
+        let task = Task { @MainActor in try await self.performSync(disconnectWhenDone: disconnectWhenDone) }
         inFlight = task
         defer { inFlight = nil }
         return try await task.value
     }
 
-    private func performSync(disconnectWhenDone: Bool?, retryStaleLink: Bool) async throws -> BandSyncer.HealthSyncOutcome {
+    private func performSync(disconnectWhenDone: Bool?) async throws -> BandSyncer.HealthSyncOutcome {
         // On a cold launch triggered by a task, the UI .onAppear may not have wired deps yet.
         try await awaitDependencies()
         guard let manager, let syncer, let id = syncer.currentDevice?.peripheralIdentifier else {
@@ -211,8 +215,8 @@ final class BackgroundSyncManager {
         // could never wake us again. BandManager re-arms a standing connect on the resulting drop.
         defer { if shouldDisconnect { manager.disconnect(userInitiated: false) } }
         do {
-            return try await syncer.syncToHealth()
-        } catch SyncError.timeout where wasConnected && retryStaleLink {
+            return try await syncer.syncToHealth(stallEndsSync: wasConnected && staleLinkRetryAllowed)
+        } catch SyncError.timeout where wasConnected && staleLinkRetryAllowed {
             // A long-held link can look connected while the band ignores every command (its session
             // moved on without us). A fresh connection re-derives the keys; retry once on it.
             log.error("Sync timed out on a link that was already up — reconnecting for a fresh session and retrying")
@@ -248,7 +252,7 @@ final class BackgroundSyncManager {
                 let outcome = try await syncNow(disconnectWhenDone: false)
                 log.notice("Background-wake sync done — \(outcome.healthSamplesWritten) samples")
             } catch {
-                log.error("Background-wake sync failed: \(error.localizedDescription)")
+                log.error("Background-wake sync failed: \(error.localizedDescription, privacy: .public)")
             }
         }
     }

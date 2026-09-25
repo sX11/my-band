@@ -45,6 +45,7 @@ final class DataUploadService {
     }
 
     private func handleCommand(_ cmd: Xiaomi_Command) {
+        log.info("Upload command from band: subtype=\(cmd.subtype) hasAck=\(cmd.dataUpload.hasDataUploadAck)")
         guard cmd.subtype == XiaomiDataUploadCmd.uploadStart,
               cmd.hasDataUpload, cmd.dataUpload.hasDataUploadAck else { return }
         let ack = cmd.dataUpload.dataUploadAck
@@ -104,7 +105,7 @@ final class DataUploadService {
             await manager.sendDataChunk(chunk)
             // A link drop resumes the paced send without writing anything; stop rather than
             // "finishing" the upload into a dead link and reporting it installed.
-            guard manager.connectionState.isConnected else { throw UploadError.notConnected }
+            guard manager.isLinkUp else { throw UploadError.notConnected }
             onProgress(Double(i + 1) / Double(totalParts))
         }
         log.info("Upload finished — \(totalParts) part(s) sent")

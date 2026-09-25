@@ -43,7 +43,7 @@ struct GetSleepStateIntent: AppIntent {
         // staleness this intent exists to avoid.
         var syncFailed = false
         do {
-            _ = try await BackgroundSyncManager.shared.syncNow()
+            _ = try await BackgroundSyncManager.shared.syncNow(retryStaleLink: false)
         } catch {
             syncFailed = true
             Self.log.error("Sync do intent de sono falhou: \(error.localizedDescription)")

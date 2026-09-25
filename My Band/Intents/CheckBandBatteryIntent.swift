@@ -58,7 +58,7 @@ struct CheckBandBatteryIntent: AppIntent {
         // Best-effort: se a pulseira estiver fora de alcance, ainda respondemos com o último nível
         // conhecido em vez de falhar o atalho (e, portanto, a automação inteira).
         do {
-            _ = try await BackgroundSyncManager.shared.syncNow(disconnectWhenDone: false)
+            _ = try await BackgroundSyncManager.shared.syncNow(disconnectWhenDone: false, retryStaleLink: false)
         } catch {
             Self.log.error("Sync do intent de bateria falhou: \(error.localizedDescription)")
         }
