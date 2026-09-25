@@ -149,6 +149,35 @@ enum XiaomiProto {
         return (try? cmd.serializedData()) ?? Data()
     }
 
+    // MARK: - Alarm (schedule) command builders — GadgetBridge XiaomiScheduleService
+
+    static func alarmsGetCommand() -> Data {
+        command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmsGet) { _ in }
+    }
+
+    static func alarmCreateCommand(_ details: Xiaomi_AlarmDetails) -> Data {
+        command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmCreate) {
+            $0.schedule.createAlarm = details
+        }
+    }
+
+    static func alarmEditCommand(id: UInt32, _ details: Xiaomi_AlarmDetails) -> Data {
+        var alarm = Xiaomi_Alarm()
+        alarm.id = id
+        alarm.alarmDetails = details
+        return command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmEdit) {
+            $0.schedule.editAlarm = alarm
+        }
+    }
+
+    static func alarmDeleteCommand(ids: [UInt32]) -> Data {
+        var del = Xiaomi_AlarmDelete()
+        del.id = ids
+        return command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmDelete) {
+            $0.schedule.deleteAlarm = del
+        }
+    }
+
     // MARK: - Reminder (schedule) command builders
 
     /// CMD_REMINDERS_CREATE — adds one reminder. `repeatMode` 0=once; `repeatFlags` 64 = unset.
