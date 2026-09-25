@@ -262,9 +262,7 @@ final class BandSyncer {
     }
 
     @discardableResult
-    /// `stallEndsSync`: a file fetch that times out before anything has arrived throws
-    /// `SyncError.timeout` instead of being skipped, so a caller that can reconnect gets the chance.
-    func syncToHealth(stallEndsSync: Bool = false) async throws -> HealthSyncOutcome {
+    func syncToHealth() async throws -> HealthSyncOutcome {
         // Re-entrancy guard. The guard + flag set run synchronously before the first await, so the
         // @MainActor serialises overlapping triggers (manual button, BGTask, background-wake) into
         // a single run — the rest see the flag and bail.
@@ -294,8 +292,7 @@ final class BandSyncer {
         let fileIds = try await fetchFileIds(manager: manager)
         log.info("Received \(fileIds.count) file ID(s)")
 
-        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context,
-                                                     stallEndsSync: stallEndsSync)
+        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context)
         markSynced(context)
 
         log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
@@ -412,8 +409,7 @@ final class BandSyncer {
 
     private func processActivityFiles(_ fileIds: [Data],
                                       manager: BandManager,
-                                      context: ModelContext,
-                                      stallEndsSync: Bool = false) async throws -> HealthSyncOutcome {
+                                      context: ModelContext) async throws -> HealthSyncOutcome {
         var outcome = HealthSyncOutcome()
         var sleepToWrite: [SleepSession] = []
         var sleepVitals: [ActivityMinuteSample] = []
@@ -529,9 +525,6 @@ final class BandSyncer {
                     }
                     delivered = (id, data)
                 } catch {
-                    // A first fetch that stalls with nothing delivered is the band ignoring this
-                    // session; bail now rather than idling out every file. Nothing was routed yet.
-                    if stallEndsSync, handled.isEmpty, case SyncError.timeout = error { throw error }
                     log.error("Failed file \(fileId.hexString): \(error.localizedDescription)")
                     break
                 }

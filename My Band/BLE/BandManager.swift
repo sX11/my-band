@@ -362,10 +362,6 @@ final class BandManager: NSObject {
         // continuation resumed by handleAuthSuccess() or failAuth()
     }
 
-    /// `userInitiated` (forget / explicit "disconnect") clears autoReconnect so we stop chasing the
-    /// band. Background teardown (post-sync, BGTask expiry) passes `false`: the active link is
-    /// released to free the radio, but autoReconnect stays on, so didDisconnectPeripheral re-arms a
-    /// standing connect and iOS brings the link back (and wakes us) when the band is in range.
     /// A connect already under way (e.g. the standing reconnect armed by a drop). Calling connect
     /// again on top of it can re-fire didConnect and run a second authenticate() under the first.
     private var isConnectInProgress: Bool {
@@ -376,6 +372,10 @@ final class BandManager: NSObject {
     /// re-authenticates over a link that stays connected.
     var isLinkUp: Bool { cmdWriteChar != nil && peripheral?.state == .connected }
 
+    /// `userInitiated` (forget / explicit "disconnect") clears autoReconnect so we stop chasing the
+    /// band. Background teardown (post-sync, BGTask expiry) passes `false`: the active link is
+    /// released to free the radio, but autoReconnect stays on, so didDisconnectPeripheral re-arms a
+    /// standing connect and iOS brings the link back (and wakes us) when the band is in range.
     func disconnect(userInitiated: Bool = true) {
         if userInitiated { autoReconnect = false }
         reconnectTask?.cancel()

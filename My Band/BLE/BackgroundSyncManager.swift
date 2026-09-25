@@ -215,7 +215,7 @@ final class BackgroundSyncManager {
         // could never wake us again. BandManager re-arms a standing connect on the resulting drop.
         defer { if shouldDisconnect { manager.disconnect(userInitiated: false) } }
         do {
-            return try await syncer.syncToHealth(stallEndsSync: wasConnected && staleLinkRetryAllowed)
+            return try await syncer.syncToHealth()
         } catch SyncError.timeout where wasConnected && staleLinkRetryAllowed {
             // A long-held link can look connected while the band ignores every command (its session
             // moved on without us). A fresh connection re-derives the keys; retry once on it.
@@ -249,7 +249,9 @@ final class BackgroundSyncManager {
                 // Keep the link up (disconnectWhenDone: false): the band just reached us, so holding
                 // the connection is what gives constant background communication (push events: find
                 // phone, workout, weather). A later drop re-arms a standing connect on its own.
-                let outcome = try await syncNow(disconnectWhenDone: false)
+                                // No stale-link retry: a background wake holds only a short assertion, and the link
+                // just authenticated, so it is not the long-held link the retry is for.
+                let outcome = try await syncNow(disconnectWhenDone: false, retryStaleLink: false)
                 log.notice("Background-wake sync done — \(outcome.healthSamplesWritten) samples")
             } catch {
                 log.error("Background-wake sync failed: \(error.localizedDescription, privacy: .public)")
