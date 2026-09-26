@@ -123,6 +123,7 @@ final class BandSyncer {
     private(set) var lastError: Error?
     private(set) var currentDevice: BandDevice?
     var latestMetrics: LatestMetricsStore?
+    var syncLog: HealthSyncLog?
 
     private weak var bandManager: BandManager?
     private var modelContext: ModelContext?
@@ -340,7 +341,8 @@ final class BandSyncer {
         }
 
         log.info("Targeted workout sync — \(fileIds.count) file(s)")
-        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context)
+        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context,
+                                                     addingToLastReport: true)
         markSynced(context)
         log.info("Targeted workout sync done — \(outcome.healthSamplesWritten) samples written")
         return outcome
@@ -410,8 +412,22 @@ final class BandSyncer {
 
     private func processActivityFiles(_ fileIds: [Data],
                                       manager: BandManager,
-                                      context: ModelContext) async throws -> HealthSyncOutcome {
+                                      context: ModelContext,
+                                      addingToLastReport: Bool = false) async throws -> HealthSyncOutcome {
         var outcome = HealthSyncOutcome()
+        var handled = Set<Data>()
+        var completed = false
+        HealthKitManager.shared.beginTally()
+        // On every exit, so a write that throws still reports what reached Apple Health before it.
+        defer {
+            syncLog?.record(HealthSyncReport(
+                at: .now, failed: !completed, filesFetched: handled.count,
+                filesFailed: fileIds.filter { !handled.contains($0) }.count,
+                sleepSessions: outcome.sleepSessions, dailySummaries: outcome.dailySummaries,
+                minuteSamples: outcome.minuteSamples, manualSamples: outcome.manualSamples,
+                workouts: outcome.workouts, byType: HealthKitManager.shared.endTally()),
+                addingToLast: addingToLastReport)
+        }
         var sleepToWrite: [SleepSession] = []
         var sleepVitals: [ActivityMinuteSample] = []
         var manualToWrite: [ManualSample] = []
@@ -522,7 +538,6 @@ final class BandSyncer {
         // any other, then ACKed at once to unstick the band. It used to be ACKed unread, silently
         // discarding whatever it held — a night's sleep file, the largest, is the likeliest one to be
         // caught mid-stream. The early ACK's only exposure is a batch write failing later in this sync.
-        var handled = Set<Data>()
         for fileId in fileIds where !handled.contains(fileId) {
             for _ in 0 ..< 3 {
                 let delivered: (id: Data, data: Data)
@@ -603,6 +618,7 @@ final class BandSyncer {
         }
         ackUnlessSkipped(detailIds, "daily detail", manager: manager)
 
+        completed = true
         return outcome
     }
 

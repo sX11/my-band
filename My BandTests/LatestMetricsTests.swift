@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import SwiftData
 @testable import My_Band
 
 @MainActor
@@ -56,6 +57,41 @@ struct LatestMetricsTests {
         #expect(LatestMetricsStore(defaults: defaults).metrics.stress?.value == 30)
         store.reset()
         #expect(LatestMetricsStore(defaults: defaults).metrics.isEmpty)
+    }
+
+    @Test func lastNightMergesOverlappingSessionsWithoutDoubleCounting() throws {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        func phase(_ from: Int, _ to: Int, _ type: SleepPhaseType) -> SleepPhase {
+            SleepPhase(startDate: t0.addingTimeInterval(Double(from) * 60), endDate: t0.addingTimeInterval(Double(to) * 60), type: type)
+        }
+        let early = SleepSession(startDate: t0, endDate: t0.addingTimeInterval(180 * 60),
+                                 phases: [phase(0, 120, .light), phase(120, 180, .deep)])
+        let resync = SleepSession(startDate: t0, endDate: t0.addingTimeInterval(300 * 60),
+                                  phases: [phase(0, 120, .light), phase(120, 180, .deep), phase(180, 300, .rem)])
+        let night = try #require(LatestMetricsView.lastNight([resync, early]))
+        #expect(night.asleep == 300 * 60)
+        #expect(night.duration(.deep) == 60 * 60)
+        #expect(night.end == t0.addingTimeInterval(300 * 60))
+    }
+
+    @Test func sleepFetchReturnsOnlyThePairedBandsSessions() throws {
+        let container = try ModelContainer(for: BandDevice.self, SleepSession.self, ActivityDay.self,
+                                           configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+        let context = container.mainContext
+        let paired = BandDevice(name: "new", peripheralIdentifier: "a")
+        let forgotten = BandDevice(name: "old", peripheralIdentifier: "b")
+        context.insert(paired)
+        context.insert(forgotten)
+        let mine = SleepSession(startDate: .now.addingTimeInterval(-9 * 3600), endDate: .now.addingTimeInterval(-2 * 3600), phases: [])
+        let theirs = SleepSession(startDate: .now.addingTimeInterval(-8 * 3600), endDate: .now.addingTimeInterval(-1 * 3600), phases: [])
+        context.insert(mine)
+        context.insert(theirs)
+        mine.device = paired
+        theirs.device = forgotten
+        try context.save()
+        let fetched = try context.fetch(LatestMetricsView.sleepDescriptor(deviceID: paired.id))
+        #expect(fetched.map(\.id) == [mine.id])
+        #expect(try context.fetch(LatestMetricsView.sleepDescriptor(deviceID: nil)).isEmpty)
     }
 
     @Test func standingDetailMergesRuns() {

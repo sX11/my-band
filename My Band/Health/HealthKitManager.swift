@@ -515,6 +515,9 @@ final class HealthKitManager {
             try await builder.endCollection(at: workoutEnd)
             guard let workout = try await builder.finishWorkout() else { continue }
             written += 1
+            // Only now are the builder's samples in Apple Health.
+            count(samples)
+            count(workoutType)
             saved[key] = workout
 
             // VO₂max is a standalone sample (not a workout statistic). The test-type metadata tells
@@ -643,6 +646,7 @@ final class HealthKitManager {
         let routeBuilder = HKWorkoutRouteBuilder(healthStore: store, device: .local())
         try await routeBuilder.insertRouteData(locations)
         _ = try await routeBuilder.finishRoute(with: workout, metadata: nil)
+        count(routeType)
     }
 
     // MARK: - Workout type mapping
@@ -817,14 +821,14 @@ final class HealthKitManager {
             let bmi = kg / (m * m)
             samples.append(quantity(bodyMassIndex, .count(), bmi, start: date, end: date, id: "mb-bmi-\(key)"))
         }
-        return try await save(samples)
+        return try await save(samples, tallied: false)
     }
 
     /// Writes the user's height (entered in the app's profile) so Apple Health has it and BMI derives.
     @discardableResult
     func writeHeight(meters: Double, date: Date = Date()) async throws -> Int {
         guard (0.5...2.6).contains(meters) else { return 0 }
-        return try await save([quantity(height, .meter(), meters, start: date, end: date, id: "mb-height")])
+        return try await save([quantity(height, .meter(), meters, start: date, end: date, id: "mb-height")], tallied: false)
     }
 
     /// Most recent height sample from Apple Health, in metres, or nil if none/denied.
@@ -872,11 +876,35 @@ final class HealthKitManager {
     }
 
     @discardableResult
-    private func save(_ samples: [HKSample]) async throws -> Int {
+    /// `tallied: false` for the scale and profile, whose writes can land mid-sync but aren't the band's.
+    private func save(_ samples: [HKSample], tallied: Bool = true) async throws -> Int {
         let allowed = shareable(samples)
         guard !allowed.isEmpty else { return 0 }
         try await store.save(allowed)
+        if tallied { count(allowed) }
         return allowed.count
+    }
+
+    // MARK: - Per-type tally for the sync report
+
+    private var tally: [String: Int]?
+
+    /// Counts what is written from here to `endTally`, per HealthKit type.
+    func beginTally() { tally = [:] }
+
+    func endTally() -> [String: Int] {
+        defer { tally = nil }
+        return tally ?? [:]
+    }
+
+    private func count(_ samples: [HKSample]) {
+        guard tally != nil else { return }
+        for s in samples { tally?[s.sampleType.identifier, default: 0] += 1 }
+    }
+
+    private func count(_ type: HKSampleType) {
+        guard tally != nil else { return }
+        tally?[type.identifier, default: 0] += 1
     }
 
     /// Set when a write dropped samples for permission. BandSyncer takes it after each write group
