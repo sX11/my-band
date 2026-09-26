@@ -10,6 +10,7 @@ struct DashboardView: View {
     @Environment(BandManager.self) private var band
     @Environment(BandSyncer.self) private var syncer
     @Environment(AlarmService.self) private var alarms
+    @Environment(BandSettingsService.self) private var settings
     var onForget: () -> Void
 
     @State private var syncing = false
@@ -18,6 +19,7 @@ struct DashboardView: View {
     @State private var showCustomize = false
     @State private var showProfile = false
     @State private var showAlarms = false
+    @State private var showSettings = false
 
     private var connected: Bool { band.connectionState.isConnected }
     /// Mid-handshake (or scanning) — a reconnect is already under way, so the button waits.
@@ -58,7 +60,12 @@ struct DashboardView: View {
         .sheet(isPresented: $showCustomize) { CustomizeView() }
         .sheet(isPresented: $showProfile) { ProfileView() }
         .sheet(isPresented: $showAlarms) { AlarmsView() }
-        .task(id: connected) { if connected { alarms.requestList() } }
+        .sheet(isPresented: $showSettings) { BandSettingsView() }
+        .task(id: connected) {
+            guard connected else { return }
+            alarms.requestList()
+            settings.requestAll()
+        }
     }
 
     // MARK: Header
@@ -88,6 +95,7 @@ struct DashboardView: View {
             VStack(spacing: MB.Space.x3) {
                 metricTiles(now: context.date)
                 alarmTile(now: context.date)
+                settingsTile
             }
         }
     }
@@ -103,6 +111,28 @@ struct DashboardView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+    private var settingsTile: some View {
+        Button { showSettings = true } label: {
+            MBMetricTile(
+                icon: "gearshape.fill", tint: MB.accent, tintSoft: MB.accentSoft,
+                label: "Band settings",
+                value: settings.heartRate != nil ? BandSettingsView.intervalLabel(settings.heartRateInterval) : "—",
+                unit: settings.heartRate != nil ? "heart rate" : nil,
+                foot: settingsFoot
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var settingsFoot: String {
+        guard settings.loaded else { return connected ? "Loading…" : "Connect the band to see settings" }
+        var parts: [String] = []
+        if settings.spo2 != nil { parts.append(settings.spo2AllDay ? "SpO₂ all-day" : "SpO₂ off") }
+        if let stress = settings.stress { parts.append(stress.allDayTracking ? "Stress on" : "Stress off") }
+        if let r = settings.standingReminder, r.enabled { parts.append("Stand-up reminder") }
+        return parts.joined(separator: " · ")
     }
 
     private func alarmFoot(_ next: (alarm: AlarmService.Alarm, fires: Date)?, now: Date) -> String {

@@ -260,6 +260,8 @@ final class BandManager: NSObject {
     var onWatchfaceCommand:      ((Xiaomi_Command) -> Void)?
     /// Alarm list / create / edit / delete responses (schedule type, alarm subtypes).
     var onAlarmCommand:          ((Xiaomi_Command) -> Void)?
+    /// Band settings replies: health CMD_CONFIG_* and the notification screen-on setting.
+    var onSettingsCommand:       ((Xiaomi_Command) -> Void)?
     /// Called for every Rpk/app command (type=20) from the band — AppInstallService handles it.
     var onRpkCommand:            ((Xiaomi_Command) -> Void)?
     /// Called for every DataUpload command (type=22) from the band — DataUploadService handles it.
@@ -787,6 +789,9 @@ final class BandManager: NSObject {
             handleHealthCommand(subtype: cmd.subtype, cmd: cmd, protoBytes: protoBytes)
         case XiaomiWeatherCmd.cmdType:
             handleWeatherCommand(cmd)
+        case XiaomiNotificationCmd.cmdType where [XiaomiNotificationCmd.screenOnGet,
+                                                  XiaomiNotificationCmd.screenOnSet].contains(cmd.subtype):
+            onSettingsCommand?(cmd)
         case XiaomiWatchfaceCmd.cmdType:
             onWatchfaceCommand?(cmd)
         case XiaomiRpkCmd.cmdType:
@@ -895,6 +900,9 @@ final class BandManager: NSObject {
         case XiaomiHealthCmd.realtimeEvent where cmd.hasHealth && cmd.health.hasRealTimeStats:
             let stats = cmd.health.realTimeStats
             if stats.hasHeartRate, stats.heartRate > 0 { onRealtimeStats?(Int(stats.heartRate)) }
+        case XiaomiHealthCmd.spo2Get ... XiaomiHealthCmd.stressSet,
+             XiaomiHealthCmd.goalNotificationGet, XiaomiHealthCmd.goalNotificationSet:
+            onSettingsCommand?(cmd)
         default:
             // All other health subtypes (activity fetch responses etc.) go to BandSyncer.
             onProtoCommandReceived?(protoBytes)

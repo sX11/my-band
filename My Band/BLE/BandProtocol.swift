@@ -270,6 +270,18 @@ enum XiaomiHealthCmd {
     static let fetchRequest:     UInt32 = 3   // CMD_ACTIVITY_FETCH_REQUEST (per file ID)
     static let fetchAck:         UInt32 = 5   // CMD_ACTIVITY_FETCH_ACK
 
+    // Band settings, each a GET/SET pair (GadgetBridge XiaomiHealthService CMD_CONFIG_*)
+    static let spo2Get:              UInt32 = 8
+    static let spo2Set:              UInt32 = 9
+    static let heartRateGet:         UInt32 = 10
+    static let heartRateSet:         UInt32 = 11
+    static let standingReminderGet:  UInt32 = 12
+    static let standingReminderSet:  UInt32 = 13
+    static let stressGet:            UInt32 = 14
+    static let stressSet:            UInt32 = 15
+    static let goalNotificationGet:  UInt32 = 21
+    static let goalNotificationSet:  UInt32 = 22
+
     // Workout / GPS commands (GadgetBridge XiaomiHealthService)
     static let workoutStatus:    UInt32 = 26  // CMD_WORKOUT_WATCH_STATUS  (band → app)
     static let workoutOpen:      UInt32 = 30  // CMD_WORKOUT_WATCH_OPEN    (band → app request / app → band reply)
@@ -279,6 +291,14 @@ enum XiaomiHealthCmd {
     static let realtimeStart:    UInt32 = 45  // CMD_REALTIME_STATS_START  (app → band)
     static let realtimeStop:     UInt32 = 46  // CMD_REALTIME_STATS_STOP   (app → band)
     static let realtimeEvent:    UInt32 = 47  // CMD_REALTIME_STATS_EVENT  (band → app: RealTimeStats)
+}
+
+// MARK: - Notification command IDs (GadgetBridge XiaomiNotificationService, type=7)
+
+enum XiaomiNotificationCmd {
+    static let cmdType:            UInt32 = 7
+    static let screenOnGet:        UInt32 = 6   // CMD_SCREEN_ON_ON_NOTIFICATIONS_GET
+    static let screenOnSet:        UInt32 = 7   // CMD_SCREEN_ON_ON_NOTIFICATIONS_SET
 }
 
 // MARK: - Watch face command IDs (GadgetBridge XiaomiWatchfaceService, type=4)
