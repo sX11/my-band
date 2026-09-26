@@ -1,6 +1,6 @@
 # CLAUDE.md — My Band
 
-Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Os dados de saúde ficam no Apple Health; a única exceção é o card Today da Dashboard, com os contadores ao vivo da pulseira, sem armazenar nada (ADR 0005).
+Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Os dados de saúde ficam no Apple Health; as exceções são o card Today da Dashboard, com os contadores ao vivo da pulseira (ADR 0005), e a folha Health, com o último valor de cada leitura vindo do último sync (ADR 0006).
 
 ---
 
@@ -13,7 +13,7 @@ Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS unive
 | UI | SwiftUI, Liquid Glass no chrome/status (`MBStatusPill` etc.) |
 | Persistência | SwiftData |
 | Bluetooth | CoreBluetooth (BLE apenas — Mi Band 10 não usa Classic BT) |
-| Saúde | HealthKit — única superfície de dados armazenados; a Dashboard mostra só os contadores ao vivo do dia (ADR 0005) |
+| Saúde | HealthKit — única superfície de dados armazenados; a Dashboard mostra os contadores ao vivo do dia (ADR 0005) e o último valor de cada leitura do último sync (ADR 0006) |
 | Automação | App Intents + Shortcuts |
 | Distribuição | Uso pessoal — sideload via Apple Developer Program pessoal (sem App Store) |
 
@@ -68,6 +68,7 @@ My Band/
 │   ├── BandDevice.swift          # SwiftData model do dispositivo pareado
 │   ├── SleepSession.swift        # SwiftData model de sessão de sono
 │   ├── ActivityDay.swift         # SwiftData model de atividade diária
+│   ├── LatestMetrics.swift       # Snapshot do último valor de cada leitura, para a folha Health (ADR 0006)
 │   └── HeartRateSample.swift     # SwiftData model de amostras de HR
 │
 └── UI/
@@ -397,7 +398,7 @@ NSHealthShareUsageDescription
 
 A UI é construída a partir do handoff do **Claude Design** (`My Band — Design System`, bundle exportado de claude.ai/design). Recriar fielmente em SwiftUI — copiar o **resultado visual**, não a estrutura HTML/JSX dos protótipos.
 
-> **O Apple Health é a superfície de dados de saúde** (ADR 0005, que substitui o 0001). A Dashboard mostra estado de conexão, frescor do sync, bateria, alarmes, configurações da pulseira e o card Today — passos, kcal, horas em pé e FC, lidos uma vez do realtime stats da pulseira e nunca armazenados. Sem histórico, sem gráficos, e não existe (nem está planejada) uma tela `SleepDetail`/hipnograma; sono continua com o Apple Health e o Atalho `GetSleepStateIntent`.
+> **O Apple Health é a superfície de dados de saúde** (ADR 0005, que substitui o 0001). A Dashboard mostra estado de conexão, frescor do sync, bateria, alarmes, configurações da pulseira e o card Today — passos, kcal e FC lidos uma vez do realtime stats da pulseira e nunca armazenados; horas em pé vêm do resumo diário do último sync. O card Latest metrics abre a folha Health com o último valor de cada leitura (FC, SpO₂, estresse, temperatura, resumo do dia, última noite, peso), guardado como um único snapshot sobrescrito (ADR 0006). Sem histórico, sem gráficos, e não existe (nem está planejada) uma tela `SleepDetail`/hipnograma; sono continua com o Apple Health e o Atalho `GetSleepStateIntent`.
 
 **Princípios fixos do maker:**
 1. **Dark-mode first** — "gosto de modo noturno".
@@ -414,9 +415,9 @@ A UI é construída a partir do handoff do **Claude Design** (`My Band — Desig
 - **Cantos** contínuos: cards 16, sheets 20, hero/modal 28, pills redondos. **4-pt grid**, gutter 20, hit target ≥44.
 - **Ícones**: SF Symbols (kit web usa Lucide como substituto). Status sempre cor + símbolo, nunca cor sozinha.
 
-**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Métrica de saúde só no card Today (contadores ao vivo do dia, ADR 0005); fora dele o número é sempre de status/sync. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
+**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Métrica de saúde só no card Today (ADR 0005) e no card/folha Latest metrics (ADR 0006); fora dele o número é sempre de status/sync. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
 
-**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar, alarmes, configurações da pulseira e o card Today — ADR 0005), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
+**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar, alarmes, configurações da pulseira, o card Today — ADR 0005 — e a folha Health — ADR 0006), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
 
 **Componentes do kit** (`components/`): core (`Button`, `IconButton`, `StatusPill`, `Badge`), forms (`Switch`, `TextField`, `SegmentedControl`), data (`ListRow`, `Card`, `MetricTile`, `SectionHeader`, `SleepBar`). Cada um tem `.prompt.md` e `.d.ts` descrevendo props/variantes.
 
@@ -478,7 +479,7 @@ Versão atual: **1.2.0** — ver `CHANGELOG.md` para o histórico completo. Pró
 4. O `GetSleepStateIntent`.
 5. O `CheckBandBatteryIntent` — em especial o `CMD_BATTERY` sob demanda fora do init pós-auth (a resposta chega no mesmo `handleSystemCommand`, mas nunca foi exercitada com o link já aberto há tempo). E se a Mi Band 10 expõe o Battery Service `0x180F` a apps (a linha `Services:` do log da conexão responde), se a `2A19` lê sem erro pós-auth e se o número bate com o widget Baterias — o log imprime os dois (`via GATT 2A19` / `via protobuf — keeping GATT`).
 
-Home Assistant foi cortado do roadmap; UI segue sem histórico nem gráficos de saúde por decisão (ADR 0005, que substitui o 0001).
+Home Assistant foi cortado do roadmap; UI segue sem histórico nem gráficos de saúde por decisão (ADR 0005, que substitui o 0001, e ADR 0006).
 
 ---
 

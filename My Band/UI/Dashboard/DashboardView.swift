@@ -3,7 +3,8 @@ import SwiftUI
 // MARK: - DashboardView
 //
 // Live band status, battery, last Apple Health sync and the sync action, the band's alarms and
-// settings, and today's activity read live from the band (ADR 0005 — nothing here is stored).
+// settings, today's activity read live from the band (ADR 0005), and the latest health readings
+// from the last sync (ADR 0006).
 
 struct DashboardView: View {
 
@@ -12,6 +13,7 @@ struct DashboardView: View {
     @Environment(AlarmService.self) private var alarms
     @Environment(BandSettingsService.self) private var settings
     @Environment(TodayActivityService.self) private var today
+    @Environment(LatestMetricsStore.self) private var latest
     @Environment(\.scenePhase) private var scenePhase
     var onForget: () -> Void
 
@@ -22,6 +24,7 @@ struct DashboardView: View {
     @State private var showProfile = false
     @State private var showAlarms = false
     @State private var showSettings = false
+    @State private var showMetrics = false
 
     private var connected: Bool { band.connectionState.isConnected }
     /// Mid-handshake (or scanning) — a reconnect is already under way, so the button waits.
@@ -67,6 +70,7 @@ struct DashboardView: View {
         .sheet(isPresented: $showProfile) { ProfileView() }
         .sheet(isPresented: $showAlarms) { AlarmsView() }
         .sheet(isPresented: $showSettings) { BandSettingsView() }
+        .sheet(isPresented: $showMetrics) { LatestMetricsView() }
         .task(id: connected) {
             guard connected else { return }
             alarms.requestList()
@@ -117,6 +121,7 @@ struct DashboardView: View {
                     todayTile(now: context.date)
                 }
                 .fixedSize(horizontal: false, vertical: true)
+                metricsTile(now: context.date)
                 settingsTile
             }
         }
@@ -159,7 +164,7 @@ struct DashboardView: View {
         var lines: [String] = []
         var totals: [String] = []
         if let kcal = today.calories { totals.append("\(kcal) kcal") }
-        if let hours = today.standingHours { totals.append("stood \(hours) h") }
+        if let hours = stoodToday(now: now) { totals.append("stood \(hours) h") }
         if !totals.isEmpty { lines.append(totals.joined(separator: " · ")) }
         if let bpm = today.heartRate {
             lines.append("HR \(bpm) bpm")
@@ -170,6 +175,37 @@ struct DashboardView: View {
             lines.append("as of \(at.formatted(date: .omitted, time: .shortened))")
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// From the last synced daily summary: the realtime stream's own stand field reads 0 on a Band 10.
+    private func stoodToday(now: Date) -> Int? {
+        guard let day = latest.metrics.summaryDay, Calendar.current.isDate(day, inSameDayAs: now) else { return nil }
+        return latest.metrics.standingHours
+    }
+
+    private func metricsTile(now: Date) -> some View {
+        let m = latest.metrics
+        return Button { showMetrics = true } label: {
+            MBMetricTile(
+                icon: "waveform.path.ecg", tint: MB.hr, tintSoft: MB.hrSoft,
+                label: "Latest metrics",
+                value: m.heartRate.map { String(Int($0.value)) } ?? "—",
+                unit: m.heartRate != nil ? "bpm" : nil,
+                foot: metricsFoot(m, now: now)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func metricsFoot(_ m: LatestMetrics, now: Date) -> String {
+        guard !m.isEmpty else { return "Sync to see the latest readings" }
+        var parts: [String] = []
+        if let r = m.spo2 { parts.append("SpO₂ \(Int(r.value))%") }
+        if let r = m.stress { parts.append("stress \(Int(r.value))") }
+        if let v = m.restingHR { parts.append("resting \(v) bpm") }
+        var lines = [parts.joined(separator: " · ")]
+        if let at = m.heartRate?.at { lines.append("HR \(at.formatted(date: .omitted, time: .shortened)) · tap for all") }
+        return lines.filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
     private var settingsTile: some View {

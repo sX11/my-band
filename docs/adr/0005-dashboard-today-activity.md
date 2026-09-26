@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: accepted, amended by 0006
 ---
 
 # The Dashboard shows today's activity; supersedes ADR 0001's no-data rule

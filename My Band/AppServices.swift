@@ -26,6 +26,7 @@ final class AppServices {
     let alarms        = AlarmService()
     let bandSettings  = BandSettingsService()
     let todayActivity = TodayActivityService()
+    let latestMetrics = LatestMetricsStore()
 
     private var didBootstrap = false
 
@@ -37,6 +38,7 @@ final class AppServices {
         guard !didBootstrap else { return }
         didBootstrap = true
 
+        bandSyncer.latestMetrics = latestMetrics
         bandSyncer.setup(manager: bandManager, context: container.mainContext)
         customization.setup(manager: bandManager)
         alarms.setup(manager: bandManager)
