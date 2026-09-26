@@ -2,7 +2,8 @@ import SwiftUI
 
 // MARK: - AlarmsView
 //
-// The band's alarms: switch one on or off, swipe to delete, add a new one. Every change goes
+// The band's alarms: switch one on or off, swipe left to delete, swipe right to switch smart
+// wake-up, add a new one. Every change goes
 // straight to the band and the list is re-read from it (see AlarmService).
 
 struct AlarmsView: View {
@@ -13,6 +14,7 @@ struct AlarmsView: View {
 
     @State private var newTime = Calendar.current.date(bySettingHour: 7, minute: 0, second: 0, of: .now) ?? .now
     @State private var newDays: UInt32 = 0
+    @State private var newSmart = false
 
     private var connected: Bool { band.connectionState.isConnected }
     private var atCapacity: Bool {
@@ -63,6 +65,11 @@ struct AlarmsView: View {
                         Button("Delete", role: .destructive) { alarms.delete(alarm) }
                             .disabled(!connected)
                     }
+                    .swipeActions(edge: .leading) {
+                        Button(alarm.smart ? "Normal" : "Smart") { alarms.setSmart(alarm, !alarm.smart) }
+                            .tint(MB.accent)
+                            .disabled(!connected)
+                    }
             }
         } header: {
             Text(capacityText)
@@ -103,10 +110,18 @@ struct AlarmsView: View {
             .frame(maxWidth: .infinity)
             Text(Self.repeatSummary(newDays))
                 .font(.mbFootnote).foregroundStyle(MB.textTertiary)
+            Toggle(isOn: $newSmart) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Smart wake-up").font(.mbSubhead).foregroundStyle(MB.textPrimary)
+                    Text("Wakes you in light sleep shortly before the set time")
+                        .font(.mbFootnote).foregroundStyle(MB.textTertiary)
+                }
+            }
+            .tint(MB.accent)
             MBButton(title: atCapacity ? "Band is full" : "Add alarm", variant: .primary, size: .lg,
                      icon: "plus", block: true, disabled: !connected || atCapacity) {
                 let c = Calendar.current.dateComponents([.hour, .minute], from: newTime)
-                alarms.add(hour: c.hour ?? 7, minute: c.minute ?? 0, repeatDays: newDays)
+                alarms.add(hour: c.hour ?? 7, minute: c.minute ?? 0, repeatDays: newDays, smart: newSmart)
             }
         }
         .listRowBackground(MB.surfaceCard)

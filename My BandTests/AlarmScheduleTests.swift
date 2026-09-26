@@ -44,4 +44,9 @@ struct AlarmScheduleTests {
         let fire = AlarmService.nextFire(of: alarm(7, 0, days: 0x1F), after: date("2026-09-25 13:00"), calendar: calendar)
         #expect(fire == date("2026-09-28 07:00"))
     }
+
+    @Test func smartAlarmEncodesAsSmart() {
+        #expect(AlarmService.details(hour: 7, minute: 0, repeatDays: 0, enabled: true, smart: true).smart == 1)
+        #expect(AlarmService.details(hour: 7, minute: 0, repeatDays: 0, enabled: true, smart: false).smart == 2)
+    }
 }

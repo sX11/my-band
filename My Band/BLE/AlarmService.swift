@@ -62,8 +62,8 @@ final class AlarmService {
         bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.alarmsGetCommand())
     }
 
-    func add(hour: Int, minute: Int, repeatDays: UInt32) {
-        let details = Self.details(hour: hour, minute: minute, repeatDays: repeatDays, enabled: true, smart: false)
+    func add(hour: Int, minute: Int, repeatDays: UInt32, smart: Bool) {
+        let details = Self.details(hour: hour, minute: minute, repeatDays: repeatDays, enabled: true, smart: smart)
         bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.alarmCreateCommand(details))
         // The band assigns the id; the list is re-read when its create ack arrives.
     }
@@ -72,6 +72,15 @@ final class AlarmService {
         guard let i = alarms.firstIndex(where: { $0.id == alarm.id }) else { return }
         alarms[i].enabled = enabled
         alarms[i].details.enabled = enabled
+        let a = alarms[i]
+        bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.alarmEditCommand(id: a.id, a.details))
+        requestList()
+    }
+
+    func setSmart(_ alarm: Alarm, _ smart: Bool) {
+        guard let i = alarms.firstIndex(where: { $0.id == alarm.id }) else { return }
+        alarms[i].smart = smart
+        alarms[i].details.smart = smart ? Self.smartOn : Self.smartOff
         let a = alarms[i]
         bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.alarmEditCommand(id: a.id, a.details))
         requestList()
@@ -137,7 +146,7 @@ final class AlarmService {
                      repeatDays: days, enabled: d.enabled, smart: d.smart == smartOn, details: d)
     }
 
-    private static func details(hour: Int, minute: Int, repeatDays: UInt32,
+    static func details(hour: Int, minute: Int, repeatDays: UInt32,
                                 enabled: Bool, smart: Bool) -> Xiaomi_AlarmDetails {
         var time = Xiaomi_HourMinute()
         time.hour = UInt32(hour)
