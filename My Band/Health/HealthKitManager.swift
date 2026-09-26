@@ -398,6 +398,14 @@ final class HealthKitManager {
         let weightKg = (try? await latestBodyMassKg()) ?? nil
         let estimatedMaxHR = estimatedMaxHeartRate()
 
+        guard canShare(workoutType) else {
+            if !workouts.isEmpty {
+                skippedForPermission = true
+                log.warning("Not allowed to write workouts — skipped \(workouts.count, privacy: .public)")
+            }
+            return (0, [:])
+        }
+
         for w in workouts {
             guard w.endDate > w.startDate else { continue }
             let key = Int(w.startDate.timeIntervalSince1970)
@@ -468,6 +476,7 @@ final class HealthKitManager {
                 }
                 log.info("Workout \(key): attaching \(attached) in-workout HR sample(s) to HKWorkout")
             }
+            samples = shareable(samples)
             if !samples.isEmpty {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                     builder.add(samples) { _, error in
@@ -630,7 +639,7 @@ final class HealthKitManager {
                     course: -1, speed: p.speed ?? -1, timestamp: p.date
                 )
             }
-        guard locations.count >= 2 else { return }
+        guard locations.count >= 2, canShare(routeType) else { return }
         let routeBuilder = HKWorkoutRouteBuilder(healthStore: store, device: .local())
         try await routeBuilder.insertRouteData(locations)
         _ = try await routeBuilder.finishRoute(with: workout, metadata: nil)
@@ -864,9 +873,35 @@ final class HealthKitManager {
 
     @discardableResult
     private func save(_ samples: [HKSample]) async throws -> Int {
-        guard !samples.isEmpty else { return 0 }
-        try await store.save(samples)
-        return samples.count
+        let allowed = shareable(samples)
+        guard !allowed.isEmpty else { return 0 }
+        try await store.save(allowed)
+        return allowed.count
+    }
+
+    /// Set when a write dropped samples for permission. BandSyncer takes it after each write group
+    /// and leaves those files un-ACKed: an ACK makes the band delete a file this app never wrote.
+    private var skippedForPermission = false
+
+    func takeSkippedForPermission() -> Bool {
+        defer { skippedForPermission = false }
+        return skippedForPermission
+    }
+
+    /// One type switched off in Health → Data Access fails the whole save with "Not authorized", so
+    /// samples of a type this app can't write are dropped (and named in the log) instead.
+    private func shareable(_ samples: [HKSample]) -> [HKSample] {
+        var denied: Set<String> = []
+        let allowed = samples.filter { sample in
+            if canShare(sample.sampleType) { return true }
+            denied.insert(sample.sampleType.identifier)
+            return false
+        }
+        if !denied.isEmpty {
+            skippedForPermission = true
+            log.warning("Not allowed to write \(denied.sorted().joined(separator: ", "), privacy: .public) — skipped")
+        }
+        return allowed
     }
 }
 

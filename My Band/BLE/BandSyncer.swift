@@ -484,9 +484,10 @@ final class BandSyncer {
                     if let summary = DailySummaryParser.parse(fileData, meta: meta) {
                         outcome.dailySummaries += 1
                         persistActivityDay(summary, context)
+                        _ = HealthKitManager.shared.takeSkippedForPermission()
                         outcome.healthSamplesWritten += try await HealthKitManager.shared.writeDailySummary(summary)
                     }
-                    sendAck(fileId: fileId, manager: manager)
+                    ackUnlessSkipped([fileId], "daily summary", manager: manager)
                 } else if meta.isDailyDetails {
                     // Batched (not written inline) so the reconciliation can exclude minutes covered
                     // by a workout — those file ids are only fully known after the loop.
@@ -541,6 +542,7 @@ final class BandSyncer {
         // skipping the manual/workout/daily-detail writes and every ACK after it — so a sleep write
         // that kept failing stalled the whole sync, every sync. Now only the sleep files stay
         // un-ACKed (the band re-offers them) and everything else goes through.
+        _ = HealthKitManager.shared.takeSkippedForPermission()
         do {
             if !sleepToWrite.isEmpty {
                 outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite)
@@ -551,7 +553,7 @@ final class BandSyncer {
                 outcome.minuteSamples += sleepVitals.count
             }
             // Sleep files ACK'd after both sessions and vitals are written.
-            sleepIds.forEach { sendAck(fileId: $0, manager: manager) }
+            ackUnlessSkipped(sleepIds, "sleep", manager: manager)
         } catch {
             log.error("Sleep write failed — \(sleepIds.count) sleep file(s) left un-ACKed for the next sync: \(error.localizedDescription)")
         }
@@ -561,11 +563,13 @@ final class BandSyncer {
         // ACKed, otherwise the band re-offers it forever and shows it as "not synced". The ACK runs
         // after the write so a thrown write skips it (the band then re-offers — no data loss). Only
         // files that fetched without throwing reach the *Ids arrays.
+        _ = HealthKitManager.shared.takeSkippedForPermission()
         if !manualToWrite.isEmpty {
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeManualSamples(manualToWrite)
         }
-        manualIds.forEach { sendAck(fileId: $0, manager: manager) }
+        ackUnlessSkipped(manualIds, "manual", manager: manager)
 
+        _ = HealthKitManager.shared.takeSkippedForPermission()
         if !workoutsToWrite.isEmpty {
             outcome.workouts = workoutsToWrite.count
             let result = try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes, heartRates: workoutHeartRates)
@@ -573,11 +577,12 @@ final class BandSyncer {
         }
         // Workout summary + GPS files: a GPS file can be pending without a parseable summary (its
         // summary was ACKed in an earlier sync), which used to leave it dangling forever.
-        workoutIds.forEach { sendAck(fileId: $0, manager: manager) }
+        ackUnlessSkipped(workoutIds, "workout", manager: manager)
 
         // Daily details last: HR/SpO₂ raw (band-exclusive), and steps/distance/energy reconciled
         // against the iPhone — excluding minutes inside a workout, whose distance/energy the workout
         // samples above already contribute.
+        _ = HealthKitManager.shared.takeSkippedForPermission()
         if !detailMinutes.isEmpty {
             let workoutWindows = workoutsToWrite.map { (start: $0.startDate, end: $0.endDate) }
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(detailMinutes)
@@ -590,9 +595,20 @@ final class BandSyncer {
                 log.error("Cardio recovery write failed: \(error.localizedDescription)")
             }
         }
-        detailIds.forEach { sendAck(fileId: $0, manager: manager) }
+        ackUnlessSkipped(detailIds, "daily detail", manager: manager)
 
         return outcome
+    }
+
+    /// The band re-offers an un-ACKed file, so one whose samples were dropped for a Health type
+    /// switched off is written on a later sync once it is on, instead of being deleted unwritten.
+    private func ackUnlessSkipped(_ ids: [Data], _ kind: String, manager: BandManager) {
+        guard !ids.isEmpty else { return }
+        if HealthKitManager.shared.takeSkippedForPermission() {
+            log.warning("\(ids.count, privacy: .public) \(kind, privacy: .public) file(s) left un-ACKed — a Health type is switched off for My Band")
+            return
+        }
+        ids.forEach { sendAck(fileId: $0, manager: manager) }
     }
 
     // MARK: - One-time sleep history repair
