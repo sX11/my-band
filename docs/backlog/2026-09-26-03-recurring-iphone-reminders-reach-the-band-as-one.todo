@@ -1,0 +1,7 @@
+- [ ] Recurring iPhone reminders reach the band as one-shot reminders #reminders #worth(later) #where(My Band/BLE/Protocol/XiaomiProto.swift:224) #added(2026-09-26)
+	> @anchor: details.repeatMode  = 0    // once
+	> reminderDetails always sends repeatMode 0, so an EKReminder with a recurrence rule is
+	> pushed as its next occurrence only. Each sync re-pushes the next one, so it only
+	> bites when no sync runs between two occurrences. Undecided: mapping EKRecurrenceRule
+	> to the band's repeat modes is the fix, and whether that gap is worth the work is
+	> open.

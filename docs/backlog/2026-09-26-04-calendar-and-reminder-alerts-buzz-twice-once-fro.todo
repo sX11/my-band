@@ -1,0 +1,6 @@
+- [ ] Calendar and reminder alerts buzz twice, once from the iPhone and once from the band's copy #reminders #calendar #worth(later) #where(My Band/BLE/CalendarSyncService.swift:49) #added(2026-09-26)
+	> @anchor: func pushAll() async {
+	> The band gets its own copy of every calendar event and reminder and fires it itself,
+	> while the iPhone's notification is also forwarded to the band, so each alert can buzz
+	> twice. No setting stops the calendar/reminder push. Undecided: whether the band's own
+	> copy is wanted is a preference, not a defect.

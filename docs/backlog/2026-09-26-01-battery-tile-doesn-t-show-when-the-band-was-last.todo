@@ -1,4 +1,4 @@
-- [ ] Battery tile doesn't show when the band was last charged #ui #worth(yes) #where(My Band/UI/Dashboard/DashboardView.swift:124) #added(2026-09-26)
+- [x] Battery tile doesn't show when the band was last charged #ui #where(My Band/UI/Dashboard/DashboardView.swift:124) #added(2026-09-26) #done(2026-09-26)
 	> @anchor: label: "Battery",
 	> Show the date of the last charge as the Battery tile's footer when not charging (e.g.
 	> "Charged 3 days ago"). The band already reports it: the battery message carries
