@@ -1,0 +1,6 @@
+- [ ] Band settings screen keeps an edited value when the band's read-back never arrives #settings #worth(later) #where(My Band/BLE/BandSettingsService.swift:101) #added(2026-09-26)
+	> @anchor: private func editHeartRate(_ change: (inout Xiaomi_HeartRate) -> Void) {
+	> Each edit updates the cached record before SET and GET go out. A rejected SET is
+	> corrected by the GET that follows, but if that reply is lost (link drop) the screen
+	> shows the edit as applied until the screen is reopened. Undecided: a pending state or
+	> rollback costs UI work for a narrow window.

@@ -1,0 +1,6 @@
+- [ ] Heart-rate config carries an unknown field 11, possibly the Mi Band 10's breathing-quality setting #settings #worth(later) #where(My Band/UI/Settings/BandSettingsView.swift:85) #added(2026-09-26)
+	> @anchor: if hr.hasBreathingScore {
+	> The band's CMD_CONFIG_HEART_RATE_GET reply never has breathingScore (field 9) and
+	> always carries field 11 = 1, which GadgetBridge's proto doesn't know. Undecided:
+	> mapping it needs the band's own sleep-breathing toggle flipped and the config
+	> re-read; worth it only if the setting matters.

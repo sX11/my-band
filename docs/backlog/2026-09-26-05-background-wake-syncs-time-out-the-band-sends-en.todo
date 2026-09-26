@@ -1,0 +1,7 @@
+- [ ] Background-wake syncs time out: the band sends encrypted packets before session keys and the file listing gets no reply #sync #ble #worth(yes) #where(My Band/BLE/BackgroundSyncManager.swift:237) #added(2026-09-26)
+	> @anchor: func syncOnBackgroundWakeIfStale() {
+	> iPhone log 2026-09-26: background-wake syncs at 11:39, 11:40 and 12:10 each failed
+	> 'Sync timed out.' after a run of 'Received encrypted packet but no session keys yet'
+	> and a session restart; FETCH_TODAY got no reply in 10 s. Foreground syncs on the same
+	> link worked. The wake path has no stale-link retry by design, so each wake is a lost
+	> sync.
