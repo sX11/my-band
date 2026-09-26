@@ -820,14 +820,14 @@ final class BandManager: NSObject {
         }
         guard cmd.hasSystem, cmd.system.hasPower, cmd.system.power.hasBattery else { return }
         let battery = cmd.system.power.battery
+        if battery.hasLastCharge, battery.lastCharge.timestampSeconds > 0 {
+            let charged = Date(timeIntervalSince1970: TimeInterval(battery.lastCharge.timestampSeconds))
+            batteryLastCharged = charged
+            log.info("Battery last charged \(charged, privacy: .public) (lastCharge.state=\(battery.lastCharge.state, privacy: .public))")
+        }
         if battery.hasLevel {
             // state: 1 = charging (GadgetBridge convertBatteryStateFromRawValue)
             batteryCharging = battery.hasState && battery.state == 1
-            if battery.hasLastCharge, battery.lastCharge.timestampSeconds > 0 {
-                let charged = Date(timeIntervalSince1970: TimeInterval(battery.lastCharge.timestampSeconds))
-                batteryLastCharged = charged
-                log.info("Battery last charged \(charged, privacy: .public) (lastCharge.state=\(battery.lastCharge.state, privacy: .public))")
-            }
             if hasGattBatteryLevel {
                 // 2A19 owns the level (widget parity). Logging both lets a hardware run compare them.
                 log.info("Battery \(battery.level)% via protobuf — keeping GATT \(self.batteryLevel ?? -1)%\(self.batteryCharging ? " (charging)" : "")")
