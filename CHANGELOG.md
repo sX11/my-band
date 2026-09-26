@@ -11,6 +11,7 @@ e o projeto adere ao [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Despertar inteligente nos alarmes** (`BLE/AlarmService.swift`, `UI/Alarms/AlarmsView.swift`): a seção New alarm ganhou o switch Smart wake-up, e deslizar um alarme para a direita alterna entre inteligente e normal (`AlarmDetails.smart` 1 / 2).
 - **Alarmes da pulseira** (`BLE/AlarmService.swift`, `UI/Alarms/AlarmsView.swift`, `UI/Dashboard/DashboardView.swift`): a Dashboard ganhou um card "Next alarm" com o próximo alarme ativo; tocar nele abre a tela de alarmes — ligar/desligar, deslizar para apagar, criar com hora e dias da semana. A pulseira é a fonte da verdade: cada mudança vai para ela e a lista é relida em seguida (tipo schedule 17, subtypes 0/1/2/4, portado do `XiaomiScheduleService` do GadgetBridge; bitmask de dias Seg=1 … Dom=64). O ack de criação de alarme é roteado à parte do ack de lembrete, para não virar id de lembrete apagado no próximo sync de calendário. Ligar/desligar edita o registro da própria pulseira, então modos de repetição que o app não modela sobrevivem; esquecer a pulseira limpa a lista. Validado em hardware (2026-09-25).
 - **Puxar para atualizar na Dashboard** (`UI/Dashboard/DashboardView.swift`): puxar a tela para baixo roda o mesmo sync coalescido do botão, com a pulseira conectada.
 
