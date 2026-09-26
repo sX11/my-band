@@ -76,6 +76,7 @@ struct RootView: View {
     private func forget() {
         band.disconnect()
         AppServices.shared.alarms.reset()
+        CalendarSyncService.forgetBand()
         AuthKeyStore.delete()
         phase = .setup
     }

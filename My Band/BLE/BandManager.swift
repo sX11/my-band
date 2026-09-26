@@ -799,7 +799,8 @@ final class BandManager: NSObject {
             onAlarmCommand?(cmd)
         case XiaomiScheduleCmd.cmdType where cmd.subtype == XiaomiScheduleCmd.remindersGet && cmd.hasSchedule:
             onReminderList?(cmd.schedule.reminders)
-        case XiaomiScheduleCmd.cmdType where cmd.hasSchedule && cmd.schedule.hasAckID:
+        case XiaomiScheduleCmd.cmdType where cmd.subtype == XiaomiScheduleCmd.reminderCreate
+                                          && cmd.hasSchedule && cmd.schedule.hasAckID:
             log.debug("Schedule ack id=\(cmd.schedule.ackID)")
             onScheduleAck?(cmd.schedule.ackID)
         default:
