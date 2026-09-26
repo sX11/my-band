@@ -1,0 +1,6 @@
+- [ ] Realtime stats fields 3, 5 and 6 are unmapped on the Mi Band 10 #dashboard #worth(later) #where(My Band/BLE/TodayActivityService.swift:69) #added(2026-09-26)
+	> @anchor: if !loggedRaw {
+	> Field 6 (standingHours) reads 0 while the band shows stand hours, so stood hours come
+	> from the last synced daily summary and lag until the next sync. Undecided: mapping
+	> needs a private-data log capture of the raw line checked against the band's screen;
+	> worth it only if a live stood count matters.
