@@ -84,6 +84,8 @@ final class BandManager: NSObject {
     private(set) var batteryLevel: Int?
     /// Whether the band reports it is currently charging. Protobuf-only: 2A19 carries no state.
     private(set) var batteryCharging: Bool = false
+    /// When the band was last charged (protobuf battery reply, lastCharge.timestampSeconds).
+    private(set) var batteryLastCharged: Date?
 
     /// Which confirmation prompt the user is on, while `.awaitingPairingConfirmation` is the state.
     private(set) var pairingStage: PairingStage?
@@ -823,6 +825,11 @@ final class BandManager: NSObject {
         }
         guard cmd.hasSystem, cmd.system.hasPower, cmd.system.power.hasBattery else { return }
         let battery = cmd.system.power.battery
+        if battery.hasLastCharge, battery.lastCharge.timestampSeconds > 0 {
+            let charged = Date(timeIntervalSince1970: TimeInterval(battery.lastCharge.timestampSeconds))
+            batteryLastCharged = charged
+            log.info("Battery last charged \(charged, privacy: .public) (lastCharge.state=\(battery.lastCharge.state, privacy: .public))")
+        }
         if battery.hasLevel {
             // state: 1 = charging (GadgetBridge convertBatteryStateFromRawValue)
             batteryCharging = battery.hasState && battery.state == 1
