@@ -69,6 +69,7 @@ My Band/
 │   ├── SleepSession.swift        # SwiftData model de sessão de sono
 │   ├── ActivityDay.swift         # SwiftData model de atividade diária
 │   ├── LatestMetrics.swift       # Snapshot do último valor de cada leitura, para a folha Health (ADR 0006)
+│   ├── HealthSyncLog.swift       # O que cada sync enviou ao Apple Health, por tipo, para a folha do card Apple Health
 │   └── HeartRateSample.swift     # SwiftData model de amostras de HR
 │
 └── UI/

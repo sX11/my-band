@@ -12,21 +12,50 @@ struct LatestMetricsView: View {
     @Environment(TodayActivityService.self) private var today
     @Environment(LatestMetricsStore.self) private var store
     @Environment(ScaleManager.self) private var scale
-    @Environment(BandSyncer.self) private var syncer
     @Environment(\.dismiss) private var dismiss
 
-    @Query(Self.recentSleepDescriptor) private var recentSleep: [SleepSession]
+    @Query private var recentSleep: [SleepSession]
 
-    private static var recentSleepDescriptor: FetchDescriptor<SleepSession> {
-        var d = FetchDescriptor<SleepSession>(sortBy: [SortDescriptor(\.startDate, order: .reverse)])
-        d.fetchLimit = 20
+    /// Forgetting a band keeps its sessions in SwiftData; only the paired band's nights belong here,
+    /// filtered in the fetch so another band's sessions can't use up the limit.
+    init(deviceID: UUID?) {
+        _recentSleep = Query(Self.sleepDescriptor(deviceID: deviceID))
+    }
+
+    static func sleepDescriptor(deviceID: UUID?) -> FetchDescriptor<SleepSession> {
+        let id = deviceID ?? UUID()
+        var d = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.device?.id == id },
+                                              sortBy: [SortDescriptor(\.startDate, order: .reverse)])
+        d.fetchLimit = 60
         return d
     }
 
-    /// Forgetting a band keeps its sessions in SwiftData; only the paired band's nights belong here.
-    private var lastSleep: SleepSession? {
-        guard let id = syncer.currentDevice?.id else { return nil }
-        return recentSleep.first { $0.device?.id == id }
+    private var lastSleep: Night? { Self.lastNight(recentSleep) }
+
+    struct Night: Equatable {
+        let start: Date
+        let end: Date
+        let phases: [SleepPhase]
+
+        func duration(_ type: SleepPhaseType) -> TimeInterval {
+            phases.filter { $0.type == type }.reduce(0) { $0 + $1.duration }
+        }
+        var asleep: TimeInterval { duration(.light) + duration(.deep) + duration(.rem) }
+        var efficiency: Double {
+            let inBed = end.timeIntervalSince(start)
+            return inBed > 0 ? min(asleep / inBed, 1) : 0
+        }
+    }
+
+    /// One night arrives as several overlapping sessions (each resync of a night in progress, and
+    /// the stages and details files), so it is merged and de-overlapped the way writeSleep does
+    /// for Apple Health; the newest session alone is a fragment or double-counts.
+    static func lastNight(_ sessions: [SleepSession]) -> Night? {
+        guard let group = HealthKitManager.groupOverlapping(sessions).last,
+              let start = group.map(\.startDate).min(), let end = group.map(\.endDate).max(),
+              end > start else { return nil }
+        return Night(start: start, end: end,
+                     phases: SleepDetailsParser.sanitizeStages(group.flatMap(\.phases)))
     }
 
     private var m: LatestMetrics { store.metrics }
@@ -64,7 +93,7 @@ struct LatestMetricsView: View {
     @ViewBuilder private func liveSection(now: Date) -> some View {
         if let at = today.updatedAt, Calendar.current.isDate(at, inSameDayAs: now) {
             Section("Live from the band · \(Self.time(at))") {
-                if let steps = today.steps { row("Steps", steps.formatted(.number.locale(Self.locale))) }
+                if let steps = today.steps { row("Steps", steps.formatted(.number.locale(MBFormat.locale))) }
                 if let kcal = today.calories { row("Active energy", "\(kcal) kcal") }
                 if let bpm = today.heartRate {
                     row("Heart rate", "\(bpm) bpm")
@@ -96,12 +125,12 @@ struct LatestMetricsView: View {
     @ViewBuilder private func readingsSection(now: Date) -> some View {
         if m.heartRate != nil || m.spo2 != nil || m.stress != nil || m.temperature != nil {
             Section("Latest readings") {
-                if let r = m.heartRate { row("Heart rate", "\(Int(r.value)) bpm", detail: Self.ago(r.at, now: now)) }
-                if let r = m.spo2 { row("SpO₂", "\(Int(r.value))%", detail: Self.ago(r.at, now: now)) }
-                if let r = m.stress { row("Stress", "\(Int(r.value))", detail: Self.ago(r.at, now: now)) }
+                if let r = m.heartRate { row("Heart rate", "\(Int(r.value)) bpm", detail: MBFormat.ago(r.at, now: now)) }
+                if let r = m.spo2 { row("SpO₂", "\(Int(r.value))%", detail: MBFormat.ago(r.at, now: now)) }
+                if let r = m.stress { row("Stress", "\(Int(r.value))", detail: MBFormat.ago(r.at, now: now)) }
                 if let r = m.temperature {
-                    row("Skin temperature", r.value.formatted(.number.precision(.fractionLength(1)).locale(Self.locale)) + " °C",
-                        detail: Self.ago(r.at, now: now))
+                    row("Skin temperature", r.value.formatted(.number.precision(.fractionLength(1)).locale(MBFormat.locale)) + " °C",
+                        detail: MBFormat.ago(r.at, now: now))
                 }
             }
             .listRowBackground(MB.surfaceCard)
@@ -110,12 +139,13 @@ struct LatestMetricsView: View {
 
     @ViewBuilder private var sleepSection: some View {
         if let s = lastSleep {
-            Section("Last sleep · \(s.endDate.formatted(.dateTime.weekday(.wide).locale(Self.locale)))") {
-                row("Asleep", Self.duration(s.lightDuration + s.deepDuration + s.remDuration),
-                    detail: "\(Self.time(s.startDate))–\(Self.time(s.endDate))")
-                row("Deep", Self.duration(s.deepDuration))
-                row("REM", Self.duration(s.remDuration))
-                row("Light", Self.duration(s.lightDuration))
+            Section("Last sleep · \(s.end.formatted(.dateTime.weekday(.wide).locale(MBFormat.locale)))") {
+                row("Asleep", Self.duration(s.asleep),
+                    detail: "\(Self.time(s.start))–\(Self.time(s.end))")
+                row("Deep", Self.duration(s.duration(.deep)))
+                row("REM", Self.duration(s.duration(.rem)))
+                row("Light", Self.duration(s.duration(.light)))
+                row("Awake", Self.duration(s.duration(.awake)))
                 row("Efficiency", "\(Int((s.efficiency * 100).rounded()))%")
             }
             .listRowBackground(MB.surfaceCard)
@@ -125,8 +155,8 @@ struct LatestMetricsView: View {
     @ViewBuilder private func bodySection(now: Date) -> some View {
         if let kg = scale.lastWeightKg {
             Section("Body") {
-                row("Weight", kg.formatted(.number.precision(.fractionLength(1)).locale(Self.locale)) + " kg",
-                    detail: scale.lastWeightDate.map { Self.ago($0, now: now) })
+                row("Weight", kg.formatted(.number.precision(.fractionLength(1)).locale(MBFormat.locale)) + " kg",
+                    detail: scale.lastWeightDate.map { MBFormat.ago($0, now: now) })
             }
             .listRowBackground(MB.surfaceCard)
         }
@@ -150,31 +180,21 @@ struct LatestMetricsView: View {
             return "Nothing yet — sync the band to fill this in. Apple Health keeps the full history."
         }
         // The snapshot's own time: it is saved as files arrive, so a sync that fails later still moved it.
-        let updated = store.updatedAt.map { "Readings updated \(Self.ago($0, now: now))." } ?? ""
+        let updated = store.updatedAt.map { "Readings updated \(MBFormat.ago($0, now: now))." } ?? ""
         return "\(updated) Apple Health keeps the full history.".trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: Formatting
 
-    private static let locale = Locale(identifier: "en_US")
-
     private static func time(_ date: Date) -> String {
-        date.formatted(.dateTime.hour().minute().locale(locale))
-    }
-
-    private static func ago(_ date: Date, now: Date) -> String {
-        if now.timeIntervalSince(date) < 60 { return "just now" }
-        let f = RelativeDateTimeFormatter()
-        f.locale = locale
-        f.unitsStyle = .abbreviated
-        return f.localizedString(for: date, relativeTo: now)
+        date.formatted(.dateTime.hour().minute().locale(MBFormat.locale))
     }
 
     private static func dayLabel(_ day: Date, now: Date) -> String {
         let cal = Calendar.current
         if cal.isDate(day, inSameDayAs: now) { return "Today · as of last sync" }
         if cal.isDateInYesterday(day) { return "Yesterday" }
-        return day.formatted(.dateTime.weekday(.wide).day().month(.abbreviated).locale(locale))
+        return day.formatted(.dateTime.weekday(.wide).day().month(.abbreviated).locale(MBFormat.locale))
     }
 
     private static func duration(_ seconds: TimeInterval) -> String {

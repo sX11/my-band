@@ -179,12 +179,13 @@ struct BandSettingsView: View {
 
     // MARK: - Copy
 
-    static func intervalLabel(_ minutes: UInt32?) -> String {
+    /// `compact` fits a half-width Dashboard tile.
+    static func intervalLabel(_ minutes: UInt32?, compact: Bool = false) -> String {
         switch minutes {
         case nil: "Off"
         case 0: "Smart"
-        case 1: "Every minute"
-        case let m?: "Every \(m) min"
+        case 1: compact ? "1 min" : "Every minute"
+        case let m?: compact ? "\(m) min" : "Every \(m) min"
         }
     }
 
