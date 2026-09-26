@@ -2,8 +2,8 @@ import SwiftUI
 
 // MARK: - DashboardView
 //
-// Minimal first dashboard: live band status, battery, last Apple Health sync, and a
-// "Sincronizar com Apple Health" action. Sleep/activity detail comes in a later phase.
+// Live band status, battery, last Apple Health sync and the sync action, the band's alarms and
+// settings, and today's activity read live from the band (ADR 0005 — nothing here is stored).
 
 struct DashboardView: View {
 
@@ -11,6 +11,8 @@ struct DashboardView: View {
     @Environment(BandSyncer.self) private var syncer
     @Environment(AlarmService.self) private var alarms
     @Environment(BandSettingsService.self) private var settings
+    @Environment(TodayActivityService.self) private var today
+    @Environment(\.scenePhase) private var scenePhase
     var onForget: () -> Void
 
     @State private var syncing = false
@@ -55,7 +57,11 @@ struct DashboardView: View {
                 .padding(.top, MB.Space.x6)
                 .padding(.bottom, MB.Space.x10)
             }
-            .refreshable { if connected { await performSync() } }
+            .refreshable {
+                guard connected else { return }
+                await performSync()
+                today.refresh()
+            }
         }
         .sheet(isPresented: $showCustomize) { CustomizeView() }
         .sheet(isPresented: $showProfile) { ProfileView() }
@@ -65,6 +71,18 @@ struct DashboardView: View {
             guard connected else { return }
             alarms.requestList()
             settings.requestAll()
+        }
+        .task(id: connected && scenePhase == .active) {
+            // SwiftUI keeps .task running in the background; each reading makes the band measure
+            // heart rate, so it only polls while the app is in front.
+            guard connected, scenePhase == .active else {
+                today.finish()
+                return
+            }
+            while !Task.isCancelled {
+                today.refresh()
+                try? await Task.sleep(for: .seconds(5 * 60))
+            }
         }
     }
 
@@ -94,7 +112,11 @@ struct DashboardView: View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
             VStack(spacing: MB.Space.x3) {
                 metricTiles(now: context.date)
-                alarmTile(now: context.date)
+                HStack(spacing: MB.Space.x3) {
+                    alarmTile(now: context.date)
+                    todayTile(now: context.date)
+                }
+                .fixedSize(horizontal: false, vertical: true)
                 settingsTile
             }
         }
@@ -111,6 +133,43 @@ struct DashboardView: View {
             )
         }
         .buttonStyle(.plain)
+    }
+
+    private func todayTile(now: Date) -> some View {
+        MBMetricTile(
+            icon: "figure.walk", tint: MB.steps, tintSoft: MB.stepsSoft,
+            label: "Today",
+            value: todaySteps(now: now).map { $0.formatted(.number.locale(Locale(identifier: "en_US"))) } ?? "—",
+            unit: todaySteps(now: now) != nil ? "steps" : nil,
+            foot: todayFoot(now: now)
+        )
+    }
+
+    /// A reading from an earlier day is not today's, whatever the tile's label says.
+    private func todaySteps(now: Date) -> Int? {
+        guard let at = today.updatedAt, Calendar.current.isDate(at, inSameDayAs: now) else { return nil }
+        return today.steps
+    }
+
+    private func todayFoot(now: Date) -> String {
+        guard todaySteps(now: now) != nil else {
+            if !connected { return "Connect the band to see today" }
+            return today.reading ? "Reading…" : "Pull to refresh"
+        }
+        var lines: [String] = []
+        var totals: [String] = []
+        if let kcal = today.calories { totals.append("\(kcal) kcal") }
+        if let hours = today.standingHours { totals.append("stood \(hours) h") }
+        if !totals.isEmpty { lines.append(totals.joined(separator: " · ")) }
+        if let bpm = today.heartRate {
+            lines.append("HR \(bpm) bpm")
+        } else if today.reading {
+            lines.append("Measuring HR…")
+        }
+        if let at = today.updatedAt, now.timeIntervalSince(at) > 10 * 60 {
+            lines.append("as of \(at.formatted(date: .omitted, time: .shortened))")
+        }
+        return lines.joined(separator: "\n")
     }
 
     private var settingsTile: some View {

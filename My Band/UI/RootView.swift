@@ -77,6 +77,7 @@ struct RootView: View {
         band.disconnect()
         AppServices.shared.alarms.reset()
         AppServices.shared.bandSettings.reset()
+        AppServices.shared.todayActivity.reset()
         CalendarSyncService.forgetBand()
         AuthKeyStore.delete()
         phase = .setup

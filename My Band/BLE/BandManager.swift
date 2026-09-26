@@ -243,9 +243,6 @@ final class BandManager: NSObject {
     /// Called when the band's "find phone" feature is toggled (System, subtype=17).
     /// Param = true to start ringing the phone, false to stop (user dismissed it on the band).
     var onFindPhone:             ((Bool) -> Void)?
-    /// Called for each live real-time stats event (Health, subtype=47) while realtime is enabled.
-    /// Param = the current heart rate in bpm. Driven by setRealtimeStats(enabled:).
-    var onRealtimeStats:         ((Int) -> Void)?
     /// Called with the band-assigned id when a Schedule item (e.g. a reminder) is created
     /// (Schedule command carrying schedule.ackId). CalendarSyncService uses it to track which
     /// reminders to delete on the next sync.
@@ -463,13 +460,33 @@ final class BandManager: NSObject {
         }
     }
 
-    /// Turns the band's live real-time stats stream on/off. While on, the band pushes RealTimeStats
-    /// events (subtype 47) that arrive via onRealtimeStats. Used for post-workout HR recovery and the
-    /// live-HR shortcut.
-    func setRealtimeStats(enabled: Bool) {
-        sendEncryptedCommand(protoBytes: XiaomiProto.realtimeStatsCommand(enable: enabled))
-        log.info("Realtime stats \(enabled ? "START" : "STOP") sent")
+    /// Who is using the band's live real-time stats stream; STOP waits for the last of them.
+    enum RealtimeHolder: String {
+        case hrRecovery, todayActivity
     }
+
+    /// Every live real-time stats event (Health, subtype 47) goes to each observer, whole.
+    func observeRealtime(_ observer: @escaping (Xiaomi_RealTimeStats) -> Void) {
+        realtimeObservers.append(observer)
+    }
+    private var realtimeObservers: [(Xiaomi_RealTimeStats) -> Void] = []
+
+    /// Turns the band's live real-time stats stream on/off for one holder: post-workout HR recovery
+    /// and the Dashboard's Today reading.
+    func setRealtimeStats(enabled: Bool, holder: RealtimeHolder) {
+        // Several features share the one stream; STOP goes out only when the last one lets go, so
+        // the Dashboard's reading can't cut off a post-workout recovery capture. START is re-sent
+        // every time so a holder left over from a dropped link can't keep it from restarting.
+        if enabled {
+            realtimeHolders.insert(holder)
+        } else {
+            realtimeHolders.remove(holder)
+            guard realtimeHolders.isEmpty else { return }
+        }
+        sendEncryptedCommand(protoBytes: XiaomiProto.realtimeStatsCommand(enable: enabled))
+        log.info("Realtime stats \(enabled ? "START" : "STOP") sent (\(holder.rawValue, privacy: .public))")
+    }
+    private var realtimeHolders: Set<RealtimeHolder> = []
 
     /// Asks for a fresh battery reading and waits (up to `timeout`) for it to land. The level is
     /// read from GATT 2A19 when the band exposes it, so the app agrees with the iOS Batteries
@@ -898,8 +915,7 @@ final class BandManager: NSObject {
             log.info("Workout status update: \(watch.status) (\(fileIds.count / 7) file id(s))")
             onWorkoutStatusWatch?(watch.status, fileIds)
         case XiaomiHealthCmd.realtimeEvent where cmd.hasHealth && cmd.health.hasRealTimeStats:
-            let stats = cmd.health.realTimeStats
-            if stats.hasHeartRate, stats.heartRate > 0 { onRealtimeStats?(Int(stats.heartRate)) }
+            realtimeObservers.forEach { $0(cmd.health.realTimeStats) }
         case XiaomiHealthCmd.spo2Get ... XiaomiHealthCmd.stressSet,
              XiaomiHealthCmd.goalNotificationGet, XiaomiHealthCmd.goalNotificationSet:
             onSettingsCommand?(cmd)
@@ -1277,6 +1293,8 @@ final class BandManager: NSObject {
         writeReadyContinuation = nil
         phoneNonce   = nil
         sessionKeys  = nil
+        // The band's stream dies with the link; a holder kept past it would block the next STOP.
+        realtimeHolders.removeAll()
         seqNum       = 0
         rxBuffer     = Data()
         authStep3Sent = false
