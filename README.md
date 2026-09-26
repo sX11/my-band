@@ -34,7 +34,7 @@ Este é um projeto pessoal que serviu de laboratório para BLE, criptografia apl
 | ✅ | Persistência local com SwiftData (BandDevice, SleepSession, ActivityDay) |
 | ✅ | Reassembly de frames BLE fragmentados (arquivos de atividade > MTU) |
 | ✅ | Leitura de bateria (nível + carregando) |
-| ✅ | UI de Setup (AuthKey + scan/conexão) e Dashboard (bateria, última sync, botão sincronizar) via Claude Design |
+| ✅ | UI de Setup (AuthKey + scan/conexão) e Dashboard (bateria, última sync, botão sincronizar, próximo alarme, configurações da pulseira e card Today — passos, kcal, horas em pé, FC) via Claude Design |
 | ✅ | Envio ao Apple Health — sono (estágios) e atividade diária (passos, calorias, distância, FC + FC de repouso, SpO₂) — **validado em hardware (Mi Band 10)** |
 | ✅ | Sincronização em segundo plano via `BGProcessingTask` (reconecta, sincroniza e reagenda com o app suspenso) — **validada em hardware** |
 | ✅ | Medições manuais no Apple Health (FC, SpO₂) — **validado em hardware (Mi Band 10)** |

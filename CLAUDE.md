@@ -1,6 +1,6 @@
 # CLAUDE.md — My Band
 
-Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Sem visualização de dados de saúde em tela própria — o Apple Health é a única superfície de dados; o app é só sincronização, configuração e status.
+Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Os dados de saúde ficam no Apple Health; a única exceção é o card Today da Dashboard, com os contadores ao vivo da pulseira, sem armazenar nada (ADR 0005).
 
 ---
 
@@ -13,7 +13,7 @@ Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS unive
 | UI | SwiftUI, Liquid Glass no chrome/status (`MBStatusPill` etc.) |
 | Persistência | SwiftData |
 | Bluetooth | CoreBluetooth (BLE apenas — Mi Band 10 não usa Classic BT) |
-| Saúde | HealthKit — única superfície de visualização de dados (ver ADR 0001) |
+| Saúde | HealthKit — única superfície de dados armazenados; a Dashboard mostra só os contadores ao vivo do dia (ADR 0005) |
 | Automação | App Intents + Shortcuts |
 | Distribuição | Uso pessoal — sideload via Apple Developer Program pessoal (sem App Store) |
 
@@ -37,6 +37,8 @@ My Band/
 │   ├── FindPhoneService.swift    # "Encontrar telefone": alarme no iPhone (band→app CMD_FIND_PHONE)
 │   ├── CalendarSyncService.swift # Push app→band: idioma, calendário e lembretes (EventKit)
 │   ├── WeatherSyncService.swift  # Push app→band: tempo atual + previsão (Open-Meteo)
+│   ├── BandSettingsService.swift # Configurações da pulseira (FC, SpO₂, estresse, lembretes, tela): GET/SET + releitura
+│   ├── TodayActivityService.swift # Leitura única do realtime stats para o card Today da Dashboard
 │   ├── Scale/                    # Balança BLE OKOK/Chipsea (independente da pulseira)
 │   │   ├── ScaleManager.swift    # Escuta o anúncio (broadcast-only) e grava peso no Apple Health
 │   │   └── ScaleWeightParser.swift # Decode do peso (variante VC0)
@@ -395,7 +397,7 @@ NSHealthShareUsageDescription
 
 A UI é construída a partir do handoff do **Claude Design** (`My Band — Design System`, bundle exportado de claude.ai/design). Recriar fielmente em SwiftUI — copiar o **resultado visual**, não a estrutura HTML/JSX dos protótipos.
 
-> **Sem visualização de dados de saúde em tela própria** (ver ADR 0001). O app não mostra sono, FC, passos ou SpO₂ em nenhuma tela — isso é papel do Apple Health e do Atalho `GetSleepStateIntent`. A Dashboard só mostra estado de conexão, frescor do sync, bateria e o botão de sincronizar; não existe (nem está planejada) uma tela `SleepDetail`/hipnograma.
+> **O Apple Health é a superfície de dados de saúde** (ADR 0005, que substitui o 0001). A Dashboard mostra estado de conexão, frescor do sync, bateria, alarmes, configurações da pulseira e o card Today — passos, kcal, horas em pé e FC, lidos uma vez do realtime stats da pulseira e nunca armazenados. Sem histórico, sem gráficos, e não existe (nem está planejada) uma tela `SleepDetail`/hipnograma; sono continua com o Apple Health e o Atalho `GetSleepStateIntent`.
 
 **Princípios fixos do maker:**
 1. **Dark-mode first** — "gosto de modo noturno".
@@ -412,9 +414,9 @@ A UI é construída a partir do handoff do **Claude Design** (`My Band — Desig
 - **Cantos** contínuos: cards 16, sheets 20, hero/modal 28, pills redondos. **4-pt grid**, gutter 20, hit target ≥44.
 - **Ícones**: SF Symbols (kit web usa Lucide como substituto). Status sempre cor + símbolo, nunca cor sozinha.
 
-**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Sem dado de saúde em tela — o número que aparece é sempre de status/sync, nunca uma métrica de saúde. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
+**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Métrica de saúde só no card Today (contadores ao vivo do dia, ADR 0005); fora dele o número é sempre de status/sync. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
 
-**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar — sem dados de saúde, ver ADR 0001), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
+**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar, alarmes, configurações da pulseira e o card Today — ADR 0005), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
 
 **Componentes do kit** (`components/`): core (`Button`, `IconButton`, `StatusPill`, `Badge`), forms (`Switch`, `TextField`, `SegmentedControl`), data (`ListRow`, `Card`, `MetricTile`, `SectionHeader`, `SleepBar`). Cada um tem `.prompt.md` e `.d.ts` descrevendo props/variantes.
 
@@ -476,7 +478,7 @@ Versão atual: **1.2.0** — ver `CHANGELOG.md` para o histórico completo. Pró
 4. O `GetSleepStateIntent`.
 5. O `CheckBandBatteryIntent` — em especial o `CMD_BATTERY` sob demanda fora do init pós-auth (a resposta chega no mesmo `handleSystemCommand`, mas nunca foi exercitada com o link já aberto há tempo). E se a Mi Band 10 expõe o Battery Service `0x180F` a apps (a linha `Services:` do log da conexão responde), se a `2A19` lê sem erro pós-auth e se o número bate com o widget Baterias — o log imprime os dois (`via GATT 2A19` / `via protobuf — keeping GATT`).
 
-Home Assistant foi cortado do roadmap; UI segue sem visualização de dados de saúde por decisão (ver ADR 0001).
+Home Assistant foi cortado do roadmap; UI segue sem histórico nem gráficos de saúde por decisão (ADR 0005, que substitui o 0001).
 
 ---
 

@@ -78,8 +78,9 @@ final class WorkoutGpsService: NSObject {
         manager.onWorkoutStatusWatch = { [weak self] status, fileIds in
             Task { @MainActor in self?.handleWorkoutStatus(status, fileIds: fileIds) }
         }
-        manager.onRealtimeStats = { [weak self] hr in
-            Task { @MainActor in self?.ingestRecoveryHR(hr) }
+        manager.observeRealtime { [weak self] stats in
+            guard stats.hasHeartRate, stats.heartRate > 0 else { return }
+            Task { @MainActor in self?.ingestRecoveryHR(Int(stats.heartRate)) }
         }
 
         locationManager.delegate = self
@@ -260,14 +261,14 @@ final class WorkoutGpsService: NSObject {
         localStart = Date()
         recoveryHR = []
         locationManager.startUpdatingLocation()
-        bandManager?.setRealtimeStats(enabled: true)
+        bandManager?.setRealtimeStats(enabled: true, holder: .hrRecovery)
         log.info("Strength finished — recording \(Int(self.recoveryDuration))-s HR recovery (realtime)")
         recoveryTimer?.cancel()
         recoveryTimer = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(self?.recoveryDuration ?? 180))
             guard let self, !Task.isCancelled else { return }
             let samples = self.recoveryHR
-            self.bandManager?.setRealtimeStats(enabled: false)
+            self.bandManager?.setRealtimeStats(enabled: false, holder: .hrRecovery)
             self.stopLocalRecording()
             self.recoveryPendingStrengthStart = nil
             self.log.info("HR recovery done — \(samples.count) sample(s)")
