@@ -122,6 +122,7 @@ final class BandSyncer {
     private(set) var lastHealthSync: Date?
     private(set) var lastError: Error?
     private(set) var currentDevice: BandDevice?
+    var latestMetrics: LatestMetricsStore?
 
     private weak var bandManager: BandManager?
     private var modelContext: ModelContext?
@@ -440,6 +441,7 @@ final class BandSyncer {
                 if meta.isManualSamples {
                     let manual = ManualSamplesParser.parse(fileData, meta: meta)
                     manualToWrite += manual
+                    latestMetrics?.update { $0.record(manual) }
                     outcome.manualSamples += manual.count
                     manualIds.append(fileId)
                 } else if meta.isWorkoutSummary {
@@ -477,13 +479,16 @@ final class BandSyncer {
                     }
                     // HR/SpO₂ recorded during sleep — written within the sleep window so
                     // Apple Health's sleep "Comparisons" tab can correlate them.
-                    sleepVitals += parsed.heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
-                    sleepVitals += parsed.spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) }
+                    let vitals = parsed.heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
+                        + parsed.spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) }
+                    sleepVitals += vitals
+                    latestMetrics?.update { $0.record(vitals) }
                     sleepIds.append(fileId)
                 } else if meta.isDailySummary {
                     if let summary = DailySummaryParser.parse(fileData, meta: meta) {
                         outcome.dailySummaries += 1
                         persistActivityDay(summary, context)
+                        latestMetrics?.update { $0.record(summary) }
                         _ = HealthKitManager.shared.takeSkippedForPermission()
                         outcome.healthSamplesWritten += try await HealthKitManager.shared.writeDailySummary(summary)
                     }
@@ -494,6 +499,7 @@ final class BandSyncer {
                     let minutes = DailyDetailsParser.parse(fileData, meta: meta)
                     outcome.minuteSamples += minutes.count
                     detailMinutes += minutes
+                    latestMetrics?.update { $0.record(minutes) }
                     detailIds.append(fileId)
                 } else {
                     // No parser matches this file. We still ACK it so the band stops re-offering it on

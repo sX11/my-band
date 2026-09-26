@@ -60,6 +60,7 @@ struct My_BandApp: App {
                 .environment(services.alarms)
                 .environment(services.bandSettings)
                 .environment(services.todayActivity)
+                .environment(services.latestMetrics)
                 .onOpenURL { url in
                     // Shared file ("Abrir com → My Band") for a .bin/.rpk. Installs against the
                     // live connection; progress/result surface in CustomizeView.
