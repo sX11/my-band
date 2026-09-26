@@ -15,12 +15,18 @@ struct LatestMetricsView: View {
     @Environment(BandSyncer.self) private var syncer
     @Environment(\.dismiss) private var dismiss
 
-    @Query(Self.lastSleepDescriptor) private var lastSleep: [SleepSession]
+    @Query(Self.recentSleepDescriptor) private var recentSleep: [SleepSession]
 
-    private static var lastSleepDescriptor: FetchDescriptor<SleepSession> {
+    private static var recentSleepDescriptor: FetchDescriptor<SleepSession> {
         var d = FetchDescriptor<SleepSession>(sortBy: [SortDescriptor(\.startDate, order: .reverse)])
-        d.fetchLimit = 1
+        d.fetchLimit = 20
         return d
+    }
+
+    /// Forgetting a band keeps its sessions in SwiftData; only the paired band's nights belong here.
+    private var lastSleep: SleepSession? {
+        guard let id = syncer.currentDevice?.id else { return nil }
+        return recentSleep.first { $0.device?.id == id }
     }
 
     private var m: LatestMetrics { store.metrics }
@@ -103,7 +109,7 @@ struct LatestMetricsView: View {
     }
 
     @ViewBuilder private var sleepSection: some View {
-        if let s = lastSleep.first {
+        if let s = lastSleep {
             Section("Last sleep · \(s.endDate.formatted(.dateTime.weekday(.wide).locale(Self.locale)))") {
                 row("Asleep", Self.duration(s.lightDuration + s.deepDuration + s.remDuration),
                     detail: "\(Self.time(s.startDate))–\(Self.time(s.endDate))")
@@ -140,11 +146,12 @@ struct LatestMetricsView: View {
     }
 
     private func footer(now: Date) -> String {
-        guard !m.isEmpty || !lastSleep.isEmpty else {
+        guard !m.isEmpty || lastSleep != nil else {
             return "Nothing yet — sync the band to fill this in. Apple Health keeps the full history."
         }
-        let synced = syncer.lastHealthSync.map { "Last sync \(Self.ago($0, now: now))." } ?? ""
-        return "\(synced) Apple Health keeps the full history.".trimmingCharacters(in: .whitespaces)
+        // The snapshot's own time: it is saved as files arrive, so a sync that fails later still moved it.
+        let updated = store.updatedAt.map { "Readings updated \(Self.ago($0, now: now))." } ?? ""
+        return "\(updated) Apple Health keeps the full history.".trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: Formatting

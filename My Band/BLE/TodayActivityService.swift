@@ -69,7 +69,7 @@ final class TodayActivityService {
         if !loggedRaw {
             loggedRaw = true
             // Fields 3, 5 and 6 are unmapped for this band; the raw values are the evidence for mapping them.
-            log.info("Realtime raw: steps=\(stats.steps, privacy: .public) kcal=\(stats.calories, privacy: .public) f3=\(stats.unknown3, privacy: .public) hr=\(stats.heartRate, privacy: .public) f5=\(stats.unknown5, privacy: .public) f6=\(stats.hasStandingHours ? String(stats.standingHours) : "-", privacy: .public)")
+            log.info("Realtime raw: steps=\(stats.steps, privacy: .private) kcal=\(stats.calories, privacy: .private) f3=\(stats.unknown3, privacy: .private) hr=\(stats.heartRate, privacy: .private) f5=\(stats.unknown5, privacy: .private) f6=\(stats.hasStandingHours ? String(stats.standingHours) : "-", privacy: .private)")
         }
         updatedAt = .now
         // GadgetBridge's one-shot threshold: at or below 10 the band hasn't measured yet.

@@ -38,6 +38,8 @@ struct LatestMetrics: Codable, Equatable {
 
     mutating func record(_ s: DailySummary) {
         let day = Calendar.current.startOfDay(for: s.date)
+        // A future day from a wrong band clock would never be replaced.
+        guard day <= Calendar.current.startOfDay(for: .now) else { return }
         // Files arrive oldest-first from the backlog; an older day must not replace a newer one.
         if let summaryDay, day < summaryDay { return }
         summaryDay = day

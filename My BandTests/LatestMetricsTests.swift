@@ -21,6 +21,13 @@ struct LatestMetricsTests {
         #expect(m.restingHR == 60)
     }
 
+    @Test func futureSummaryIsIgnored() {
+        var m = LatestMetrics()
+        m.record(summary(daysAgo: 0, resting: 60))
+        m.record(summary(daysAgo: -2, resting: 70))
+        #expect(m.restingHR == 60)
+    }
+
     @Test func standingHoursCountsMaskBits() {
         var m = LatestMetrics()
         m.record(summary(daysAgo: 0, resting: 60, mask: 0b1011_0000_0000))
