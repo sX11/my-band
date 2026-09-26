@@ -68,11 +68,8 @@ enum XiaomiProto {
 
     // MARK: - System command builders
 
-    static func setCurrentTimeCommand() -> Data {
-        let now   = Date()
-        let cal   = Calendar.current
-        let tz    = TimeZone.current
-        let comps = cal.dateComponents(in: tz, from: now)
+    static func setCurrentTimeCommand(now: Date = Date(), tz: TimeZone = .current) -> Data {
+        let comps = Calendar.current.dateComponents(in: tz, from: now)
 
         var time = Xiaomi_Time()
         time.hour   = UInt32(comps.hour   ?? 0)
@@ -84,8 +81,10 @@ enum XiaomiProto {
         date.month = UInt32(comps.month ?? 1)
         date.day   = UInt32(comps.day   ?? 1)
 
-        let zoneOffset = Int32(tz.secondsFromGMT(for: now) / (15 * 60))
+        // zoneOffset is the standard offset WITHOUT DST (Java's Calendar.ZONE_OFFSET, which
+        // GadgetBridge sends); secondsFromGMT already includes DST, so the band counted it twice.
         let dstSecs    = Int(tz.daylightSavingTimeOffset(for: now))
+        let zoneOffset = Int32((tz.secondsFromGMT(for: now) - dstSecs) / (15 * 60))
         let dstOffset  = Int32(dstSecs / (15 * 60))
 
         var tzMsg = Xiaomi_TimeZone()
