@@ -1,4 +1,4 @@
-- [ ] Alarms screen has no smart wake-up option #alarms #ui #worth(yes) #where(My Band/BLE/AlarmService.swift:66) #added(2026-09-26)
+- [x] Alarms screen has no smart wake-up option #alarms #ui #where(My Band/BLE/AlarmService.swift:66) #added(2026-09-26) #done(2026-09-26)
 	> @anchor: enabled: true, smart: false)
 	> New alarms are always created with smart = off, and AlarmsView has no switch for it.
 	> The band supports it (AlarmDetails.smart: 1 = smart, 2 = normal); existing smart
