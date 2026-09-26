@@ -124,7 +124,7 @@ struct DashboardView: View {
                 label: "Battery",
                 value: band.batteryLevel.map(String.init) ?? "—",
                 unit: band.batteryLevel != nil ? "%" : nil,
-                foot: band.batteryCharging ? "Charging" : nil
+                foot: band.batteryCharging ? "Charging" : lastChargeText(now: now)
             )
             MBMetricTile(
                 icon: "heart.fill", tint: MB.hr, tintSoft: MB.hrSoft,
@@ -207,6 +207,15 @@ struct DashboardView: View {
         // Under a minute reads "in 0 sec." / "0 sec. ago" from the formatter.
         if now.timeIntervalSince(date) < 60 { return "Just now" }
         return f.localizedString(for: date, relativeTo: now)
+    }
+
+    private func lastChargeText(now: Date) -> String? {
+        guard let date = band.batteryLastCharged else { return nil }
+        if now.timeIntervalSince(date) < 60 { return "Charged just now" }
+        let f = RelativeDateTimeFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.unitsStyle = .abbreviated
+        return "Charged \(f.localizedString(for: date, relativeTo: now))"
     }
 
     private var batteryIcon: String {

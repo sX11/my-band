@@ -84,6 +84,8 @@ final class BandManager: NSObject {
     private(set) var batteryLevel: Int?
     /// Whether the band reports it is currently charging. Protobuf-only: 2A19 carries no state.
     private(set) var batteryCharging: Bool = false
+    /// When the band was last charged (protobuf battery reply, lastCharge.timestampSeconds).
+    private(set) var batteryLastCharged: Date?
 
     /// Which confirmation prompt the user is on, while `.awaitingPairingConfirmation` is the state.
     private(set) var pairingStage: PairingStage?
@@ -821,6 +823,11 @@ final class BandManager: NSObject {
         if battery.hasLevel {
             // state: 1 = charging (GadgetBridge convertBatteryStateFromRawValue)
             batteryCharging = battery.hasState && battery.state == 1
+            if battery.hasLastCharge, battery.lastCharge.timestampSeconds > 0 {
+                let charged = Date(timeIntervalSince1970: TimeInterval(battery.lastCharge.timestampSeconds))
+                batteryLastCharged = charged
+                log.info("Battery last charged \(charged, privacy: .public) (lastCharge.state=\(battery.lastCharge.state, privacy: .public))")
+            }
             if hasGattBatteryLevel {
                 // 2A19 owns the level (widget parity). Logging both lets a hardware run compare them.
                 log.info("Battery \(battery.level)% via protobuf — keeping GATT \(self.batteryLevel ?? -1)%\(self.batteryCharging ? " (charging)" : "")")
