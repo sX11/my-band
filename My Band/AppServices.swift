@@ -24,6 +24,7 @@ final class AppServices {
     let customization = CustomizationManager()
     let scaleManager  = ScaleManager()
     let alarms        = AlarmService()
+    let bandSettings  = BandSettingsService()
 
     private var didBootstrap = false
 
@@ -38,6 +39,7 @@ final class AppServices {
         bandSyncer.setup(manager: bandManager, context: container.mainContext)
         customization.setup(manager: bandManager)
         alarms.setup(manager: bandManager)
+        bandSettings.setup(manager: bandManager)
         bandSyncer.loadStoredDevice()
         BackgroundSyncManager.shared.configure(manager: bandManager, syncer: bandSyncer)
         // Broadcast-only scale: a foreground listen is enough; harmless on a headless launch.

@@ -288,6 +288,21 @@ enum XiaomiProto {
         return (try? cmd.serializedData()) ?? Data()
     }
 
+    /// A CMD_CONFIG_*_SET carrying one health config (heart rate, SpO₂, stress, …).
+    static func healthConfigCommand(subtype: UInt32, _ configure: (inout Xiaomi_Health) -> Void) -> Data {
+        command(type: XiaomiHealthCmd.cmdType, subtype: subtype) { configure(&$0.health) }
+    }
+
+    static func screenOnNotificationsGetCommand() -> Data {
+        bareCommand(type: XiaomiNotificationCmd.cmdType, subtype: XiaomiNotificationCmd.screenOnGet)
+    }
+
+    static func screenOnNotificationsSetCommand(_ enabled: Bool) -> Data {
+        command(type: XiaomiNotificationCmd.cmdType, subtype: XiaomiNotificationCmd.screenOnSet) {
+            $0.notification.screenOnOnNotifications = enabled
+        }
+    }
+
     /// CMD_ACTIVITY_FETCH_TODAY — lists today's pending activity file IDs.
     static func fetchTodayCommand() -> Data {
         var cmd = Xiaomi_Command()
