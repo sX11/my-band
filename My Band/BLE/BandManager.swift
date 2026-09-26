@@ -248,6 +248,8 @@ final class BandManager: NSObject {
     /// (Schedule command carrying schedule.ackId). CalendarSyncService uses it to track which
     /// reminders to delete on the next sync.
     var onScheduleAck:           ((UInt32) -> Void)?
+    /// Called with the band's reminder list (Schedule, CMD_REMINDERS_GET response).
+    var onReminderList:          ((Xiaomi_Reminders) -> Void)?
     /// Called when the band requests weather (Weather, subtype=3). Params = (locationKey, locationName);
     /// both empty means the band wants its current-location weather. The band sends this on connect and
     /// when its weather screen opens — it's the trigger WeatherSyncService responds to with a push.
@@ -795,7 +797,10 @@ final class BandManager: NSObject {
             // Kept apart from the reminder ack below: an alarm-create ack must not be recorded as a
             // reminder id, or the next calendar sync would delete a reminder by that number.
             onAlarmCommand?(cmd)
-        case XiaomiScheduleCmd.cmdType where cmd.hasSchedule && cmd.schedule.hasAckID:
+        case XiaomiScheduleCmd.cmdType where cmd.subtype == XiaomiScheduleCmd.remindersGet && cmd.hasSchedule:
+            onReminderList?(cmd.schedule.reminders)
+        case XiaomiScheduleCmd.cmdType where cmd.subtype == XiaomiScheduleCmd.reminderCreate
+                                          && cmd.hasSchedule && cmd.schedule.hasAckID:
             log.debug("Schedule ack id=\(cmd.schedule.ackID)")
             onScheduleAck?(cmd.schedule.ackID)
         default:

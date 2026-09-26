@@ -179,6 +179,10 @@ enum XiaomiProto {
 
     // MARK: - Reminder (schedule) command builders
 
+    static func remindersGetCommand() -> Data {
+        command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.remindersGet) { _ in }
+    }
+
     /// CMD_REMINDERS_CREATE — adds one reminder. `repeatMode` 0=once; `repeatFlags` 64 = unset.
     static func reminderCreateCommand(_ details: Xiaomi_ReminderDetails) -> Data {
         var schedule = Xiaomi_Schedule()

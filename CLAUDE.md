@@ -189,15 +189,16 @@ Alguns recursos são **push** da pulseira: ela manda o comando e o app reage. `B
 |---|---|---|---|---|
 | Idioma | 2 (SYSTEM) | 6 `CMD_LANGUAGE` | `system.language.code` | `Locale` → `"pt_br"` minúsculo |
 | Calendário | 12 | 1 `CMD_CALENDAR_SET` | `calendar.calendarSync.event[]` | EventKit, próximos 30 dias, ≤50, **substitui** o set na banda |
-| Lembrete (criar) | 17 (SCHEDULE) | 15 `CMD_REMINDERS_CREATE` | `schedule.createReminder` | EventKit, com data, ≤20 |
-| Lembrete (apagar) | 17 | 18 `CMD_REMINDERS_DELETE` | `schedule.deleteReminder.id[]` | apaga os ids do sync anterior antes de recriar |
+| Lembrete (listar) | 17 (SCHEDULE) | 14 `CMD_REMINDERS_GET` | `schedule.reminders` | lista da banda (ids, título/hora, `maxReminders`), lida antes de cada push |
+| Lembrete (criar) | 17 | 15 `CMD_REMINDERS_CREATE` | `schedule.createReminder` | EventKit, só os que ainda vão disparar (alerta › vencimento › 09:00 se só data), ≤20 e ≤ vagas da banda |
+| Lembrete (apagar) | 17 | 18 `CMD_REMINDERS_DELETE` | `schedule.deleteReminder.id[]` | apaga só os lembretes deste app antes de recriar |
 | Tempo (localização) | 10 | 7 `CMD_ADD_LOCATION` | `weather.location` | `WeatherSyncService`, chave `accu:<hash>` |
 | Tempo (atual) | 10 | 0 `CMD_SET_CURRENT_WEATHER` | `weather.current` | Open-Meteo, Guarapuava |
 | Tempo (previsão) | 10 | 1 `CMD_UPDATE_DAILY_FORECAST` | `weather.forecast` | 7 dias (hoje + 6) |
 
 > **O tempo é request-driven — a pulseira pede, o app responde.** A Mi Band 10 envia `CMD_REQUEST_CONDITIONS_FOR_LOCATION` (type=10, subtype=3) ao conectar e ao abrir a tela de tempo; a tela fica **aguardando a resposta a esse request**, então o push proativo (ao fim do `syncToHealth()`) sozinho não popula o widget. `BandManager.handleWeatherCommand` roteia subtype=3 para o callback `onWeatherConditionsRequest`, e `WeatherSyncService` responde com um push completo (location → current → forecast). A resposta **ecoa a chave/nome de localização que a banda pediu** (`requestedKey`/`requestedName`) para que ela vincule os dados; sem request, o push usa a localização padrão com `isCurrentLocation=true`. Status≠0 das respostas da banda aos nossos pushes (subtypes 0/1/7) é logado. Espelha `XiaomiWeatherService.onConditionRequestReceived` do GadgetBridge.
 
-> **Id de lembrete é atribuído pela banda.** O create não carrega id; a banda responde com `schedule.ackId` (type=17). `BandManager.onScheduleAck` captura esses ids, que `CalendarSyncService` persiste (`UserDefaults`) e usa para apagar no próximo sync — sem isso os lembretes acumulariam na pulseira.
+> **Id de lembrete é atribuído pela banda.** O create não carrega id; a banda responde com `schedule.ackId` (type=17, subtype=15). `BandManager.onScheduleAck` captura esses ids, que `CalendarSyncService` persiste (`UserDefaults`) junto com título e hora de cada lembrete enviado. No sync seguinte ele lê a lista da banda (`onReminderList`) e apaga os ids que conhece **e** os que batem em título+hora com o que enviou — um ack perdido não deixa mais um lembrete órfão disparando para sempre, e lembretes criados por outro app não são tocados. Sem a lista, o push é adiado para o próximo sync. `Esquecer pulseira` limpa esse estado (`CalendarSyncService.forgetBand`).
 
 > **Frames > MTU.** Calendário com muitos eventos passa do ATT MTU. `BandManager.writeSPP` fragmenta a frame em chunks do tamanho do MTU (`maximumWriteValueLength`); a banda reassembla pelo comprimento declarado na frame. Pacotes de auth/init cabem em um chunk — caminho do handshake inalterado.
 
