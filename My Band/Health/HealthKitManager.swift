@@ -399,7 +399,10 @@ final class HealthKitManager {
         let estimatedMaxHR = estimatedMaxHeartRate()
 
         guard canShare(workoutType) else {
-            if !workouts.isEmpty { log.warning("Not allowed to write workouts — skipped \(workouts.count, privacy: .public)") }
+            if !workouts.isEmpty {
+                skippedForPermission = true
+                log.warning("Not allowed to write workouts — skipped \(workouts.count, privacy: .public)")
+            }
             return (0, [:])
         }
 
@@ -876,6 +879,15 @@ final class HealthKitManager {
         return allowed.count
     }
 
+    /// Set when a write dropped samples for permission. BandSyncer takes it after each write group
+    /// and leaves those files un-ACKed: an ACK makes the band delete a file this app never wrote.
+    private var skippedForPermission = false
+
+    func takeSkippedForPermission() -> Bool {
+        defer { skippedForPermission = false }
+        return skippedForPermission
+    }
+
     /// One type switched off in Health → Data Access fails the whole save with "Not authorized", so
     /// samples of a type this app can't write are dropped (and named in the log) instead.
     private func shareable(_ samples: [HKSample]) -> [HKSample] {
@@ -886,6 +898,7 @@ final class HealthKitManager {
             return false
         }
         if !denied.isEmpty {
+            skippedForPermission = true
             log.warning("Not allowed to write \(denied.sorted().joined(separator: ", "), privacy: .public) — skipped")
         }
         return allowed
