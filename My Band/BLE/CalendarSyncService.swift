@@ -7,11 +7,11 @@ import EventKit
 // Pushes phone-side configuration TO the band (app → band, encrypted):
 //   • UI language   (System / CMD_LANGUAGE)        — from the current locale
 //   • calendar events (CMD_CALENDAR_SET)           — EventKit, next 30 days, ≤50 events
-//   • reminders     (Schedule / CMD_REMINDERS_*)   — EventKit reminders with a due date, ≤20
+//   • reminders     (Schedule / CMD_REMINDERS_*)   — EventKit reminders still to fire, ≤20
 //
 // Calendar sync is replace-semantics (the band swaps its whole event set), so it's idempotent.
-// Reminders have no bulk-replace, so we track the ids we created and delete them before
-// re-creating — this mirrors the iPhone's reminders without accumulating duplicates on the band.
+// Reminders have no bulk-replace, so every reminder on the band is deleted before re-creating —
+// this mirrors the iPhone's reminders without accumulating duplicates on the band.
 
 @MainActor
 final class CalendarSyncService {
@@ -93,9 +93,8 @@ final class CalendarSyncService {
                 e.start  = UInt32(ev.startDate.timeIntervalSince1970)
                 e.end    = UInt32(ev.endDate.timeIntervalSince1970)
                 e.allDay = ev.isAllDay
-                // First relative alarm (minutes before start) maps to the band's reminder.
-                if let offset = ev.alarms?.compactMap({ $0.relativeOffset }).min(), offset < 0 {
-                    e.notifyMinutesBefore = UInt32((-offset) / 60)
+                if let minutes = Self.notifyMinutesBefore(start: ev.startDate, alarms: ev.alarms ?? []) {
+                    e.notifyMinutesBefore = minutes
                 }
                 return e
             }
@@ -120,12 +119,16 @@ final class CalendarSyncService {
             return
         }
 
-        let reminders = await fetchDueReminders()
+        // Only reminders that will still fire: an overdue one is created on the band in the past.
+        let now = Date()
+        let upcoming = await fetchDueReminders()
+            .compactMap { r in Self.fireDate(of: r).map { (title: r.title ?? "Reminder", fires: $0) } }
+            .filter { $0.fires > now }
+            .sorted { $0.fires < $1.fires }
+            .prefix(maxReminders)
 
-        // Skip the delete+recreate churn when the due-reminder set hasn't changed since the last
-        // push. The persisted band-assigned ids stay valid, so there's nothing to reconcile.
-        let sig = signature(reminders.prefix(maxReminders)
-            .map { "\($0.title ?? "")|\($0.dueDateComponents?.date?.timeIntervalSince1970 ?? 0)" }
+        // Skip the delete+recreate churn when the upcoming set hasn't changed since the last push.
+        let sig = signature(upcoming.map { "\($0.title)|\($0.fires.timeIntervalSince1970)" }
             .joined(separator: ";"))
         guard UserDefaults.standard.string(forKey: lastRemindersKey) != sig else {
             log.debug("Reminders unchanged — skipping push")
@@ -135,11 +138,14 @@ final class CalendarSyncService {
         // Clear the reminders we created on a previous sync before re-creating, so the band mirrors
         // the current state instead of accumulating. The ids are the band-assigned ones captured
         // from the create-acks of the previous run (see below).
-        let previous = UserDefaults.standard.array(forKey: createdReminderIDsKey) as? [Int] ?? []
-        if !previous.isEmpty {
-            bandManager?.sendEncryptedCommand(
-                protoBytes: XiaomiProto.reminderDeleteCommand(ids: previous.map { UInt32($0) })
-            )
+        // The band's own list is authoritative: an id whose create-ack was missed is never
+        // persisted, so deleting only the remembered ids left that reminder firing forever.
+        let previous = (UserDefaults.standard.array(forKey: createdReminderIDsKey) as? [Int] ?? []).map { UInt32($0) }
+        let onBand = await fetchBandReminderIDs() ?? []
+        let stale = Array(Set(previous).union(onBand)).sorted()
+        if !stale.isEmpty {
+            log.info("Deleting \(stale.count) reminder(s) from the band")
+            bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.reminderDeleteCommand(ids: stale))
         }
 
         // The band assigns each reminder's id and returns it via schedule.ackId. Collect those acks
@@ -148,19 +154,61 @@ final class CalendarSyncService {
         bandManager?.onScheduleAck = { id in ackedIDs.append(Int(id)) }
         defer { bandManager?.onScheduleAck = nil }
 
-        var sent = 0
-        for reminder in reminders.prefix(maxReminders) {
-            guard let due = reminder.dueDateComponents?.date else { continue }
-            let details = XiaomiProto.reminderDetails(date: due, title: reminder.title ?? "Lembrete")
+        for reminder in upcoming {
+            let details = XiaomiProto.reminderDetails(date: reminder.fires, title: reminder.title)
             bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.reminderCreateCommand(details))
-            sent += 1
         }
 
-        // Give the band a moment to ack each create before persisting the ids it assigned.
-        try? await Task.sleep(for: .seconds(2))
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ackedIDs.count < upcoming.count, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
         UserDefaults.standard.set(ackedIDs, forKey: createdReminderIDsKey)
-        UserDefaults.standard.set(sig, forKey: lastRemindersKey)
-        log.info("Pushed \(sent) reminder(s), \(ackedIDs.count) acked")
+        // Unacked creates leave the signature unset, so the next sync redoes the push.
+        if ackedIDs.count == upcoming.count {
+            UserDefaults.standard.set(sig, forKey: lastRemindersKey)
+        }
+        log.info("Pushed \(upcoming.count) reminder(s), \(ackedIDs.count) acked")
+    }
+
+    /// The ids of every reminder on the band, or nil if it didn't answer in time.
+    private func fetchBandReminderIDs() async -> [UInt32]? {
+        guard let bandManager else { return nil }
+        var ids: [UInt32]?
+        bandManager.onReminderList = { ids = $0.reminder.map(\.id) }
+        defer { bandManager.onReminderList = nil }
+        bandManager.sendEncryptedCommand(protoBytes: XiaomiProto.remindersGetCommand())
+        let deadline = ContinuousClock.now + .seconds(3)
+        while ids == nil, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return ids
+    }
+
+    // MARK: - Fire times
+
+    /// When the band should buzz: the reminder's earliest alert, else its due time, else 09:00 on
+    /// a date-only due day (the iOS Reminders default for all-day reminders).
+    static func fireDate(due: DateComponents?, alarms: [EKAlarm], calendar: Calendar = .current) -> Date? {
+        var dueDate: Date?
+        if var comps = due, comps.year != nil, comps.month != nil, comps.day != nil {
+            if comps.hour == nil { comps.hour = 9; comps.minute = 0 }
+            dueDate = calendar.date(from: comps)
+        }
+        let alerts = alarms.compactMap { $0.absoluteDate ?? dueDate?.addingTimeInterval($0.relativeOffset) }
+        return alerts.min() ?? dueDate
+    }
+
+    static func fireDate(of reminder: EKReminder) -> Date? {
+        fireDate(due: reminder.dueDateComponents, alarms: reminder.alarms ?? [])
+    }
+
+    /// Minutes before `start` of the earliest alert. Nil for an alert at or after the start (an
+    /// all-day event's "9:00 on the day"), which the band's unsigned field cannot express.
+    static func notifyMinutesBefore(start: Date, alarms: [EKAlarm]) -> UInt32? {
+        guard let first = alarms.map({ $0.absoluteDate ?? start.addingTimeInterval($0.relativeOffset) }).min(),
+              first < start else { return nil }
+        return UInt32(start.timeIntervalSince(first) / 60)
     }
 
     private func fetchDueReminders() async -> [EKReminder] {
@@ -170,8 +218,7 @@ final class CalendarSyncService {
         return await withCheckedContinuation { cont in
             store.fetchReminders(matching: predicate) { reminders in
                 let withDue = (reminders ?? [])
-                    .filter { $0.dueDateComponents?.date != nil }
-                    .sorted { ($0.dueDateComponents?.date ?? .distantFuture) < ($1.dueDateComponents?.date ?? .distantFuture) }
+                    .filter { $0.dueDateComponents != nil }
                 cont.resume(returning: withDue)
             }
         }
