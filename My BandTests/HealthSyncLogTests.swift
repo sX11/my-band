@@ -55,13 +55,6 @@ struct HealthSyncLogTests {
         #expect(HealthSyncLog(defaults: defaults).last?.error == "boom")
     }
 
-    @Test func lockedFullSyncStaysFlaggedAfterAWorkoutSync() throws {
-        let log = HealthSyncLog(defaults: try freshDefaults())
-        log.record(HealthSyncReport(at: .now, waitingForUnlock: true))
-        log.record(HealthSyncReport(at: .now, workouts: 1), addingToLast: true)
-        #expect(log.last?.waitingForUnlock == true)
-    }
-
     @Test func resetForgetsEverything() throws {
         let defaults = try freshDefaults()
         let log = HealthSyncLog(defaults: defaults)

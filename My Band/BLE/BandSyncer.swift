@@ -124,6 +124,7 @@ final class BandSyncer {
     private(set) var currentDevice: BandDevice?
     var latestMetrics: LatestMetricsStore?
     var syncLog: HealthSyncLog?
+    var workoutWindows = WorkoutWindows()
 
     private weak var bandManager: BandManager?
     private var modelContext: ModelContext?
@@ -251,7 +252,7 @@ final class BandSyncer {
     //   sleep         → SleepDetailsParser   → HealthKit sleepAnalysis (+ SwiftData)
     //   daily summary → DailySummaryParser   → HealthKit HR/SpO₂ extremes (+ ActivityDay)
     //   daily details → DailyDetailsParser   → HealthKit per-minute HR/SpO₂ (raw) +
-    //                                           steps/distance/energy (reconciled vs iPhone)
+    //                                           steps/distance/energy (raw)
     // Each file is ACKed so the band marks it synced.
 
     struct HealthSyncOutcome {
@@ -385,7 +386,7 @@ final class BandSyncer {
     // was fetched — not only the ones that produced writable samples — so a file that parses to
     // nothing (or whose sibling already synced) doesn't get re-offered forever. The daily summary is
     // written and ACK'd inline; sleep, manual, workout, and daily-detail files are batched, so their
-    // ACKs go out after the batch write (daily details are batched so the reconciliation can exclude
+    // ACKs go out after the batch write (daily details are batched so the activity write can exclude
     // workout-covered minutes). If a write throws or the app is killed before ACKs are sent, the band
     // re-offers those files on the next connection — no data is lost.
 
@@ -430,12 +431,11 @@ final class BandSyncer {
         var outcome = HealthSyncOutcome()
         var handled = Set<Data>()
         var completed = false
-        var waitingForUnlock = false
         HealthKitManager.shared.beginTally()
         // On every exit, so a write that throws still reports what reached Apple Health before it.
         defer {
             syncLog?.record(HealthSyncReport(
-                at: .now, failed: !completed, waitingForUnlock: waitingForUnlock, filesFetched: handled.count,
+                at: .now, failed: !completed, filesFetched: handled.count,
                 filesFailed: fileIds.filter { !handled.contains($0) }.count,
                 sleepSessions: outcome.sleepSessions, dailySummaries: outcome.dailySummaries,
                 minuteSamples: outcome.minuteSamples, manualSamples: outcome.manualSamples,
@@ -524,7 +524,7 @@ final class BandSyncer {
                     }
                     ackUnlessSkipped([fileId], "daily summary", manager: manager)
                 } else if meta.isDailyDetails {
-                    // Batched (not written inline) so the reconciliation can exclude minutes covered
+                    // Batched (not written inline) so the activity write can exclude minutes covered
                     // by a workout — those file ids are only fully known after the loop.
                     let minutes = DailyDetailsParser.parse(fileData, meta: meta)
                     outcome.minuteSamples += minutes.count
@@ -604,32 +604,34 @@ final class BandSyncer {
         }
         ackUnlessSkipped(manualIds, "manual", manager: manager)
 
+        // Weight, age, sleep cleanup and recovery pairing read Health, which a locked phone refuses
+        // while still accepting saves. Everything is written; the files those reads feed stay
+        // un-ACKed so an unlocked sync rewrites them in full under the same sync identifiers.
+        let healthReadable = Self.healthReadable
+        if !healthReadable { log.notice("Phone locked — workout and daily detail files left un-ACKed for a sync after unlock") }
+
         _ = HealthKitManager.shared.takeSkippedForPermission()
         if !workoutsToWrite.isEmpty {
             outcome.workouts = workoutsToWrite.count
             let result = try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes, heartRates: workoutHeartRates)
             outcome.healthSamplesWritten += result.written
+            workoutWindows.record(workoutsToWrite
+                .filter { result.saved[Int($0.startDate.timeIntervalSince1970)] != nil }
+                .map { .init(start: $0.startDate, end: $0.endDate) })
         }
         // Workout summary + GPS files: a GPS file can be pending without a parseable summary (its
         // summary was ACKed in an earlier sync), which used to leave it dangling forever.
-        ackUnlessSkipped(workoutIds, "workout", manager: manager)
+        if healthReadable { ackUnlessSkipped(workoutIds, "workout", manager: manager) }
 
-        // Daily details last: HR/SpO₂ raw (band-exclusive), and steps/distance/energy reconciled
-        // against the iPhone — excluding minutes inside a workout, whose distance/energy the workout
-        // samples above already contribute.
+        // Daily details last: HR/SpO₂ and steps/distance/energy per minute, leaving out distance and
+        // energy inside a workout, which the workout samples above already contribute.
         _ = HealthKitManager.shared.takeSkippedForPermission()
-        var detailsWaitForUnlock = false
         if !detailMinutes.isEmpty {
-            let workoutWindows = workoutsToWrite.map { (start: $0.startDate, end: $0.endDate) }
+            // Stored windows, not just this batch: a workout the post-workout sync already wrote is
+            // missing from workoutsToWrite when its daily-details file arrives later.
+            let windows = workoutWindows.all().map { (start: $0.start, end: $0.end) }
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(detailMinutes)
-            do {
-                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeReconciledActivity(detailMinutes, excludingWorkouts: workoutWindows)
-            } catch where HealthKitManager.isLockedOut(error) {
-                // Reconciling reads the iPhone's own totals, which a locked phone refuses; writing the
-                // band's in full instead would double-count. Un-ACKed, the files come back next sync.
-                detailsWaitForUnlock = true
-                log.notice("Phone locked — steps/distance/energy left for a sync after unlock (\(detailIds.count, privacy: .public) daily detail file(s) un-ACKed)")
-            }
+            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeActivity(detailMinutes, excludingWorkouts: windows)
             // Cardio Recovery: pairs recent workouts already in Health with the post-workout
             // per-minute HR this batch carries. Best-effort — must not block the ACKs below.
             do {
@@ -638,11 +640,18 @@ final class BandSyncer {
                 log.error("Cardio recovery write failed: \(error.localizedDescription)")
             }
         }
-        if !detailsWaitForUnlock { ackUnlessSkipped(detailIds, "daily detail", manager: manager) }
+        if healthReadable { ackUnlessSkipped(detailIds, "daily detail", manager: manager) }
 
-        waitingForUnlock = detailsWaitForUnlock
         completed = true
         return outcome
+    }
+
+    private static var healthReadable: Bool {
+        #if canImport(UIKit)
+        UIApplication.shared.isProtectedDataAvailable
+        #else
+        true
+        #endif
     }
 
     /// The band re-offers an un-ACKed file, so one whose samples were dropped for a Health type

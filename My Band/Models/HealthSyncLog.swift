@@ -17,8 +17,6 @@ struct HealthSyncReport: Codable, Equatable {
     var at: Date
     /// A write threw part-way: the counts are what reached Apple Health before it did.
     var failed = false
-    /// The phone was locked, so steps/distance/energy wait for a sync after it is unlocked.
-    var waitingForUnlock = false
     /// Why a failed sync stopped.
     var error: String?
     var filesFetched = 0
@@ -39,7 +37,6 @@ struct HealthSyncReport: Codable, Equatable {
         var r = self
         r.at = other.at
         r.failed = failed || other.failed
-        r.waitingForUnlock = waitingForUnlock || other.waitingForUnlock
         r.error = other.error ?? error
         r.filesFetched += other.filesFetched
         r.filesFailed += other.filesFailed
