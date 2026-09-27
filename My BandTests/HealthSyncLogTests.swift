@@ -43,6 +43,18 @@ struct HealthSyncLogTests {
         #expect(log.last?.at == t.addingTimeInterval(60))
     }
 
+    @Test func failureReasonIsKeptOnlyForAFailedSync() throws {
+        struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
+        let defaults = try freshDefaults()
+        let log = HealthSyncLog(defaults: defaults)
+        log.record(HealthSyncReport(at: .now))
+        log.noteFailure(Boom())
+        #expect(log.last?.error == nil)
+        log.record(HealthSyncReport(at: .now, failed: true))
+        log.noteFailure(Boom())
+        #expect(HealthSyncLog(defaults: defaults).last?.error == "boom")
+    }
+
     @Test func resetForgetsEverything() throws {
         let defaults = try freshDefaults()
         let log = HealthSyncLog(defaults: defaults)

@@ -60,6 +60,9 @@ struct HealthSyncView: View {
                 }
                 row("Total", MBFormat.number(r.total))
             }
+            if r.failed, let error = r.error {
+                Text("Stopped: \(error)").font(.mbFootnote).foregroundStyle(MB.textSecondary)
+            }
         }
         .listRowBackground(MB.surfaceCard)
     }
