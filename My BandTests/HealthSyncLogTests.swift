@@ -43,6 +43,25 @@ struct HealthSyncLogTests {
         #expect(log.last?.at == t.addingTimeInterval(60))
     }
 
+    @Test func failureReasonIsKeptOnlyForAFailedSync() throws {
+        struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
+        let defaults = try freshDefaults()
+        let log = HealthSyncLog(defaults: defaults)
+        log.record(HealthSyncReport(at: .now))
+        log.noteFailure(Boom())
+        #expect(log.last?.error == nil)
+        log.record(HealthSyncReport(at: .now, failed: true))
+        log.noteFailure(Boom())
+        #expect(HealthSyncLog(defaults: defaults).last?.error == "boom")
+    }
+
+    @Test func lockedFullSyncStaysFlaggedAfterAWorkoutSync() throws {
+        let log = HealthSyncLog(defaults: try freshDefaults())
+        log.record(HealthSyncReport(at: .now, waitingForUnlock: true))
+        log.record(HealthSyncReport(at: .now, workouts: 1), addingToLast: true)
+        #expect(log.last?.waitingForUnlock == true)
+    }
+
     @Test func resetForgetsEverything() throws {
         let defaults = try freshDefaults()
         let log = HealthSyncLog(defaults: defaults)

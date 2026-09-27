@@ -294,7 +294,9 @@ final class BandSyncer {
         let fileIds = try await fetchFileIds(manager: manager)
         log.info("Received \(fileIds.count) file ID(s)")
 
-        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context)
+        let outcome = try await reportingFailure {
+            try await processActivityFiles(fileIds, manager: manager, context: context)
+        }
         markSynced(context)
 
         log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
@@ -341,8 +343,10 @@ final class BandSyncer {
         }
 
         log.info("Targeted workout sync — \(fileIds.count) file(s)")
-        let outcome = try await processActivityFiles(fileIds, manager: manager, context: context,
-                                                     addingToLastReport: true)
+        let outcome = try await reportingFailure {
+            try await processActivityFiles(fileIds, manager: manager, context: context,
+                                           addingToLastReport: true)
+        }
         markSynced(context)
         log.info("Targeted workout sync done — \(outcome.healthSamplesWritten) samples written")
         return outcome
@@ -410,6 +414,15 @@ final class BandSyncer {
     }
     #endif
 
+    private func reportingFailure(_ body: () async throws -> HealthSyncOutcome) async throws -> HealthSyncOutcome {
+        do {
+            return try await body()
+        } catch {
+            syncLog?.noteFailure(error)
+            throw error
+        }
+    }
+
     private func processActivityFiles(_ fileIds: [Data],
                                       manager: BandManager,
                                       context: ModelContext,
@@ -417,11 +430,12 @@ final class BandSyncer {
         var outcome = HealthSyncOutcome()
         var handled = Set<Data>()
         var completed = false
+        var waitingForUnlock = false
         HealthKitManager.shared.beginTally()
         // On every exit, so a write that throws still reports what reached Apple Health before it.
         defer {
             syncLog?.record(HealthSyncReport(
-                at: .now, failed: !completed, filesFetched: handled.count,
+                at: .now, failed: !completed, waitingForUnlock: waitingForUnlock, filesFetched: handled.count,
                 filesFailed: fileIds.filter { !handled.contains($0) }.count,
                 sleepSessions: outcome.sleepSessions, dailySummaries: outcome.dailySummaries,
                 minuteSamples: outcome.minuteSamples, manualSamples: outcome.manualSamples,
@@ -604,10 +618,18 @@ final class BandSyncer {
         // against the iPhone — excluding minutes inside a workout, whose distance/energy the workout
         // samples above already contribute.
         _ = HealthKitManager.shared.takeSkippedForPermission()
+        var detailsWaitForUnlock = false
         if !detailMinutes.isEmpty {
             let workoutWindows = workoutsToWrite.map { (start: $0.startDate, end: $0.endDate) }
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(detailMinutes)
-            outcome.healthSamplesWritten += try await HealthKitManager.shared.writeReconciledActivity(detailMinutes, excludingWorkouts: workoutWindows)
+            do {
+                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeReconciledActivity(detailMinutes, excludingWorkouts: workoutWindows)
+            } catch where HealthKitManager.isLockedOut(error) {
+                // Reconciling reads the iPhone's own totals, which a locked phone refuses; writing the
+                // band's in full instead would double-count. Un-ACKed, the files come back next sync.
+                detailsWaitForUnlock = true
+                log.notice("Phone locked — steps/distance/energy left for a sync after unlock (\(detailIds.count, privacy: .public) daily detail file(s) un-ACKed)")
+            }
             // Cardio Recovery: pairs recent workouts already in Health with the post-workout
             // per-minute HR this batch carries. Best-effort — must not block the ACKs below.
             do {
@@ -616,8 +638,9 @@ final class BandSyncer {
                 log.error("Cardio recovery write failed: \(error.localizedDescription)")
             }
         }
-        ackUnlessSkipped(detailIds, "daily detail", manager: manager)
+        if !detailsWaitForUnlock { ackUnlessSkipped(detailIds, "daily detail", manager: manager) }
 
+        waitingForUnlock = detailsWaitForUnlock
         completed = true
         return outcome
     }

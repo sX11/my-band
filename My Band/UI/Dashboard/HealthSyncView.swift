@@ -60,6 +60,13 @@ struct HealthSyncView: View {
                 }
                 row("Total", MBFormat.number(r.total))
             }
+            if r.failed, let error = r.error {
+                Text("Stopped: \(error)").font(.mbFootnote).foregroundStyle(MB.textSecondary)
+            }
+            if r.waitingForUnlock {
+                Text("The phone was locked, so steps, distance and energy wait for a sync after it's unlocked. Apple Health can't be read while locked, and they are matched against the iPhone's own counts.")
+                    .font(.mbFootnote).foregroundStyle(MB.textSecondary)
+            }
         }
         .listRowBackground(MB.surfaceCard)
     }

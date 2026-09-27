@@ -245,7 +245,8 @@ struct DashboardView: View {
 
     private func healthSyncFoot(_ r: HealthSyncReport) -> String {
         let sent = "\(MBFormat.number(r.total)) samples sent"
-        return r.failed ? "\(sent) · sync failed" : sent
+        if r.failed { return "\(sent) · sync failed" }
+        return r.waitingForUnlock ? "\(sent) · steps after unlock" : sent
     }
 
     private func healthSyncTile(now: Date) -> some View {

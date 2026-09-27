@@ -36,6 +36,11 @@ final class HealthKitManager {
 
     var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
+    /// Reads fail while the iPhone is locked; saves don't (HealthKit caches them until unlock).
+    static func isLockedOut(_ error: Error) -> Bool {
+        (error as? HKError)?.code == .errorDatabaseInaccessible
+    }
+
     // Types we write.
     private let sleepType   = HKCategoryType(.sleepAnalysis)
     private let heartRate   = HKQuantityType(.heartRate)

@@ -17,6 +17,10 @@ struct HealthSyncReport: Codable, Equatable {
     var at: Date
     /// A write threw part-way: the counts are what reached Apple Health before it did.
     var failed = false
+    /// The phone was locked, so steps/distance/energy wait for a sync after it is unlocked.
+    var waitingForUnlock = false
+    /// Why a failed sync stopped.
+    var error: String?
     var filesFetched = 0
     /// Requested files the band never delivered.
     var filesFailed = 0
@@ -35,6 +39,8 @@ struct HealthSyncReport: Codable, Equatable {
         var r = self
         r.at = other.at
         r.failed = failed || other.failed
+        r.waitingForUnlock = waitingForUnlock || other.waitingForUnlock
+        r.error = other.error ?? error
         r.filesFetched += other.filesFetched
         r.filesFailed += other.filesFailed
         r.sleepSessions += other.sleepSessions
@@ -56,7 +62,7 @@ final class HealthSyncLog {
     private(set) var lastByType: [String: HealthSyncReport.TypeTotal]
 
     private let defaults: UserDefaults
-    private static let lastKey = "healthSyncLastReportV2"
+    private static let lastKey = "healthSyncLastReportV3"
     private static let byTypeKey = "healthSyncLastByTypeV2"
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "HealthSyncLog")
 
@@ -78,6 +84,18 @@ final class HealthSyncLog {
             let encoder = JSONEncoder()
             defaults.set(try encoder.encode(report), forKey: Self.lastKey)
             defaults.set(try encoder.encode(lastByType), forKey: Self.byTypeKey)
+        } catch {
+            log.error("Could not save the sync report: \(error.localizedDescription)")
+        }
+    }
+
+    /// The report is written as the sync unwinds, before the error reaches the caller.
+    func noteFailure(_ error: Error) {
+        guard var report = last, report.failed else { return }
+        report.error = error.localizedDescription
+        last = report
+        do {
+            defaults.set(try JSONEncoder().encode(report), forKey: Self.lastKey)
         } catch {
             log.error("Could not save the sync report: \(error.localizedDescription)")
         }
