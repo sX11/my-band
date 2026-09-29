@@ -78,6 +78,7 @@ struct RootView: View {
         AppServices.shared.alarms.reset()
         AppServices.shared.bandSettings.reset()
         AppServices.shared.todayActivity.reset()
+        AppServices.shared.workoutLive.reset()
         AppServices.shared.latestMetrics.reset()
         AppServices.shared.syncLog.reset()
         CalendarSyncService.forgetBand()

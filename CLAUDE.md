@@ -1,6 +1,6 @@
 # CLAUDE.md — My Band
 
-Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Os dados de saúde ficam no Apple Health; as exceções são o card Today da Dashboard, com os contadores ao vivo da pulseira (ADR 0005), e a folha Health, com o último valor de cada leitura vindo do último sync (ADR 0006).
+Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Os dados de saúde ficam no Apple Health; as exceções são o card Today da Dashboard, com os contadores ao vivo da pulseira (ADR 0005), o card de treino ao vivo, enquanto a pulseira grava um treino (ADR 0008), e a folha Health, com o último valor de cada leitura vindo do último sync (ADR 0006).
 
 ---
 
@@ -8,7 +8,7 @@ Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS unive
 
 | Item | Detalhe |
 |---|---|
-| Plataformas | iOS 26+ (um único target Xcode; roda no Mac via "Designed for iPad and iPhone", não é target macOS nativo — `IPHONEOS_DEPLOYMENT_TARGET` no pbxproj é a fonte da verdade) |
+| Plataformas | iOS 26+ (target do app mais a extensão WidgetKit `MyBandWidgets`, que desenha a Live Activity do treino; roda no Mac via "Designed for iPad and iPhone", não é target macOS nativo — `IPHONEOS_DEPLOYMENT_TARGET` no pbxproj é a fonte da verdade) |
 | Linguagem | Swift 5.10+ |
 | UI | SwiftUI, Liquid Glass no chrome/status (`MBStatusPill` etc.) |
 | Persistência | SwiftData |
@@ -39,6 +39,7 @@ My Band/
 │   ├── WeatherSyncService.swift  # Push app→band: tempo atual + previsão (Open-Meteo)
 │   ├── BandSettingsService.swift # Configurações da pulseira (FC, SpO₂, estresse, lembretes, tela): GET/SET + releitura
 │   ├── TodayActivityService.swift # Leitura única do realtime stats para o card Today da Dashboard
+│   ├── WorkoutLiveService.swift  # Treino em curso na pulseira (status 8/26 + realtime + GPS) para o card de treino (ADR 0008)
 │   ├── Scale/                    # Balança BLE OKOK/Chipsea (independente da pulseira)
 │   │   ├── ScaleManager.swift    # Escuta o anúncio (broadcast-only) e grava peso no Apple Health
 │   │   └── ScaleWeightParser.swift # Decode do peso (variante VC0)
@@ -79,8 +80,11 @@ My Band/
     ├── Sleep/                    # Visualização detalhada de sono
     ├── Profile/                  # Perfil do usuário (altura → IMC no Apple Health)
     ├── Customize/                # Watch faces e apps RPK
-    └── Settings/                 # Configurações gerais
+    ├── Settings/                 # Configurações gerais
+    └── LiveActivity/             # WorkoutActivityController: Live Activity do treino (ADR 0008)
 ```
+
+Fora de `My Band/`: `MyBandWidgets/` (extensão WidgetKit; o Info.plist dela fica em `MyBandWidgets-Info.plist`, na raiz, pela mesma armadilha do Info.plist do app) e `Shared/` (sincronizado nos dois targets: `WorkoutActivityAttributes`, `WorkoutClockFormat`).
 
 ---
 
@@ -417,9 +421,9 @@ A UI é construída a partir do handoff do **Claude Design** (`My Band — Desig
 - **Cantos** contínuos: cards 16, sheets 20, hero/modal 28, pills redondos. **4-pt grid**, gutter 20, hit target ≥44.
 - **Ícones**: SF Symbols (kit web usa Lucide como substituto). Status sempre cor + símbolo, nunca cor sozinha.
 
-**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Métrica de saúde só no card Today (ADR 0005) e no card/folha Latest metrics (ADR 0006); fora dele o número é sempre de status/sync. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
+**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Métrica de saúde só no card Today (ADR 0005) e no card/folha Latest metrics (ADR 0006) e no card de treino e na Live Activity enquanto a pulseira grava um treino (ADR 0008); fora deles o número é sempre de status/sync. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
 
-**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar, alarmes, configurações da pulseira, o card Today — ADR 0005 — e a folha Health — ADR 0006), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
+**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar, alarmes, configurações da pulseira, o card Today — ADR 0005 —, a folha Health — ADR 0006 — e o card de treino ao vivo — ADR 0008), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
 
 **Componentes do kit** (`components/`): core (`Button`, `IconButton`, `StatusPill`, `Badge`), forms (`Switch`, `TextField`, `SegmentedControl`), data (`ListRow`, `Card`, `MetricTile`, `SectionHeader`, `SleepBar`). Cada um tem `.prompt.md` e `.d.ts` descrevendo props/variantes.
 

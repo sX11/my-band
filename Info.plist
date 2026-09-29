@@ -59,6 +59,8 @@
 	<string>My Band sends your dated reminders to the Mi Band 10 so the band alerts you at the right time.</string>
 	<key>NSRemindersUsageDescription</key>
 	<string>My Band sends your dated reminders to the Mi Band 10 so the band alerts you at the right time.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

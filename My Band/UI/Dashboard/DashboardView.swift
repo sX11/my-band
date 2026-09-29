@@ -3,8 +3,8 @@ import SwiftUI
 // MARK: - DashboardView
 //
 // Live band status, battery, last Apple Health sync and the sync action, the band's alarms and
-// settings, today's activity read live from the band (ADR 0005), and the latest health readings
-// from the last sync (ADR 0006).
+// settings, today's activity read live from the band (ADR 0005), the latest health readings from
+// the last sync (ADR 0006), and the workout running on the band (ADR 0008).
 
 struct DashboardView: View {
 
@@ -13,6 +13,7 @@ struct DashboardView: View {
     @Environment(AlarmService.self) private var alarms
     @Environment(BandSettingsService.self) private var settings
     @Environment(TodayActivityService.self) private var today
+    @Environment(WorkoutLiveService.self) private var workout
     @Environment(LatestMetricsStore.self) private var latest
     @Environment(HealthSyncLog.self) private var syncLog
     @Environment(\.scenePhase) private var scenePhase
@@ -27,6 +28,7 @@ struct DashboardView: View {
     @State private var showSettings = false
     @State private var showMetrics = false
     @State private var showHealthSync = false
+    @State private var showWorkout = false
 
     private var connected: Bool { band.connectionState.isConnected }
     /// Mid-handshake (or scanning) — a reconnect is already under way, so the button waits.
@@ -44,6 +46,10 @@ struct DashboardView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: MB.Space.x5) {
                     header
+                    if let current = workout.current {
+                        Button { showWorkout = true } label: { WorkoutLiveCard(workout: current) }
+                            .buttonStyle(.plain)
+                    }
                     metrics
                     syncSection
                     MBButton(title: "Customize", variant: .secondary, size: .lg,
@@ -74,6 +80,7 @@ struct DashboardView: View {
         .sheet(isPresented: $showSettings) { BandSettingsView() }
         .sheet(isPresented: $showMetrics) { LatestMetricsView(deviceID: syncer.currentDevice?.id) }
         .sheet(isPresented: $showHealthSync) { HealthSyncView() }
+        .sheet(isPresented: $showWorkout) { WorkoutLiveView() }
         .task(id: connected) {
             guard connected else { return }
             alarms.requestList()

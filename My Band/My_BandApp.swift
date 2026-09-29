@@ -60,6 +60,7 @@ struct My_BandApp: App {
                 .environment(services.alarms)
                 .environment(services.bandSettings)
                 .environment(services.todayActivity)
+                .environment(services.workoutLive)
                 .environment(services.latestMetrics)
                 .environment(services.syncLog)
                 .onOpenURL { url in
@@ -80,6 +81,8 @@ struct My_BandApp: App {
                 // suspenso pode ter deixado nada pendente — este empurrão evita um "desconectado"
                 // morto sem como reconectar.
                 AppServices.shared.reconnectIfNeeded()
+                // iOS only starts a Live Activity in the foreground; a workout begun in the pocket waits for this.
+                AppServices.shared.workoutActivity.retryIfNeeded()
             default:
                 break
             }

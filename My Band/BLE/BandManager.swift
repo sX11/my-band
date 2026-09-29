@@ -462,8 +462,26 @@ final class BandManager: NSObject {
 
     /// Who is using the band's live real-time stats stream; STOP waits for the last of them.
     enum RealtimeHolder: String {
-        case hrRecovery, todayActivity
+        case hrRecovery, todayActivity, workout
     }
+
+    /// Every workoutStatusWatch (Health, subtype 26), whole — WorkoutGpsService keeps its own callback.
+    func observeWorkoutStatus(_ observer: @escaping (Xiaomi_WorkoutStatusWatch) -> Void) {
+        workoutStatusObservers.append(observer)
+    }
+    private var workoutStatusObservers: [(Xiaomi_WorkoutStatusWatch) -> Void] = []
+
+    /// Fired on every successful handshake, including the band's own session restart after init.
+    func observeAuthenticated(_ observer: @escaping () -> Void) {
+        authenticatedObservers.append(observer)
+    }
+    private var authenticatedObservers: [() -> Void] = []
+
+    /// Fired on every link teardown, after the realtime holders are cleared.
+    func observeLinkLost(_ observer: @escaping () -> Void) {
+        linkLostObservers.append(observer)
+    }
+    private var linkLostObservers: [() -> Void] = []
 
     /// Every live real-time stats event (Health, subtype 47) goes to each observer, whole.
     func observeRealtime(_ observer: @escaping (Xiaomi_RealTimeStats) -> Void) {
@@ -471,8 +489,8 @@ final class BandManager: NSObject {
     }
     private var realtimeObservers: [(Xiaomi_RealTimeStats) -> Void] = []
 
-    /// Turns the band's live real-time stats stream on/off for one holder: post-workout HR recovery
-    /// and the Dashboard's Today reading.
+    /// Turns the band's live real-time stats stream on/off for one holder: post-workout HR recovery,
+    /// the Dashboard's Today reading and a live workout.
     func setRealtimeStats(enabled: Bool, holder: RealtimeHolder) {
         // Several features share the one stream; STOP goes out only when the last one lets go, so
         // the Dashboard's reading can't cut off a post-workout recovery capture. START is re-sent
@@ -914,6 +932,7 @@ final class BandManager: NSObject {
             let fileIds = watch.hasActivityFileIds ? watch.activityFileIds : Data()
             log.info("Workout status update: \(watch.status) (\(fileIds.count / 7) file id(s))")
             onWorkoutStatusWatch?(watch.status, fileIds)
+            workoutStatusObservers.forEach { $0(watch) }
         case XiaomiHealthCmd.realtimeEvent where cmd.hasHealth && cmd.health.hasRealTimeStats:
             realtimeObservers.forEach { $0(cmd.health.realTimeStats) }
         case XiaomiHealthCmd.spo2Get ... XiaomiHealthCmd.stressSet,
@@ -1119,6 +1138,7 @@ final class BandManager: NSObject {
         if let p = peripheral {
             onAuthenticated?(p.name ?? "Mi Band 10", p.identifier.uuidString)
         }
+        authenticatedObservers.forEach { $0() }
         sendPostAuthInit()
         startGattBatteryUpdates()
     }
@@ -1295,6 +1315,7 @@ final class BandManager: NSObject {
         sessionKeys  = nil
         // The band's stream dies with the link; a holder kept past it would block the next STOP.
         realtimeHolders.removeAll()
+        linkLostObservers.forEach { $0() }
         seqNum       = 0
         rxBuffer     = Data()
         authStep3Sent = false

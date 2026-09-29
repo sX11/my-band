@@ -143,6 +143,7 @@ extension Font {
     static let mbCaption      = Font.system(size: 12, weight: .regular)
 
     static let mbDataMD = Font.system(size: 28, weight: .semibold)
+    static let mbDataLG = Font.system(size: 48, weight: .semibold)
 
     static let mbMono   = Font.system(size: 14, weight: .medium, design: .monospaced)
     static let mbMonoSm = Font.system(size: 12, weight: .medium, design: .monospaced)

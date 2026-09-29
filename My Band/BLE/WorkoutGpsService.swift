@@ -25,6 +25,9 @@ final class WorkoutGpsService: NSObject {
     /// files instead of re-listing the whole backlog.
     var onWorkoutFinished: ((Data) -> Void)?
 
+    /// Each fix actually sent to the band — only while an outdoor workout runs, never while paused.
+    var onLocationStreamed: ((CLLocation) -> Void)?
+
     /// Fired ~3 minutes after a strength workout finishes, carrying the strength workout's start (to
     /// correlate with the workout) plus the continuously-measured post-workout heart-rate recovery
     /// samples. BandSyncer appends them to the (window-extended) strength workout's HR graph.
@@ -404,6 +407,7 @@ extension WorkoutGpsService: CLLocationManagerDelegate {
             bearing:   Float(loc.course >= 0 ? loc.course : 0)
         )
         bandManager?.sendEncryptedCommand(protoBytes: proto)
+        onLocationStreamed?(loc)
         log.debug("GPS location sent: (\(loc.coordinate.latitude, privacy: .private), \(loc.coordinate.longitude, privacy: .private))")
     }
 }

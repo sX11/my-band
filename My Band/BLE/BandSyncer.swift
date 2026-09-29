@@ -124,6 +124,7 @@ final class BandSyncer {
     private(set) var currentDevice: BandDevice?
     var latestMetrics: LatestMetricsStore?
     var syncLog: HealthSyncLog?
+    var workoutLive: WorkoutLiveService?
     var workoutWindows = WorkoutWindows()
 
     private weak var bandManager: BandManager?
@@ -169,6 +170,9 @@ final class BandSyncer {
 
         workoutGps.onWorkoutFinished = { [weak self] fileIds in
             Task { @MainActor in await self?.handleWorkoutFinished(fileIds) }
+        }
+        workoutGps.onLocationStreamed = { [weak self] loc in
+            self?.workoutLive?.ingest(fix: loc)
         }
     }
 
