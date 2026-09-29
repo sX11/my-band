@@ -25,6 +25,9 @@ final class WorkoutGpsService: NSObject {
     /// files instead of re-listing the whole backlog.
     var onWorkoutFinished: ((Data) -> Void)?
 
+    /// Each fix actually sent to the band — only while an outdoor workout runs, never while paused.
+    var onLocationStreamed: ((CLLocation) -> Void)?
+
     /// Fired ~3 minutes after a strength workout finishes, carrying the strength workout's start (to
     /// correlate with the workout) plus the continuously-measured post-workout heart-rate recovery
     /// samples. BandSyncer appends them to the (window-extended) strength workout's HR graph.
@@ -78,8 +81,9 @@ final class WorkoutGpsService: NSObject {
         manager.onWorkoutStatusWatch = { [weak self] status, fileIds in
             Task { @MainActor in self?.handleWorkoutStatus(status, fileIds: fileIds) }
         }
-        manager.onRealtimeStats = { [weak self] hr in
-            Task { @MainActor in self?.ingestRecoveryHR(hr) }
+        manager.observeRealtime { [weak self] stats in
+            guard stats.hasHeartRate, stats.heartRate > 0 else { return }
+            Task { @MainActor in self?.ingestRecoveryHR(Int(stats.heartRate)) }
         }
 
         locationManager.delegate = self
@@ -260,14 +264,14 @@ final class WorkoutGpsService: NSObject {
         localStart = Date()
         recoveryHR = []
         locationManager.startUpdatingLocation()
-        bandManager?.setRealtimeStats(enabled: true)
+        bandManager?.setRealtimeStats(enabled: true, holder: .hrRecovery)
         log.info("Strength finished — recording \(Int(self.recoveryDuration))-s HR recovery (realtime)")
         recoveryTimer?.cancel()
         recoveryTimer = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(self?.recoveryDuration ?? 180))
             guard let self, !Task.isCancelled else { return }
             let samples = self.recoveryHR
-            self.bandManager?.setRealtimeStats(enabled: false)
+            self.bandManager?.setRealtimeStats(enabled: false, holder: .hrRecovery)
             self.stopLocalRecording()
             self.recoveryPendingStrengthStart = nil
             self.log.info("HR recovery done — \(samples.count) sample(s)")
@@ -403,6 +407,7 @@ extension WorkoutGpsService: CLLocationManagerDelegate {
             bearing:   Float(loc.course >= 0 ? loc.course : 0)
         )
         bandManager?.sendEncryptedCommand(protoBytes: proto)
+        onLocationStreamed?(loc)
         log.debug("GPS location sent: (\(loc.coordinate.latitude, privacy: .private), \(loc.coordinate.longitude, privacy: .private))")
     }
 }

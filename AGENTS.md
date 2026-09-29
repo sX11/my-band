@@ -138,7 +138,7 @@ A Mi Band 10 suporta mini apps via protocolo proprietário ainda em processo de 
 - [x] **Parsers de medição manual + treinos (2026-06-19)** — `ManualSamplesParser` (FC/SpO₂/estresse/temperatura), `WorkoutSummaryParser` (+ builder posicional, todas as modalidades) e `WorkoutGpsParser`; `HealthKitManager` grava `HKWorkout`/rota GPS/VO₂máx/temperatura/FC de repouso. Corrigido crash de autorização do `appleStandHour`. **Pendente validação em hardware.**
 - [ ] **UI: SleepDetail + Settings** → próximas telas do handoff do Claude Design
 - [ ] **Parsers de device info / bateria** → `Proto command type=2` ainda só logados; parsear para alimentar o Dashboard
-- [x] **HealthKit** → `HealthKitManager` + reconciliação por minuto + deduplicação
+- [x] **HealthKit** → `HealthKitManager` + passos/distância/energia crus por minuto + deduplicação
 - [x] **App Intents** → `SyncBandIntent` + `GetSleepStateIntent` + `CheckBandBatteryIntent` + `BandShortcuts`
 - [x] **AuthKey via Xiaomi Cloud** → `XiaomiCloudAuth` por usuário/senha (fluxo alternativo ao manual)
 - [ ] **Mini App** → (fase futura, aguardar definição de protocolo)

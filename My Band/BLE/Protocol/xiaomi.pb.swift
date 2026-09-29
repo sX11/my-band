@@ -3005,14 +3005,16 @@ nonisolated struct Xiaomi_SpO2: Sendable {
   /// Clears the value of `unknown1`. Subsequent reads from it will return its default value.
   mutating func clearUnknown1() {self._unknown1 = nil}
 
-  var allDayTracking: Bool {
-    get {_allDayTracking ?? false}
-    set {_allDayTracking = newValue}
+  /// Hand-patched from the old `bool allDayTracking`, as upstream GadgetBridge did: the band sends
+  /// a mode (0 off, 1 sleep-only, 2 all-day), so a bool `true` on the wire meant sleep-only.
+  var mode: UInt32 {
+    get {_mode ?? 0}
+    set {_mode = newValue}
   }
-  /// Returns true if `allDayTracking` has been explicitly set.
-  var hasAllDayTracking: Bool {self._allDayTracking != nil}
-  /// Clears the value of `allDayTracking`. Subsequent reads from it will return its default value.
-  mutating func clearAllDayTracking() {self._allDayTracking = nil}
+  /// Returns true if `mode` has been explicitly set.
+  var hasMode: Bool {self._mode != nil}
+  /// Clears the value of `mode`. Subsequent reads from it will return its default value.
+  mutating func clearMode() {self._mode = nil}
 
   var alarmLow: Xiaomi_Spo2AlarmLow {
     get {_alarmLow ?? Xiaomi_Spo2AlarmLow()}
@@ -3028,7 +3030,7 @@ nonisolated struct Xiaomi_SpO2: Sendable {
   init() {}
 
   fileprivate var _unknown1: UInt32? = nil
-  fileprivate var _allDayTracking: Bool? = nil
+  fileprivate var _mode: UInt32? = nil
   fileprivate var _alarmLow: Xiaomi_Spo2AlarmLow? = nil
 }
 
@@ -9163,7 +9165,7 @@ nonisolated extension Xiaomi_ActivitySyncRequestToday: SwiftProtobuf.Message, Sw
 
 nonisolated extension Xiaomi_SpO2: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   static let protoMessageName: String = _protobuf_package + ".SpO2"
-  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}unknown1\0\u{1}allDayTracking\0\u{2}\u{2}alarmLow\0")
+  static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}unknown1\0\u{1}mode\0\u{2}\u{2}alarmLow\0")
 
   mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -9172,7 +9174,7 @@ nonisolated extension Xiaomi_SpO2: SwiftProtobuf.Message, SwiftProtobuf._Message
       // enabled. https://github.com/apple/swift-protobuf/issues/1034
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularUInt32Field(value: &self._unknown1) }()
-      case 2: try { try decoder.decodeSingularBoolField(value: &self._allDayTracking) }()
+      case 2: try { try decoder.decodeSingularUInt32Field(value: &self._mode) }()
       case 4: try { try decoder.decodeSingularMessageField(value: &self._alarmLow) }()
       default: break
       }
@@ -9187,8 +9189,8 @@ nonisolated extension Xiaomi_SpO2: SwiftProtobuf.Message, SwiftProtobuf._Message
     try { if let v = self._unknown1 {
       try visitor.visitSingularUInt32Field(value: v, fieldNumber: 1)
     } }()
-    try { if let v = self._allDayTracking {
-      try visitor.visitSingularBoolField(value: v, fieldNumber: 2)
+    try { if let v = self._mode {
+      try visitor.visitSingularUInt32Field(value: v, fieldNumber: 2)
     } }()
     try { if let v = self._alarmLow {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 4)
@@ -9198,7 +9200,7 @@ nonisolated extension Xiaomi_SpO2: SwiftProtobuf.Message, SwiftProtobuf._Message
 
   static func ==(lhs: Xiaomi_SpO2, rhs: Xiaomi_SpO2) -> Bool {
     if lhs._unknown1 != rhs._unknown1 {return false}
-    if lhs._allDayTracking != rhs._allDayTracking {return false}
+    if lhs._mode != rhs._mode {return false}
     if lhs._alarmLow != rhs._alarmLow {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true

@@ -58,8 +58,11 @@ struct AuthKeyStore {
 
         // One-time migration from the old bundle-id-keyed item.
         if let legacyService, let legacy = try read(service: legacyService) {
-            try? save(legacy)
-            SecItemDelete(baseQuery(service: legacyService) as CFDictionary)
+            // The legacy item is the only copy until the new one exists: delete it only after a
+            // successful save, and still hand the key back when the save fails (retried next load).
+            if (try? save(legacy)) != nil {
+                SecItemDelete(baseQuery(service: legacyService) as CFDictionary)
+            }
             return legacy
         }
         throw AuthKeyError.notFound
@@ -118,11 +121,11 @@ enum AuthKeyError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notFound:               return "AuthKey não encontrado. Configure a chave da pulseira."
-        case .locked:                 return "Keychain bloqueado. Desbloqueie o iPhone e tente de novo."
-        case .invalidLength(let n):   return "AuthKey deve ter 16 bytes; recebido \(n)."
-        case .invalidHex:             return "Formato inválido. Informe 32 caracteres hexadecimais."
-        case .keychainError(let s):   return "Erro no Keychain (OSStatus \(s))."
+        case .notFound:               return "AuthKey not found. Set up the band key."
+        case .locked:                 return "Keychain is locked. Unlock the iPhone and try again."
+        case .invalidLength(let n):   return "AuthKey must be 16 bytes; got \(n)."
+        case .invalidHex:             return "Invalid format. Enter 32 hexadecimal characters."
+        case .keychainError(let s):   return "Keychain error (OSStatus \(s))."
         }
     }
 }

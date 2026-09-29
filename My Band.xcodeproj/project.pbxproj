@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1EAF9D41ECC930C0C2EEE267 /* MyBandWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = CDA04FE2ED203E51F234BC87 /* MyBandWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		9371A6672FE501BE00C68E69 /* SwiftProtobuf in Frameworks */ = {isa = PBXBuildFile; productRef = BB0A1B2C3D4E5F001122AACC /* SwiftProtobuf */; };
 /* End PBXBuildFile section */
 
@@ -18,21 +19,61 @@
 			remoteGlobalIDString = 93200F232FD62F9A00E8DC0C;
 			remoteInfo = "My Band";
 		};
+		B259B1B142F4F6179F32685C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 93200F1C2FD62F9A00E8DC0C /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = BFFE0FA12C8542A39174F6E7;
+			remoteInfo = MyBandWidgets;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		01C0F53D472EB8C511C23BCF /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				1EAF9D41ECC930C0C2EEE267 /* MyBandWidgets.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		93200F242FD62F9A00E8DC0C /* My Band.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "My Band.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB00000000000000000000A8 /* My BandTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "My BandTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
+		CDA04FE2ED203E51F234BC87 /* MyBandWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MyBandWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		75F04F524D77B7B08F329C18 /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		7E4E5ACA16AB3A2D1A996DEA /* MyBandWidgets */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
+			path = MyBandWidgets;
+			sourceTree = "<group>";
+		};
 		93200F262FD62F9A00E8DC0C /* My Band */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
 			path = "My Band";
 			sourceTree = "<group>";
 		};
 		AB00000000000000000000A9 /* My BandTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+			);
 			path = "My BandTests";
 			sourceTree = "<group>";
 		};
@@ -54,6 +95,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		D21E1CE87B56EBF0B1013BFA /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -62,6 +110,8 @@
 			children = (
 				93200F262FD62F9A00E8DC0C /* My Band */,
 				AB00000000000000000000A9 /* My BandTests */,
+				7E4E5ACA16AB3A2D1A996DEA /* MyBandWidgets */,
+				75F04F524D77B7B08F329C18 /* Shared */,
 				93200F252FD62F9A00E8DC0C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -71,6 +121,7 @@
 			children = (
 				93200F242FD62F9A00E8DC0C /* My Band.app */,
 				AB00000000000000000000A8 /* My BandTests.xctest */,
+				CDA04FE2ED203E51F234BC87 /* MyBandWidgets.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -85,13 +136,16 @@
 				93200F202FD62F9A00E8DC0C /* Sources */,
 				93200F212FD62F9A00E8DC0C /* Frameworks */,
 				93200F222FD62F9A00E8DC0C /* Resources */,
+				01C0F53D472EB8C511C23BCF /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				9EE2303D1037CF35B5A983BD /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				93200F262FD62F9A00E8DC0C /* My Band */,
+				75F04F524D77B7B08F329C18 /* Shared */,
 			);
 			name = "My Band";
 			packageProductDependencies = (
@@ -118,11 +172,30 @@
 				AB00000000000000000000A9 /* My BandTests */,
 			);
 			name = "My BandTests";
-			packageProductDependencies = (
-			);
 			productName = "My BandTests";
 			productReference = AB00000000000000000000A8 /* My BandTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		BFFE0FA12C8542A39174F6E7 /* MyBandWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 57EE023BE9691A045E022FC4 /* Build configuration list for PBXNativeTarget "MyBandWidgets" */;
+			buildPhases = (
+				9F437F47D6C8A65D6C277823 /* Sources */,
+				D21E1CE87B56EBF0B1013BFA /* Frameworks */,
+				0B3F8646ED02CF9A854AE2EC /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				7E4E5ACA16AB3A2D1A996DEA /* MyBandWidgets */,
+				75F04F524D77B7B08F329C18 /* Shared */,
+			);
+			name = MyBandWidgets;
+			productName = MyBandWidgets;
+			productReference = CDA04FE2ED203E51F234BC87 /* MyBandWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -162,11 +235,19 @@
 			targets = (
 				93200F232FD62F9A00E8DC0C /* My Band */,
 				AB00000000000000000000A1 /* My BandTests */,
+				BFFE0FA12C8542A39174F6E7 /* MyBandWidgets */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		0B3F8646ED02CF9A854AE2EC /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		93200F222FD62F9A00E8DC0C /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -191,6 +272,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		9F437F47D6C8A65D6C277823 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		AB00000000000000000000A5 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -201,6 +289,12 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		9EE2303D1037CF35B5A983BD /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = MyBandWidgets;
+			target = BFFE0FA12C8542A39174F6E7 /* MyBandWidgets */;
+			targetProxy = B259B1B142F4F6179F32685C /* PBXContainerItemProxy */;
+		};
 		AB00000000000000000000AA /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 93200F232FD62F9A00E8DC0C /* My Band */;
@@ -209,6 +303,61 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		2BAFE47F0A0AF581AEC2CCAE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "MyBandWidgets-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "My Band";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.2;
+				PRODUCT_BUNDLE_IDENTIFIER = kkartsel.myband.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		50B5E43C2637839B5CAF1BA3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "MyBandWidgets-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = "My Band";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.2;
+				PRODUCT_BUNDLE_IDENTIFIER = kkartsel.myband.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
 		93200F2F2FD62F9C00E8DC0C /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -245,7 +394,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = Z7KM7R2775;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -311,7 +460,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = Z7KM7R2775;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -343,7 +492,7 @@
 				CODE_SIGN_ENTITLEMENTS = "My Band/My Band.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = Z7KM7R2775;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
@@ -352,7 +501,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = myband.beta.matheusdanoite;
+				PRODUCT_BUNDLE_IDENTIFIER = kkartsel.myband;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -373,7 +522,7 @@
 				CODE_SIGN_ENTITLEMENTS = "My Band/My Band.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = Z7KM7R2775;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
@@ -382,7 +531,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = myband.beta.matheusdanoite;
+				PRODUCT_BUNDLE_IDENTIFIER = kkartsel.myband;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -400,11 +549,11 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = Z7KM7R2775;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = "matheusdanoite.My-BandTests";
+				PRODUCT_BUNDLE_IDENTIFIER = kkartsel.myband.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
@@ -421,11 +570,11 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = Z7KM7R2775;
+				DEVELOPMENT_TEAM = KBPR4BGF6U;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = "matheusdanoite.My-BandTests";
+				PRODUCT_BUNDLE_IDENTIFIER = kkartsel.myband.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
@@ -439,6 +588,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		57EE023BE9691A045E022FC4 /* Build configuration list for PBXNativeTarget "MyBandWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2BAFE47F0A0AF581AEC2CCAE /* Release */,
+				50B5E43C2637839B5CAF1BA3 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		93200F1F2FD62F9A00E8DC0C /* Build configuration list for PBXProject "My Band" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

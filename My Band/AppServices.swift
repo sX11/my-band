@@ -23,6 +23,13 @@ final class AppServices {
     let bandSyncer    = BandSyncer()
     let customization = CustomizationManager()
     let scaleManager  = ScaleManager()
+    let alarms        = AlarmService()
+    let bandSettings  = BandSettingsService()
+    let todayActivity = TodayActivityService()
+    let workoutLive   = WorkoutLiveService()
+    let workoutActivity = WorkoutActivityController()
+    let latestMetrics = LatestMetricsStore()
+    let syncLog = HealthSyncLog()
 
     private var didBootstrap = false
 
@@ -34,8 +41,16 @@ final class AppServices {
         guard !didBootstrap else { return }
         didBootstrap = true
 
+        bandSyncer.latestMetrics = latestMetrics
+        bandSyncer.syncLog = syncLog
+        bandSyncer.workoutLive = workoutLive
         bandSyncer.setup(manager: bandManager, context: container.mainContext)
         customization.setup(manager: bandManager)
+        alarms.setup(manager: bandManager)
+        bandSettings.setup(manager: bandManager)
+        todayActivity.setup(manager: bandManager)
+        workoutLive.setup(manager: bandManager)
+        workoutActivity.setup(live: workoutLive)
         bandSyncer.loadStoredDevice()
         BackgroundSyncManager.shared.configure(manager: bandManager, syncer: bandSyncer)
         // Broadcast-only scale: a foreground listen is enough; harmless on a headless launch.

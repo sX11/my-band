@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by 0005
 ---
 
 # No in-app health data visualization; Liquid Glass for chrome, Apple Health is the sole data surface

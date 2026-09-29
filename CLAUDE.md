@@ -1,6 +1,6 @@
 # CLAUDE.md — My Band
 
-Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Sem visualização de dados de saúde em tela própria — o Apple Health é a única superfície de dados; o app é só sincronização, configuração e status.
+Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS universal que conecta a Mi Band 10 via BLE usando AuthKey, sincroniza dados de saúde com o Apple Health e suporta Atalhos via App Intents. Os dados de saúde ficam no Apple Health; as exceções são o card Today da Dashboard, com os contadores ao vivo da pulseira (ADR 0005), o card de treino ao vivo, enquanto a pulseira grava um treino (ADR 0008), e a folha Health, com o último valor de cada leitura vindo do último sync (ADR 0006).
 
 ---
 
@@ -8,12 +8,12 @@ Guia de arquitetura e diretrizes para o projeto **My Band**: app iOS/macOS unive
 
 | Item | Detalhe |
 |---|---|
-| Plataformas | iOS 26+ (um único target Xcode; roda no Mac via "Designed for iPad and iPhone", não é target macOS nativo — `IPHONEOS_DEPLOYMENT_TARGET` no pbxproj é a fonte da verdade) |
+| Plataformas | iOS 26+ (target do app mais a extensão WidgetKit `MyBandWidgets`, que desenha a Live Activity do treino; roda no Mac via "Designed for iPad and iPhone", não é target macOS nativo — `IPHONEOS_DEPLOYMENT_TARGET` no pbxproj é a fonte da verdade) |
 | Linguagem | Swift 5.10+ |
 | UI | SwiftUI, Liquid Glass no chrome/status (`MBStatusPill` etc.) |
 | Persistência | SwiftData |
 | Bluetooth | CoreBluetooth (BLE apenas — Mi Band 10 não usa Classic BT) |
-| Saúde | HealthKit — única superfície de visualização de dados (ver ADR 0001) |
+| Saúde | HealthKit — única superfície de dados armazenados; a Dashboard mostra os contadores ao vivo do dia (ADR 0005) e o último valor de cada leitura do último sync (ADR 0006) |
 | Automação | App Intents + Shortcuts |
 | Distribuição | Uso pessoal — sideload via Apple Developer Program pessoal (sem App Store) |
 
@@ -37,6 +37,9 @@ My Band/
 │   ├── FindPhoneService.swift    # "Encontrar telefone": alarme no iPhone (band→app CMD_FIND_PHONE)
 │   ├── CalendarSyncService.swift # Push app→band: idioma, calendário e lembretes (EventKit)
 │   ├── WeatherSyncService.swift  # Push app→band: tempo atual + previsão (Open-Meteo)
+│   ├── BandSettingsService.swift # Configurações da pulseira (FC, SpO₂, estresse, lembretes, tela): GET/SET + releitura
+│   ├── TodayActivityService.swift # Leitura única do realtime stats para o card Today da Dashboard
+│   ├── WorkoutLiveService.swift  # Treino em curso na pulseira (status 8/26 + realtime + GPS) para o card de treino (ADR 0008)
 │   ├── Scale/                    # Balança BLE OKOK/Chipsea (independente da pulseira)
 │   │   ├── ScaleManager.swift    # Escuta o anúncio (broadcast-only) e grava peso no Apple Health
 │   │   └── ScaleWeightParser.swift # Decode do peso (variante VC0)
@@ -66,6 +69,9 @@ My Band/
 │   ├── BandDevice.swift          # SwiftData model do dispositivo pareado
 │   ├── SleepSession.swift        # SwiftData model de sessão de sono
 │   ├── ActivityDay.swift         # SwiftData model de atividade diária
+│   ├── LatestMetrics.swift       # Snapshot do último valor de cada leitura, para a folha Health (ADR 0006)
+│   ├── HealthSyncLog.swift       # O que cada sync enviou ao Apple Health, por tipo, para a folha do card Apple Health
+│   ├── WorkoutWindows.swift      # Janelas dos treinos gravados, para o detalhe diário excluir distância/energia (ADR 0007)
 │   └── HeartRateSample.swift     # SwiftData model de amostras de HR
 │
 └── UI/
@@ -74,8 +80,11 @@ My Band/
     ├── Sleep/                    # Visualização detalhada de sono
     ├── Profile/                  # Perfil do usuário (altura → IMC no Apple Health)
     ├── Customize/                # Watch faces e apps RPK
-    └── Settings/                 # Configurações gerais
+    ├── Settings/                 # Configurações gerais
+    └── LiveActivity/             # WorkoutActivityController: Live Activity do treino (ADR 0008)
 ```
+
+Fora de `My Band/`: `MyBandWidgets/` (extensão WidgetKit; o Info.plist dela fica em `MyBandWidgets-Info.plist`, na raiz, pela mesma armadilha do Info.plist do app) e `Shared/` (sincronizado nos dois targets: `WorkoutActivityAttributes`, `WorkoutClockFormat`).
 
 ---
 
@@ -189,15 +198,16 @@ Alguns recursos são **push** da pulseira: ela manda o comando e o app reage. `B
 |---|---|---|---|---|
 | Idioma | 2 (SYSTEM) | 6 `CMD_LANGUAGE` | `system.language.code` | `Locale` → `"pt_br"` minúsculo |
 | Calendário | 12 | 1 `CMD_CALENDAR_SET` | `calendar.calendarSync.event[]` | EventKit, próximos 30 dias, ≤50, **substitui** o set na banda |
-| Lembrete (criar) | 17 (SCHEDULE) | 15 `CMD_REMINDERS_CREATE` | `schedule.createReminder` | EventKit, com data, ≤20 |
-| Lembrete (apagar) | 17 | 18 `CMD_REMINDERS_DELETE` | `schedule.deleteReminder.id[]` | apaga os ids do sync anterior antes de recriar |
+| Lembrete (listar) | 17 (SCHEDULE) | 14 `CMD_REMINDERS_GET` | `schedule.reminders` | lista da banda (ids, título/hora, `maxReminders`), lida antes de cada push |
+| Lembrete (criar) | 17 | 15 `CMD_REMINDERS_CREATE` | `schedule.createReminder` | EventKit, só os que ainda vão disparar (alerta › vencimento › 09:00 se só data), ≤20 e ≤ vagas da banda |
+| Lembrete (apagar) | 17 | 18 `CMD_REMINDERS_DELETE` | `schedule.deleteReminder.id[]` | apaga só os lembretes deste app antes de recriar |
 | Tempo (localização) | 10 | 7 `CMD_ADD_LOCATION` | `weather.location` | `WeatherSyncService`, chave `accu:<hash>` |
 | Tempo (atual) | 10 | 0 `CMD_SET_CURRENT_WEATHER` | `weather.current` | Open-Meteo, Guarapuava |
 | Tempo (previsão) | 10 | 1 `CMD_UPDATE_DAILY_FORECAST` | `weather.forecast` | 7 dias (hoje + 6) |
 
 > **O tempo é request-driven — a pulseira pede, o app responde.** A Mi Band 10 envia `CMD_REQUEST_CONDITIONS_FOR_LOCATION` (type=10, subtype=3) ao conectar e ao abrir a tela de tempo; a tela fica **aguardando a resposta a esse request**, então o push proativo (ao fim do `syncToHealth()`) sozinho não popula o widget. `BandManager.handleWeatherCommand` roteia subtype=3 para o callback `onWeatherConditionsRequest`, e `WeatherSyncService` responde com um push completo (location → current → forecast). A resposta **ecoa a chave/nome de localização que a banda pediu** (`requestedKey`/`requestedName`) para que ela vincule os dados; sem request, o push usa a localização padrão com `isCurrentLocation=true`. Status≠0 das respostas da banda aos nossos pushes (subtypes 0/1/7) é logado. Espelha `XiaomiWeatherService.onConditionRequestReceived` do GadgetBridge.
 
-> **Id de lembrete é atribuído pela banda.** O create não carrega id; a banda responde com `schedule.ackId` (type=17). `BandManager.onScheduleAck` captura esses ids, que `CalendarSyncService` persiste (`UserDefaults`) e usa para apagar no próximo sync — sem isso os lembretes acumulariam na pulseira.
+> **Id de lembrete é atribuído pela banda.** O create não carrega id; a banda responde com `schedule.ackId` (type=17, subtype=15). `BandManager.onScheduleAck` captura esses ids, que `CalendarSyncService` persiste (`UserDefaults`) junto com título e hora de cada lembrete enviado. No sync seguinte ele lê a lista da banda (`onReminderList`) e apaga os ids que conhece **e** os que batem em título+hora com o que enviou — um ack perdido não deixa mais um lembrete órfão disparando para sempre, e lembretes criados por outro app não são tocados. Sem a lista, o push é adiado para o próximo sync. `Esquecer pulseira` limpa esse estado (`CalendarSyncService.forgetBand`).
 
 > **Frames > MTU.** Calendário com muitos eventos passa do ATT MTU. `BandManager.writeSPP` fragmenta a frame em chunks do tamanho do MTU (`maximumWriteValueLength`); a banda reassembla pelo comprimento declarado na frame. Pacotes de auth/init cabem em um chunk — caminho do handshake inalterado.
 
@@ -334,7 +344,7 @@ Porta o `PasswordXiaomiCloudConnector` do `token_extractor/token_extractor.py` �
 >
 > **Recuperação cardíaca roda no caminho do arquivo diário, não no `writeWorkouts`.** A série 1 Hz do treino termina exatamente no fim do treino (count == duration), então a leitura de fim+60 s só chega no arquivo de detalhe diário seguinte. `writeHeartRateRecoveries` consulta os treinos recentes **do próprio app** no Health (independe de qual sync gravou o treino), casa o pico do último minuto (série 1 Hz, `HKStatisticsQuery` discreteMax) com a leitura por minuto mais próxima de fim+60 s (±30 s) e grava o delta. Best-effort no `BandSyncer` — não bloqueia os ACKs dos arquivos.
 >
-> **Mobilidade continua exclusiva do iPhone.** `walkingSpeed`/`walkingStepLength` são graváveis, mas alimentariam as métricas de Mobilidade que a reconciliação preserva de propósito — por isso a série de velocidade só é escrita para corrida/ciclismo (`speedType(_:)` devolve nil para caminhada/trilha) e a passada usa `runningStrideLength`, não `walkingStepLength`.
+> **Mobilidade continua exclusiva do iPhone.** `walkingSpeed`/`walkingStepLength` são graváveis, mas alimentariam as métricas de Mobilidade, que ficam exclusivas do iPhone de propósito — por isso a série de velocidade só é escrita para corrida/ciclismo (`speedType(_:)` devolve nil para caminhada/trilha) e a passada usa `runningStrideLength`, não `walkingStepLength`.
 
 ### Permissões (Info.plist)
 ```
@@ -346,9 +356,9 @@ NSHealthShareUsageDescription
 - Antes de escrever, consultar amostras existentes no período para evitar duplicatas
 - Usar `HKQueryAnchor` com persistência em SwiftData para sincronizações incrementais
 
-> **Reconciliação entre fontes (passos / distância / energia ativa).** O iPhone grava essas mesmas grandezas, e o Apple Health **soma** toda fonte de terceiros por cima do iPhone — a dedup privada iPhone+Watch não se estende a terceiros e **não há API** para mudar a agregação nem registrar a pulseira como fonte confiável. Gravar o total da pulseira cru dobra a contagem (caminhada de 200 → 400). Solução (`HealthKitManager.writeReconciledActivity`): grava-se só o **excedente** da pulseira sobre o iPhone, por minuto — `delta = max(0, banda − iPhone)`, com a soma do iPhone obtida via `HKStatisticsCollectionQuery` em buckets de 1 min e predicado `fonte ≠ este app`. O total por minuto vira `max(banda, iPhone)`: sem double-count, **Mobilidade do iPhone preservada** (Assimetria/Comprimento do Passo/Velocidade/Estabilidade ao Caminhar — a pulseira não produz nada disso e elas exigem o Monitoramento de Fitness **ligado**), e passos sem o telefone ainda capturados. Funciona porque a pulseira reporta minutos **já concluídos**: quando o minuto sincroniza, o pedômetro do iPhone já o finalizou, então o delta é estável e o re-sync (idempotente via sync-id) reproduz o mesmo valor — sem necessidade de `HKObserverQuery` para o dia corrente.
+> **Passos / distância / energia ativa: crus por minuto, sem reconciliação.** O iPhone grava essas mesmas grandezas; o Apple Health **mescla** amostras sobrepostas de fontes diferentes pela ordem de Fontes de Dados (Saúde → Passos → Fontes de Dados e Acesso) em vez de somá-las — é o que a documentação da Apple descreve e o que o better-mi-fitness-sync (código aberto, mesma tarefa) assume ao gravar valores crus. `HealthKitManager.writeActivity` grava o valor da pulseira por minuto (`mb-steps-rec-`, `mb-dist-rec-`, `mb-cal-rec-` + minuto, versão monotônica), sem ler nada do Health — um iPhone bloqueado recusa leituras (`errorDatabaseInaccessible`) mas aceita escritas. A versão monotônica faz cada re-sync substituir a amostra anterior do mesmo minuto, inclusive o excedente gravado pela antiga reconciliação (`max(0, banda − iPhone)`); minutos antigos que a pulseira não re-oferece ficam com o excedente, sem passada de exclusão (o detalhe por minuto não é guardado localmente). Para o iPhone vencer os minutos em comum, ele deve ficar **acima** de My Band na ordem de fontes (apps novos entram no topo). **Ainda não validado no hardware.** A observação anterior de uma caminhada dobrada (200 → 400) foi feita com uma amostra de passos do dia inteiro gravada por `writeDailySummary`, não com amostras por minuto.
 >
-> **A fonte oficial dessas três grandezas é o arquivo de detalhe diário (por minuto).** `writeDailySummary` deixou de gravar passos/energia (manteria-se somando); ele só escreve extremos band-exclusivos (FC/SpO₂, FC de repouso). Se o usuário **negar a leitura** no HealthKit, os somatórios do iPhone voltam vazios e grava-se o valor cheio da pulseira (direção segura — pulseira como fonte). **SpO₂ fica fora da reconciliação** (o iPhone não tem o sensor) e continua cru por minuto em `writeMinuteSamples`, granularidade intacta.
+> **A fonte oficial dessas três grandezas é o arquivo de detalhe diário (por minuto).** `writeDailySummary` não grava passos/energia: uma amostra do dia inteiro ganharia ou perderia o dia todo contra o iPhone, em vez de minuto a minuto. Ele só escreve extremos band-exclusivos (FC/SpO₂, FC de repouso). Distância e energia dentro de um treino ficam de fora (as amostras do próprio treino já as trazem); passos não. **SpO₂** (o iPhone não tem o sensor) continua cru por minuto em `writeMinuteSamples`. Com o iPhone bloqueado tudo é gravado, mas os arquivos de treino e de detalhe diário ficam sem ACK (`UIApplication.isProtectedDataAvailable`): peso, idade, limpeza do sono e recuperação cardíaca leem o Health, e um sync desbloqueado os regrava pelos mesmos sync-ids. As janelas de treino gravadas ficam em `WorkoutWindows` (30 dias), para que um detalhe diário de um sync posterior ainda exclua a distância/energia do treino.
 
 ---
 
@@ -394,7 +404,7 @@ NSHealthShareUsageDescription
 
 A UI é construída a partir do handoff do **Claude Design** (`My Band — Design System`, bundle exportado de claude.ai/design). Recriar fielmente em SwiftUI — copiar o **resultado visual**, não a estrutura HTML/JSX dos protótipos.
 
-> **Sem visualização de dados de saúde em tela própria** (ver ADR 0001). O app não mostra sono, FC, passos ou SpO₂ em nenhuma tela — isso é papel do Apple Health e do Atalho `GetSleepStateIntent`. A Dashboard só mostra estado de conexão, frescor do sync, bateria e o botão de sincronizar; não existe (nem está planejada) uma tela `SleepDetail`/hipnograma.
+> **O Apple Health é a superfície de dados de saúde** (ADR 0005, que substitui o 0001). A Dashboard mostra estado de conexão, frescor do sync, bateria, alarmes, configurações da pulseira e o card Today — passos, kcal e FC lidos uma vez do realtime stats da pulseira e nunca armazenados; horas em pé vêm do resumo diário do último sync. O card Latest metrics abre a folha Health com o último valor de cada leitura (FC, SpO₂, estresse, temperatura, resumo do dia, última noite, peso), guardado como um único snapshot sobrescrito (ADR 0006). Sem histórico, sem gráficos, e não existe (nem está planejada) uma tela `SleepDetail`/hipnograma; sono continua com o Apple Health e o Atalho `GetSleepStateIntent`.
 
 **Princípios fixos do maker:**
 1. **Dark-mode first** — "gosto de modo noturno".
@@ -411,9 +421,9 @@ A UI é construída a partir do handoff do **Claude Design** (`My Band — Desig
 - **Cantos** contínuos: cards 16, sheets 20, hero/modal 28, pills redondos. **4-pt grid**, gutter 20, hit target ≥44.
 - **Ícones**: SF Symbols (kit web usa Lucide como substituto). Status sempre cor + símbolo, nunca cor sozinha.
 
-**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Sem dado de saúde em tela — o número que aparece é sempre de status/sync, nunca uma métrica de saúde. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
+**Voz & copy (pt-BR):** sentence case, sem emoji, tratamento por **você**, dispositivo = "a pulseira". Tom calmo e factual ("Sincronizado há 2 min", "42 amostras no Apple Health"). Métrica de saúde só no card Today (ADR 0005) e no card/folha Latest metrics (ADR 0006) e no card de treino e na Live Activity enquanto a pulseira grava um treino (ADR 0008); fora deles o número é sempre de status/sync. Honestidade técnica: AuthKey/BLE mostrados em mono, AuthKey mascarado por padrão.
 
-**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar — sem dados de saúde, ver ADR 0001), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
+**Telas (`ui_kits/app/`):** `Dashboard` (status de conexão, frescor do sync, bateria, sincronizar, alarmes, configurações da pulseira, o card Today — ADR 0005 —, a folha Health — ADR 0006 — e o card de treino ao vivo — ADR 0008), `Setup` (AuthKey + scan/conexão), `Settings`. **Não existe `SleepDetail`.** Status de conexão + frescor do sync são first-class em toda tela.
 
 **Componentes do kit** (`components/`): core (`Button`, `IconButton`, `StatusPill`, `Badge`), forms (`Switch`, `TextField`, `SegmentedControl`), data (`ListRow`, `Card`, `MetricTile`, `SectionHeader`, `SleepBar`). Cada um tem `.prompt.md` e `.d.ts` descrevendo props/variantes.
 
@@ -475,7 +485,7 @@ Versão atual: **1.2.0** — ver `CHANGELOG.md` para o histórico completo. Pró
 4. O `GetSleepStateIntent`.
 5. O `CheckBandBatteryIntent` — em especial o `CMD_BATTERY` sob demanda fora do init pós-auth (a resposta chega no mesmo `handleSystemCommand`, mas nunca foi exercitada com o link já aberto há tempo). E se a Mi Band 10 expõe o Battery Service `0x180F` a apps (a linha `Services:` do log da conexão responde), se a `2A19` lê sem erro pós-auth e se o número bate com o widget Baterias — o log imprime os dois (`via GATT 2A19` / `via protobuf — keeping GATT`).
 
-Home Assistant foi cortado do roadmap; UI segue sem visualização de dados de saúde por decisão (ver ADR 0001).
+Home Assistant foi cortado do roadmap; UI segue sem histórico nem gráficos de saúde por decisão (ADR 0005, que substitui o 0001, e ADR 0006).
 
 ---
 

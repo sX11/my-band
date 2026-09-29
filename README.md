@@ -14,7 +14,7 @@ Este é um projeto pessoal que serviu de laboratório para BLE, criptografia apl
 
 - **🔐 Autenticação criptográfica revertida e validada em hardware.** Handshake da Mi Band 10 implementado do zero em Swift: troca de nonce, HMAC-SHA256, derivação de chaves de sessão via HKDF e comunicação cifrada com AES (CTR/CCM). Testado em uma pulseira física, com dados reais.
 - **📡 Engenharia reversa de protocolo binário.** Formato de pacotes (frames, CRC-16/ARC, transporte confiável com ACK, protobuf) e parsers para sono, treinos e rota GPS. Inclusive uma **série de frequência cardíaca por segundo que a implementação de referência open-source (GadgetBridge) não decodifica** — layout revertido a partir de capturas reais e validado por CRC-32.
-- **❤️ Integração profunda com HealthKit.** Sono, passos, FC, SpO₂, treinos com rota GPS, esforço físico, esforço de treino e recuperação cardíaca. Destaque: uma camada de **reconciliação por minuto** que grava apenas o excedente da pulseira sobre o iPhone — sem contar passos em dobro e sem quebrar as métricas de Mobilidade que o iOS reserva.
+- **❤️ Integração profunda com HealthKit.** Sono, passos, FC, SpO₂, treinos com rota GPS, esforço físico, esforço de treino e recuperação cardíaca. Passos, distância e energia vão crus por minuto; o Apple Health mescla os minutos em comum com o iPhone pela ordem de Fontes de Dados.
 - **🏗️ Concorrência moderna e disciplina de arquitetura.** Swift 5.10, `async/await`, `@Observable`, `@MainActor`, BLE em segundo plano com state restoration, testes unitários com fixtures de dados reais e um AuthKey que nunca sai do Keychain.
 
 ---
@@ -34,14 +34,14 @@ Este é um projeto pessoal que serviu de laboratório para BLE, criptografia apl
 | ✅ | Persistência local com SwiftData (BandDevice, SleepSession, ActivityDay) |
 | ✅ | Reassembly de frames BLE fragmentados (arquivos de atividade > MTU) |
 | ✅ | Leitura de bateria (nível + carregando) |
-| ✅ | UI de Setup (AuthKey + scan/conexão) e Dashboard (bateria, última sync, botão sincronizar) via Claude Design |
+| ✅ | UI de Setup (AuthKey + scan/conexão) e Dashboard (bateria, última sync, botão sincronizar, próximo alarme, configurações da pulseira card Today — passos, kcal, horas em pé, FC — e folha Health com a última leitura de cada métrica) via Claude Design |
 | ✅ | Envio ao Apple Health — sono (estágios) e atividade diária (passos, calorias, distância, FC + FC de repouso, SpO₂) — **validado em hardware (Mi Band 10)** |
 | ✅ | Sincronização em segundo plano via `BGProcessingTask` (reconecta, sincroniza e reagenda com o app suspenso) — **validada em hardware** |
 | ✅ | Medições manuais no Apple Health (FC, SpO₂) — **validado em hardware (Mi Band 10)** |
 | ✅ | Treinos no Apple Health (`HKWorkout` + rota GPS + VO₂máx) e handshake GPS com o iPhone (CoreLocation → `workoutLocation` stream) — **validado em hardware** |
 | ✅ | Série de FC por segundo do treino anexada ao `HKWorkout` (gráfico de FC dentro do treino) — **validada em hardware** |
 | ✅ | Métricas ricas no Apple Health — esforço físico (METs/min), esforço de treino (iOS 18+), recuperação cardíaca, velocidade/passada e distância de remo, derivadas de medições reais |
-| ✅ | Reconciliação por minuto (grava só o excedente da pulseira sobre o iPhone — sem contar passos em dobro, Mobilidade preservada) — **validada em hardware** |
+| ✅ | Passos/distância/energia crus por minuto, mesclados pelo Apple Health conforme a ordem de Fontes de Dados (coloque o iPhone acima de My Band) — **ainda não validado no hardware** |
 | ✅ | Balança BLE OKOK/Chipsea (broadcast-only) → peso + IMC no Apple Health, com perfil de altura — **validada em hardware** |
 | ✅ | Extração do AuthKey via Xiaomi Cloud (login por QR, sem app Xiaomi) |
 | ✅ | Target de testes unitários (Swift Testing, 23 testes) com fixtures reais — **validado no iPhone** |

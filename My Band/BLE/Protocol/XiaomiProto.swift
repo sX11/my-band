@@ -68,11 +68,8 @@ enum XiaomiProto {
 
     // MARK: - System command builders
 
-    static func setCurrentTimeCommand() -> Data {
-        let now   = Date()
-        let cal   = Calendar.current
-        let tz    = TimeZone.current
-        let comps = cal.dateComponents(in: tz, from: now)
+    static func setCurrentTimeCommand(now: Date = Date(), tz: TimeZone = .current) -> Data {
+        let comps = Calendar.current.dateComponents(in: tz, from: now)
 
         var time = Xiaomi_Time()
         time.hour   = UInt32(comps.hour   ?? 0)
@@ -84,8 +81,10 @@ enum XiaomiProto {
         date.month = UInt32(comps.month ?? 1)
         date.day   = UInt32(comps.day   ?? 1)
 
-        let zoneOffset = Int32(tz.secondsFromGMT(for: now) / (15 * 60))
+        // zoneOffset is the standard offset WITHOUT DST (Java's Calendar.ZONE_OFFSET, which
+        // GadgetBridge sends); secondsFromGMT already includes DST, so the band counted it twice.
         let dstSecs    = Int(tz.daylightSavingTimeOffset(for: now))
+        let zoneOffset = Int32((tz.secondsFromGMT(for: now) - dstSecs) / (15 * 60))
         let dstOffset  = Int32(dstSecs / (15 * 60))
 
         var tzMsg = Xiaomi_TimeZone()
@@ -149,7 +148,40 @@ enum XiaomiProto {
         return (try? cmd.serializedData()) ?? Data()
     }
 
+    // MARK: - Alarm (schedule) command builders — GadgetBridge XiaomiScheduleService
+
+    static func alarmsGetCommand() -> Data {
+        command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmsGet) { _ in }
+    }
+
+    static func alarmCreateCommand(_ details: Xiaomi_AlarmDetails) -> Data {
+        command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmCreate) {
+            $0.schedule.createAlarm = details
+        }
+    }
+
+    static func alarmEditCommand(id: UInt32, _ details: Xiaomi_AlarmDetails) -> Data {
+        var alarm = Xiaomi_Alarm()
+        alarm.id = id
+        alarm.alarmDetails = details
+        return command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmEdit) {
+            $0.schedule.editAlarm = alarm
+        }
+    }
+
+    static func alarmDeleteCommand(ids: [UInt32]) -> Data {
+        var del = Xiaomi_AlarmDelete()
+        del.id = ids
+        return command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.alarmDelete) {
+            $0.schedule.deleteAlarm = del
+        }
+    }
+
     // MARK: - Reminder (schedule) command builders
+
+    static func remindersGetCommand() -> Data {
+        command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.remindersGet) { _ in }
+    }
 
     /// CMD_REMINDERS_CREATE — adds one reminder. `repeatMode` 0=once; `repeatFlags` 64 = unset.
     static func reminderCreateCommand(_ details: Xiaomi_ReminderDetails) -> Data {
@@ -254,6 +286,21 @@ enum XiaomiProto {
         }
 
         return (try? cmd.serializedData()) ?? Data()
+    }
+
+    /// A CMD_CONFIG_*_SET carrying one health config (heart rate, SpO₂, stress, …).
+    static func healthConfigCommand(subtype: UInt32, _ configure: (inout Xiaomi_Health) -> Void) -> Data {
+        command(type: XiaomiHealthCmd.cmdType, subtype: subtype) { configure(&$0.health) }
+    }
+
+    static func screenOnNotificationsGetCommand() -> Data {
+        bareCommand(type: XiaomiNotificationCmd.cmdType, subtype: XiaomiNotificationCmd.screenOnGet)
+    }
+
+    static func screenOnNotificationsSetCommand(_ enabled: Bool) -> Data {
+        command(type: XiaomiNotificationCmd.cmdType, subtype: XiaomiNotificationCmd.screenOnSet) {
+            $0.notification.screenOnOnNotifications = enabled
+        }
     }
 
     /// CMD_ACTIVITY_FETCH_TODAY — lists today's pending activity file IDs.

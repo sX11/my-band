@@ -55,6 +55,21 @@ struct DailySummaryParserTests {
         #expect(DailySummaryParser.parse(data, meta: meta(data)) == nil)
     }
 
+    @Test func keepsStepsAndDropsSpO2WhenTheFileEndsBeforeTheSpO2Block() throws {
+        let full = Fixtures.bytes(Fixtures.dailySummaryV5)
+        let truncated = full.prefix(7 + 1 + 4 + 27 + 4)
+        let summary = try #require(DailySummaryParser.parse(truncated, meta: meta(truncated)))
+        #expect(summary.steps == 1111)
+        #expect(summary.spo2Avg == nil)
+        #expect(summary.spo2Max == nil)
+    }
+
+    @Test func rejectsFileTruncatedBeforeCalories() {
+        let full = Fixtures.bytes(Fixtures.dailySummaryV5)
+        let truncated = full.prefix(7 + 1 + 4 + 27 + 3)
+        #expect(DailySummaryParser.parse(truncated, meta: meta(truncated)) == nil)
+    }
+
     @Test func datedAtFileTimestamp() throws {
         let data = Fixtures.bytes(Fixtures.dailySummaryV5)
         let m = meta(data)

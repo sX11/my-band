@@ -84,6 +84,8 @@ final class BandManager: NSObject {
     private(set) var batteryLevel: Int?
     /// Whether the band reports it is currently charging. Protobuf-only: 2A19 carries no state.
     private(set) var batteryCharging: Bool = false
+    /// When the band was last charged (protobuf battery reply, lastCharge.timestampSeconds).
+    private(set) var batteryLastCharged: Date?
 
     /// Which confirmation prompt the user is on, while `.awaitingPairingConfirmation` is the state.
     private(set) var pairingStage: PairingStage?
@@ -130,6 +132,10 @@ final class BandManager: NSObject {
 
     // Resumed by peripheralIsReady(toSendWriteWithoutResponse:) to pace large uploads.
     private var writeReadyContinuation: CheckedContinuation<Void, Never>?
+
+    // Fragments of MTU-split frames waiting for write-without-response buffer space. Every later
+    // write queues behind them: the band reassembles by byte stream, so nothing may interleave.
+    private var pendingWrites: [Data] = []
 
     // MARK: - Reconnect
 
@@ -237,19 +243,22 @@ final class BandManager: NSObject {
     /// Called when the band's "find phone" feature is toggled (System, subtype=17).
     /// Param = true to start ringing the phone, false to stop (user dismissed it on the band).
     var onFindPhone:             ((Bool) -> Void)?
-    /// Called for each live real-time stats event (Health, subtype=47) while realtime is enabled.
-    /// Param = the current heart rate in bpm. Driven by setRealtimeStats(enabled:).
-    var onRealtimeStats:         ((Int) -> Void)?
     /// Called with the band-assigned id when a Schedule item (e.g. a reminder) is created
     /// (Schedule command carrying schedule.ackId). CalendarSyncService uses it to track which
     /// reminders to delete on the next sync.
     var onScheduleAck:           ((UInt32) -> Void)?
+    /// Called with the band's reminder list (Schedule, CMD_REMINDERS_GET response).
+    var onReminderList:          ((Xiaomi_Reminders) -> Void)?
     /// Called when the band requests weather (Weather, subtype=3). Params = (locationKey, locationName);
     /// both empty means the band wants its current-location weather. The band sends this on connect and
     /// when its weather screen opens — it's the trigger WeatherSyncService responds to with a push.
     var onWeatherConditionsRequest: ((String, String) -> Void)?
     /// Called for every Watchface command (type=4) from the band — WatchfaceService handles it.
     var onWatchfaceCommand:      ((Xiaomi_Command) -> Void)?
+    /// Alarm list / create / edit / delete responses (schedule type, alarm subtypes).
+    var onAlarmCommand:          ((Xiaomi_Command) -> Void)?
+    /// Band settings replies: health CMD_CONFIG_* and the notification screen-on setting.
+    var onSettingsCommand:       ((Xiaomi_Command) -> Void)?
     /// Called for every Rpk/app command (type=20) from the band — AppInstallService handles it.
     var onRpkCommand:            ((Xiaomi_Command) -> Void)?
     /// Called for every DataUpload command (type=22) from the band — DataUploadService handles it.
@@ -358,6 +367,16 @@ final class BandManager: NSObject {
         // continuation resumed by handleAuthSuccess() or failAuth()
     }
 
+    /// A connect already under way (e.g. the standing reconnect armed by a drop). Calling connect
+    /// again on top of it can re-fire didConnect and run a second authenticate() under the first.
+    private var isConnectInProgress: Bool {
+        connectionState == .connecting || connectionState == .discoveringServices
+    }
+
+    /// The GATT link is up and writable, whatever the session's auth state — a band session restart
+    /// re-authenticates over a link that stays connected.
+    var isLinkUp: Bool { cmdWriteChar != nil && peripheral?.state == .connected }
+
     /// `userInitiated` (forget / explicit "disconnect") clears autoReconnect so we stop chasing the
     /// band. Background teardown (post-sync, BGTask expiry) passes `false`: the active link is
     /// released to free the radio, but autoReconnect stays on, so didDisconnectPeripheral re-arms a
@@ -378,7 +397,7 @@ final class BandManager: NSObject {
         // A link already mid-handshake (usually re-deriving keys after the band reopened its
         // session) only needs waiting for. Reconnecting on top of it reset the state to .connecting
         // and re-ran service discovery — and with it a second authenticate() — under the live one.
-        if connectionState.isAuthInProgress || connectionState == .sessionConfig {
+        if connectionState.isAuthInProgress || connectionState == .sessionConfig || isConnectInProgress {
             try await awaitSession(timeout: timeout)
             return
         }
@@ -401,7 +420,7 @@ final class BandManager: NSObject {
     /// connection, so it can't collide with the handshake already in flight.
     func awaitSession(timeout: Duration = .seconds(20)) async throws {
         if connectionState.isConnected { return }
-        guard connectionState.isAuthInProgress || connectionState == .sessionConfig else {
+        guard connectionState.isAuthInProgress || connectionState == .sessionConfig || isConnectInProgress else {
             throw SyncError.notConnected
         }
         let timeoutTask = Task { [weak self] in
@@ -441,13 +460,51 @@ final class BandManager: NSObject {
         }
     }
 
-    /// Turns the band's live real-time stats stream on/off. While on, the band pushes RealTimeStats
-    /// events (subtype 47) that arrive via onRealtimeStats. Used for post-workout HR recovery and the
-    /// live-HR shortcut.
-    func setRealtimeStats(enabled: Bool) {
-        sendEncryptedCommand(protoBytes: XiaomiProto.realtimeStatsCommand(enable: enabled))
-        log.info("Realtime stats \(enabled ? "START" : "STOP") sent")
+    /// Who is using the band's live real-time stats stream; STOP waits for the last of them.
+    enum RealtimeHolder: String {
+        case hrRecovery, todayActivity, workout
     }
+
+    /// Every workoutStatusWatch (Health, subtype 26), whole — WorkoutGpsService keeps its own callback.
+    func observeWorkoutStatus(_ observer: @escaping (Xiaomi_WorkoutStatusWatch) -> Void) {
+        workoutStatusObservers.append(observer)
+    }
+    private var workoutStatusObservers: [(Xiaomi_WorkoutStatusWatch) -> Void] = []
+
+    /// Fired on every successful handshake, including the band's own session restart after init.
+    func observeAuthenticated(_ observer: @escaping () -> Void) {
+        authenticatedObservers.append(observer)
+    }
+    private var authenticatedObservers: [() -> Void] = []
+
+    /// Fired on every link teardown, after the realtime holders are cleared.
+    func observeLinkLost(_ observer: @escaping () -> Void) {
+        linkLostObservers.append(observer)
+    }
+    private var linkLostObservers: [() -> Void] = []
+
+    /// Every live real-time stats event (Health, subtype 47) goes to each observer, whole.
+    func observeRealtime(_ observer: @escaping (Xiaomi_RealTimeStats) -> Void) {
+        realtimeObservers.append(observer)
+    }
+    private var realtimeObservers: [(Xiaomi_RealTimeStats) -> Void] = []
+
+    /// Turns the band's live real-time stats stream on/off for one holder: post-workout HR recovery,
+    /// the Dashboard's Today reading and a live workout.
+    func setRealtimeStats(enabled: Bool, holder: RealtimeHolder) {
+        // Several features share the one stream; STOP goes out only when the last one lets go, so
+        // the Dashboard's reading can't cut off a post-workout recovery capture. START is re-sent
+        // every time so a holder left over from a dropped link can't keep it from restarting.
+        if enabled {
+            realtimeHolders.insert(holder)
+        } else {
+            realtimeHolders.remove(holder)
+            guard realtimeHolders.isEmpty else { return }
+        }
+        sendEncryptedCommand(protoBytes: XiaomiProto.realtimeStatsCommand(enable: enabled))
+        log.info("Realtime stats \(enabled ? "START" : "STOP") sent (\(holder.rawValue, privacy: .public))")
+    }
+    private var realtimeHolders: Set<RealtimeHolder> = []
 
     /// Asks for a fresh battery reading and waits (up to `timeout`) for it to land. The level is
     /// read from GATT 2A19 when the band exposes it, so the app agrees with the iOS Batteries
@@ -491,7 +548,8 @@ final class BandManager: NSObject {
     /// it and silently drop frames. Awaits peripheralIsReady when the buffer is full.
     func sendDataChunk(_ chunk: Data) async {
         if let p = peripheral, let char = cmdWriteChar,
-           char.properties.contains(.writeWithoutResponse), !p.canSendWriteWithoutResponse {
+           char.properties.contains(.writeWithoutResponse),
+           !p.canSendWriteWithoutResponse || !pendingWrites.isEmpty {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 writeReadyContinuation = cont
             }
@@ -517,7 +575,8 @@ final class BandManager: NSObject {
         // length (mirrors GadgetBridge's chunked outgoing write). For the small auth/init packets
         // this is a single chunk, so the existing handshake path is unchanged.
         let mtu = max(20, p.maximumWriteValueLength(for: writeType))
-        if packet.count <= mtu {
+        let bufferHasRoom = writeType == .withResponse || p.canSendWriteWithoutResponse
+        if packet.count <= mtu, pendingWrites.isEmpty, bufferHasRoom {
             // Full hex only for small frames (handshake/commands). Upload chunks are large and
             // frequent — building the hex string for every one is wasteful, so log just the length.
             if packet.count <= 64 {
@@ -529,11 +588,28 @@ final class BandManager: NSObject {
             return
         }
         log.debug("005F write (\(packet.count)B in \(mtu)B chunks, \(writeType == .withoutResponse ? "noRsp" : "rsp"))")
+        var fragments: [Data] = []
         var offset = packet.startIndex
         while offset < packet.endIndex {
             let end = packet.index(offset, offsetBy: mtu, limitedBy: packet.endIndex) ?? packet.endIndex
-            p.writeValue(packet.subdata(in: offset..<end), for: char, type: writeType)
+            fragments.append(packet.subdata(in: offset..<end))
             offset = end
+        }
+        guard writeType == .withoutResponse else {
+            // With-response writes are queued by CoreBluetooth itself.
+            fragments.forEach { p.writeValue($0, for: char, type: writeType) }
+            return
+        }
+        // A write-without-response issued while the buffer is full is silently dropped, and one
+        // lost fragment corrupts the whole frame — pace them against peripheralIsReady.
+        pendingWrites += fragments
+        flushPendingWrites()
+    }
+
+    private func flushPendingWrites() {
+        guard let char = cmdWriteChar, let p = peripheral, p.state == .connected else { return }
+        while !pendingWrites.isEmpty, p.canSendWriteWithoutResponse {
+            p.writeValue(pendingWrites.removeFirst(), for: char, type: .withoutResponse)
         }
     }
 
@@ -748,13 +824,25 @@ final class BandManager: NSObject {
             handleHealthCommand(subtype: cmd.subtype, cmd: cmd, protoBytes: protoBytes)
         case XiaomiWeatherCmd.cmdType:
             handleWeatherCommand(cmd)
+        case XiaomiNotificationCmd.cmdType where [XiaomiNotificationCmd.screenOnGet,
+                                                  XiaomiNotificationCmd.screenOnSet].contains(cmd.subtype):
+            onSettingsCommand?(cmd)
         case XiaomiWatchfaceCmd.cmdType:
             onWatchfaceCommand?(cmd)
         case XiaomiRpkCmd.cmdType:
             onRpkCommand?(cmd)
         case XiaomiDataUploadCmd.cmdType:
             onDataUploadCommand?(cmd)
-        case XiaomiScheduleCmd.cmdType where cmd.hasSchedule && cmd.schedule.hasAckID:
+        case XiaomiScheduleCmd.cmdType where [XiaomiScheduleCmd.alarmsGet, XiaomiScheduleCmd.alarmCreate,
+                                              XiaomiScheduleCmd.alarmEdit, XiaomiScheduleCmd.alarmDelete]
+                                                .contains(cmd.subtype):
+            // Kept apart from the reminder ack below: an alarm-create ack must not be recorded as a
+            // reminder id, or the next calendar sync would delete a reminder by that number.
+            onAlarmCommand?(cmd)
+        case XiaomiScheduleCmd.cmdType where cmd.subtype == XiaomiScheduleCmd.remindersGet && cmd.hasSchedule:
+            onReminderList?(cmd.schedule.reminders)
+        case XiaomiScheduleCmd.cmdType where cmd.subtype == XiaomiScheduleCmd.reminderCreate
+                                          && cmd.hasSchedule && cmd.schedule.hasAckID:
             log.debug("Schedule ack id=\(cmd.schedule.ackID)")
             onScheduleAck?(cmd.schedule.ackID)
         default:
@@ -777,6 +865,11 @@ final class BandManager: NSObject {
         }
         guard cmd.hasSystem, cmd.system.hasPower, cmd.system.power.hasBattery else { return }
         let battery = cmd.system.power.battery
+        if battery.hasLastCharge, battery.lastCharge.timestampSeconds > 0 {
+            let charged = Date(timeIntervalSince1970: TimeInterval(battery.lastCharge.timestampSeconds))
+            batteryLastCharged = charged
+            log.info("Battery last charged \(charged, privacy: .public) (lastCharge.state=\(battery.lastCharge.state, privacy: .public))")
+        }
         if battery.hasLevel {
             // state: 1 = charging (GadgetBridge convertBatteryStateFromRawValue)
             batteryCharging = battery.hasState && battery.state == 1
@@ -839,9 +932,12 @@ final class BandManager: NSObject {
             let fileIds = watch.hasActivityFileIds ? watch.activityFileIds : Data()
             log.info("Workout status update: \(watch.status) (\(fileIds.count / 7) file id(s))")
             onWorkoutStatusWatch?(watch.status, fileIds)
+            workoutStatusObservers.forEach { $0(watch) }
         case XiaomiHealthCmd.realtimeEvent where cmd.hasHealth && cmd.health.hasRealTimeStats:
-            let stats = cmd.health.realTimeStats
-            if stats.hasHeartRate, stats.heartRate > 0 { onRealtimeStats?(Int(stats.heartRate)) }
+            realtimeObservers.forEach { $0(cmd.health.realTimeStats) }
+        case XiaomiHealthCmd.spo2Get ... XiaomiHealthCmd.stressSet,
+             XiaomiHealthCmd.goalNotificationGet, XiaomiHealthCmd.goalNotificationSet:
+            onSettingsCommand?(cmd)
         default:
             // All other health subtypes (activity fetch responses etc.) go to BandSyncer.
             onProtoCommandReceived?(protoBytes)
@@ -1042,6 +1138,7 @@ final class BandManager: NSObject {
         if let p = peripheral {
             onAuthenticated?(p.name ?? "Mi Band 10", p.identifier.uuidString)
         }
+        authenticatedObservers.forEach { $0() }
         sendPostAuthInit()
         startGattBatteryUpdates()
     }
@@ -1210,8 +1307,15 @@ final class BandManager: NSObject {
         batteryLevelChar = nil
         hasGattBatteryLevel = false
         resumeBatteryWaiters()
+        pendingWrites.removeAll()
+        // peripheralIsReady never fires on a dead link; an upload parked here would hang forever.
+        writeReadyContinuation?.resume()
+        writeReadyContinuation = nil
         phoneNonce   = nil
         sessionKeys  = nil
+        // The band's stream dies with the link; a holder kept past it would block the next STOP.
+        realtimeHolders.removeAll()
+        linkLostObservers.forEach { $0() }
         seqNum       = 0
         rxBuffer     = Data()
         authStep3Sent = false
@@ -1256,9 +1360,9 @@ extension BandManager: CBCentralManagerDelegate {
         case .poweredOff:
             connectionState = .bluetoothUnavailable
         case .unauthorized:
-            connectionState = .error("Acesso Bluetooth não autorizado.")
+            connectionState = .error("Bluetooth access not authorized.")
         case .unsupported:
-            connectionState = .error("Este dispositivo não suporta Bluetooth LE.")
+            connectionState = .error("This device doesn't support Bluetooth LE.")
         default:
             connectionState = .bluetoothUnavailable
         }
@@ -1294,7 +1398,7 @@ extension BandManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         log.error("Failed to connect: \(error?.localizedDescription ?? "unknown")")
         lastError = error
-        connectionState = .error(error?.localizedDescription ?? "Falha na conexão")
+        connectionState = .error(error?.localizedDescription ?? "Connection failed")
         scheduleReconnect(to: peripheral)
     }
 
@@ -1370,6 +1474,8 @@ extension BandManager: CBCentralManagerDelegate {
 extension BandManager: CBPeripheralDelegate {
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        flushPendingWrites()
+        guard pendingWrites.isEmpty else { return }
         writeReadyContinuation?.resume()
         writeReadyContinuation = nil
     }

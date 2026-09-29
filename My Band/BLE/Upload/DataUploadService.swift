@@ -29,10 +29,10 @@ final class DataUploadService {
 
         var errorDescription: String? {
             switch self {
-            case .notConnected: "Pulseira não conectada."
-            case .rejected:     "A pulseira recusou o upload."
-            case .timeout:      "Tempo esgotado durante o upload."
-            case .md5Failed:    "Falha ao calcular o checksum do arquivo."
+            case .notConnected: "Band not connected."
+            case .rejected:     "The band rejected the upload."
+            case .timeout:      "Upload timed out."
+            case .md5Failed:    "Failed to compute the file checksum."
             }
         }
     }
@@ -45,6 +45,7 @@ final class DataUploadService {
     }
 
     private func handleCommand(_ cmd: Xiaomi_Command) {
+        log.info("Upload command from band: subtype=\(cmd.subtype) hasAck=\(cmd.dataUpload.hasDataUploadAck)")
         guard cmd.subtype == XiaomiDataUploadCmd.uploadStart,
               cmd.hasDataUpload, cmd.dataUpload.hasDataUploadAck else { return }
         let ack = cmd.dataUpload.dataUploadAck
@@ -102,6 +103,9 @@ final class DataUploadService {
             chunk.append(uint16LE(UInt16(i + 1)))
             chunk.append(payload[start..<end])
             await manager.sendDataChunk(chunk)
+            // A link drop resumes the paced send without writing anything; stop rather than
+            // "finishing" the upload into a dead link and reporting it installed.
+            guard manager.isLinkUp else { throw UploadError.notConnected }
             onProgress(Double(i + 1) / Double(totalParts))
         }
         log.info("Upload finished — \(totalParts) part(s) sent")

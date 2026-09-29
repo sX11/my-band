@@ -9,16 +9,9 @@ import OSLog
 // HKMetadataKeySyncVersion: re-saving a sample with the same identifier and an equal/greater
 // version replaces the existing one instead of creating a duplicate — so re-syncing is safe.
 //
-// Cross-source reconciliation (steps / distance / active energy). The iPhone's motion
-// coprocessor writes these same quantities, and Apple Health *sums* every third-party source on
-// top of the iPhone instead of merging them (its private iPhone+Watch dedup does not extend to
-// third parties, and there's no API to influence the aggregation). So writing the band's totals
-// raw would double-count a shared walk. Instead `writeReconciledActivity` writes only the band's
-// *surplus* over what the iPhone already recorded for the same minute — net total per minute =
-// max(band, iPhone). That kills the double count, keeps the iPhone's Mobility metrics (Walking
-// Asymmetry, Step Length, etc., which the band can't produce and which need Fitness Tracking on),
-// and still captures steps taken without the phone. SpO₂ stays out of this — the iPhone has no
-// such sensor, so it's written at full per-minute granularity in `writeMinuteSamples`.
+// Steps / distance / active energy overlap the iPhone's own and are written raw per minute
+// (`writeActivity`): Apple Health merges overlapping sources by the Data Sources order rather than
+// summing them. Mobility types (walkingSpeed, step length) stay iPhone-only; nothing writes them.
 
 @MainActor
 final class HealthKitManager {
@@ -29,10 +22,6 @@ final class HealthKitManager {
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Health")
 
     private let syncVersion = 1
-    /// Reconciled minutes newer than this are skipped: the iPhone pedometer may not have written
-    /// them to HealthKit yet, so reconciling them would delta against a near-zero baseline and inflate
-    /// the surplus. They're reconciled on a later sync once settled (the band re-offers today's file).
-    private let reconcileSettleWindow: TimeInterval = 15 * 60
 
     var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
@@ -184,11 +173,9 @@ final class HealthKitManager {
         let dayEnd = min(dayStart.addingTimeInterval(86_400 - 1), Date())
         let dayKey = Int(dayStart.timeIntervalSince1970)
 
-        // Steps, distance and active energy are intentionally NOT written here. They would be
-        // summed on top of the iPhone's own values; the per-minute daily-details file carries the
-        // same totals and goes through writeReconciledActivity, which deltas them against the
-        // iPhone. The daily summary keeps only band-exclusive readings (HR/SpO₂ extremes), which
-        // the iPhone never produces and so never conflict.
+        // Steps, distance and active energy are intentionally NOT written here: the per-minute
+        // daily-details file carries the same totals (writeActivity), and a day-long sample would
+        // win or lose the whole day against the iPhone instead of minute by minute.
         let bpm = HKUnit.count().unitDivided(by: .minute())
         let validDateRange: ClosedRange<Date> = Date(timeIntervalSince1970: 1_600_000_000)...Date().addingTimeInterval(86400)
 
@@ -217,14 +204,14 @@ final class HealthKitManager {
 
     // MARK: - Per-minute detail (HR / SpO₂ / Physical Effort time series)
     //
-    // Band-exclusive vitals only. Distance moved to writeReconciledActivity (it double-counts with
-    // the iPhone); HR and SpO₂ have no iPhone equivalent here, so they're written raw at full
-    // granularity. Also used for the HR/SpO₂ samples recorded during sleep.
+    // Band-exclusive vitals only; steps, distance and energy go through writeActivity. HR and SpO₂
+    // have no iPhone equivalent here, so they're written raw at full granularity. Also used for the
+    // HR/SpO₂ samples recorded during sleep.
     //
     // Physical Effort (METs, the same all-day metric the Apple Watch populates) derives from the
     // band's per-minute active calories and the user's weight: MET = 1 (resting baseline, which the
-    // band's *active* kcal excludes by definition) + kcal·60/kg. No reconciliation needed — the
-    // iPhone never writes physicalEffort. Sleep-vitals batches carry no calories, so they skip it.
+    // band's *active* kcal excludes by definition) + kcal·60/kg. The iPhone never writes
+    // physicalEffort. Sleep-vitals batches carry no calories, so they skip it.
 
     func writeMinuteSamples(_ minutes: [ActivityMinuteSample]) async throws -> Int {
         let bpm = HKUnit.count().unitDivided(by: .minute())
@@ -253,107 +240,46 @@ final class HealthKitManager {
         return try await save(samples)
     }
 
-    // MARK: - Reconciled activity (steps / distance / active energy)
+    // MARK: - Activity (steps / distance / active energy)
     //
-    // Writes only the band's surplus over the iPhone, per minute, so the Health total stops
-    // double-counting (see the type header). Each band minute is reconciled against the iPhone's
-    // already-recorded value for that exact minute: delta = max(0, band − iPhone). Two things keep
-    // the surplus accurate across re-syncs: (1) minutes inside reconcileSettleWindow are skipped, so
-    // the iPhone's pedometer has had time to write them before we delta against it; (2) a monotonic
-    // sync version lets a later sync REPLACE an earlier surplus with a corrected one — HealthKit only
-    // replaces a same-identifier sample when the new version is strictly greater (equal/lower saves
-    // are ignored), so a constant version would freeze a first, possibly inflated, write forever. If
-    // the user denied read access the iPhone sums come back empty and we fall back to writing the
-    // full band value — the safe direction (band stays authoritative).
+    // The band's raw per-minute values; Apple Health resolves minutes the iPhone also recorded by
+    // the Data Sources order, so nothing here reads Health. The monotonic version lets a re-sync
+    // replace the same minute's earlier sample (HealthKit ignores an equal or lower version).
 
-    func writeReconciledActivity(_ minutes: [ActivityMinuteSample],
-                                 excludingWorkouts windows: [(start: Date, end: Date)] = []) async throws -> Int {
-        // Distance and active energy measured during a workout are already written as the workout's
-        // own samples (writeWorkouts), which Apple Health also folds into the daily totals — so skip
-        // those minutes here to avoid counting them twice. Steps aren't part of a workout's samples,
-        // so they're always reconciled.
-        func inWorkout(_ d: Date) -> Bool { windows.contains { d >= $0.start && d < $0.end } }
-
-        // Skip minutes the iPhone may not have finalised yet (see the type header). Skipped recent
-        // minutes are reconciled on a later sync — the band keeps re-offering today's growing file.
-        let cutoff = Date().addingTimeInterval(-reconcileSettleWindow)
-        func settled(_ d: Date) -> Bool { d < cutoff }
-
-        let steps = minutes.filter { settled($0.date) }.compactMap { m in m.steps.map { (m.date, Double($0)) } }
-        let dist  = minutes.filter { settled($0.date) && !inWorkout($0.date) }.compactMap { m in m.distanceMeters.map { (m.date, $0) } }
-        let cals  = minutes.filter { settled($0.date) && !inWorkout($0.date) }.compactMap { m in m.caloriesKcal.map { (m.date, Double($0)) } }
-
-        // Strictly-increasing across the BLE-round-trip gap between any two syncs, so the later sync's
-        // recomputed (usually smaller) delta replaces the earlier one instead of being discarded.
+    func writeActivity(_ minutes: [ActivityMinuteSample],
+                       excludingWorkouts windows: [(start: Date, end: Date)] = []) async throws -> Int {
         let version = Int(Date().timeIntervalSince1970)
-
-        var samples: [HKSample] = []
-        samples += try await reconciledSurplus(stepCount, .count(), steps, idPrefix: "mb-steps-rec", version: version)
-        samples += try await reconciledSurplus(distance, .meter(), dist, idPrefix: "mb-dist-rec", version: version)
-        samples += try await reconciledSurplus(activeEnergy, .kilocalorie(), cals, idPrefix: "mb-cal-rec", version: version)
+        let samples: [HKSample] = Self.activityValues(minutes, excludingWorkouts: windows).map { v in
+            let type: HKQuantityType, unit: HKUnit, prefix: String
+            switch v.kind {
+            case .steps:    (type, unit, prefix) = (stepCount, .count(), "mb-steps-rec")
+            case .distance: (type, unit, prefix) = (distance, .meter(), "mb-dist-rec")
+            case .energy:   (type, unit, prefix) = (activeEnergy, .kilocalorie(), "mb-cal-rec")
+            }
+            let start = Date(timeIntervalSince1970: TimeInterval(v.key))
+            return quantity(type, unit, v.value, start: start, end: start.addingTimeInterval(60),
+                            id: "\(prefix)-\(v.key)", version: version)
+        }
         return try await save(samples)
     }
 
-    /// Builds per-minute "surplus" samples for one quantity type: band value minus the iPhone's sum
-    /// for the same minute, dropped when ≤ 0. `version` is the monotonic sync version (see caller).
-    private func reconciledSurplus(_ type: HKQuantityType, _ unit: HKUnit,
-                                   _ values: [(date: Date, value: Double)],
-                                   idPrefix: String, version: Int) async throws -> [HKSample] {
-        let points = values.filter { $0.value > 0 }.sorted { $0.date < $1.date }
-        guard let first = points.first?.date, let last = points.last?.date else { return [] }
-        let end = last.addingTimeInterval(60)
-        let iphone = try await otherSourceSumsByMinute(type: type, unit: unit, start: first, end: end)
+    enum ActivityKind { case steps, distance, energy }
 
-        return Self.surplusValues(points, otherSourceSums: iphone).map { key, delta in
-            quantity(type, unit, delta,
-                    start: Date(timeIntervalSince1970: TimeInterval(key)),
-                    end: Date(timeIntervalSince1970: TimeInterval(key)).addingTimeInterval(60),
-                    id: "\(idPrefix)-\(key)", version: version)
+    /// Distance and energy inside a workout are left out: the workout's own samples carry them.
+    /// Steps aren't part of a workout's samples, so they're always kept.
+    static func activityValues(_ minutes: [ActivityMinuteSample],
+                               excludingWorkouts windows: [(start: Date, end: Date)] = [])
+        -> [(kind: ActivityKind, key: Int, value: Double)] {
+        func inWorkout(_ d: Date) -> Bool { windows.contains { d >= $0.start && d < $0.end } }
+        var out: [(kind: ActivityKind, key: Int, value: Double)] = []
+        for m in minutes {
+            let key = Int(m.date.timeIntervalSince1970)
+            if let steps = m.steps, steps > 0 { out.append((.steps, key, Double(steps))) }
+            guard !inWorkout(m.date) else { continue }
+            if let meters = m.distanceMeters, meters > 0 { out.append((.distance, key, meters)) }
+            if let kcal = m.caloriesKcal, kcal > 0 { out.append((.energy, key, Double(kcal))) }
         }
-    }
-
-    /// Pure delta math for cross-source reconciliation: band value minus the iPhone's sum for the
-    /// same minute, dropped when ≤ 0. Split out from `reconciledSurplus` (which also does the live
-    /// HealthKit query and builds `HKSample`s) so the math itself — the part a re-sync's changing
-    /// iPhone totals can actually get wrong — is testable without HealthKit.
-    static func surplusValues(_ points: [(date: Date, value: Double)],
-                              otherSourceSums: [Int: Double]) -> [(key: Int, delta: Double)] {
-        points.compactMap { p in
-            let key = Int(p.date.timeIntervalSince1970)
-            let delta = p.value - (otherSourceSums[key] ?? 0)
-            guard delta > 0 else { return nil }
-            return (key, delta)
-        }
-    }
-
-    /// Per-minute cumulative sum of `type` from every source *except this app*, over [start, end).
-    /// A single HKStatisticsCollectionQuery handles partial-overlap samples by pro-rating cumulative
-    /// quantities across the 1-minute buckets, so boundary crossings don't skew the totals. Buckets
-    /// are anchored at `start` (a band minute boundary) so their keys line up with the band's minutes.
-    private func otherSourceSumsByMinute(type: HKQuantityType, unit: HKUnit,
-                                         start: Date, end: Date) async throws -> [Int: Double] {
-        let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
-        let notMine = NSCompoundPredicate(notPredicateWithSubpredicate: mine)
-        let time = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
-        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [notMine, time])
-        var interval = DateComponents(); interval.minute = 1
-
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[Int: Double], Error>) in
-            let query = HKStatisticsCollectionQuery(
-                quantityType: type, quantitySamplePredicate: predicate,
-                options: .cumulativeSum, anchorDate: start, intervalComponents: interval)
-            query.initialResultsHandler = { _, results, error in
-                if let error { cont.resume(throwing: error); return }
-                var map: [Int: Double] = [:]
-                results?.enumerateStatistics(from: start, to: end) { stat, _ in
-                    if let sum = stat.sumQuantity() {
-                        map[Int(stat.startDate.timeIntervalSince1970)] = sum.doubleValue(for: unit)
-                    }
-                }
-                cont.resume(returning: map)
-            }
-            store.execute(query)
-        }
+        return out
     }
 
     // MARK: - Manual (on-demand) measurements
@@ -398,6 +324,14 @@ final class HealthKitManager {
         let weightKg = (try? await latestBodyMassKg()) ?? nil
         let estimatedMaxHR = estimatedMaxHeartRate()
 
+        guard canShare(workoutType) else {
+            if !workouts.isEmpty {
+                skippedForPermission = true
+                log.warning("Not allowed to write workouts — skipped \(workouts.count, privacy: .public)")
+            }
+            return (0, [:])
+        }
+
         for w in workouts {
             guard w.endDate > w.startDate else { continue }
             let key = Int(w.startDate.timeIntervalSince1970)
@@ -437,7 +371,7 @@ final class HealthKitManager {
             // In-workout speed series from the GPS track (V2 points carry m/s), so Apple Health
             // draws the speed/pace graph. Running kinds → runningSpeed, cycling → cyclingSpeed.
             // Walking/hiking are deliberately excluded: walkingSpeed feeds the iPhone's Mobility
-            // metrics, which stay iPhone-authoritative (see writeReconciledActivity's rationale).
+            // metrics, which stay iPhone-authoritative (see the type header).
             if let track, let speedType = Self.speedType(w.kind), canShare(speedType) {
                 let mps = HKUnit.meter().unitDivided(by: .second())
                 for p in track where w.startDate ... w.endDate ~= p.date {
@@ -468,6 +402,7 @@ final class HealthKitManager {
                 }
                 log.info("Workout \(key): attaching \(attached) in-workout HR sample(s) to HKWorkout")
             }
+            samples = shareable(samples)
             if !samples.isEmpty {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                     builder.add(samples) { _, error in
@@ -506,6 +441,9 @@ final class HealthKitManager {
             try await builder.endCollection(at: workoutEnd)
             guard let workout = try await builder.finishWorkout() else { continue }
             written += 1
+            // Only now are the builder's samples in Apple Health.
+            count(samples)
+            count(workoutType)
             saved[key] = workout
 
             // VO₂max is a standalone sample (not a workout statistic). The test-type metadata tells
@@ -630,10 +568,11 @@ final class HealthKitManager {
                     course: -1, speed: p.speed ?? -1, timestamp: p.date
                 )
             }
-        guard locations.count >= 2 else { return }
+        guard locations.count >= 2, canShare(routeType) else { return }
         let routeBuilder = HKWorkoutRouteBuilder(healthStore: store, device: .local())
         try await routeBuilder.insertRouteData(locations)
         _ = try await routeBuilder.finishRoute(with: workout, metadata: nil)
+        count(routeType)
     }
 
     // MARK: - Workout type mapping
@@ -808,14 +747,14 @@ final class HealthKitManager {
             let bmi = kg / (m * m)
             samples.append(quantity(bodyMassIndex, .count(), bmi, start: date, end: date, id: "mb-bmi-\(key)"))
         }
-        return try await save(samples)
+        return try await save(samples, tallied: false)
     }
 
     /// Writes the user's height (entered in the app's profile) so Apple Health has it and BMI derives.
     @discardableResult
     func writeHeight(meters: Double, date: Date = Date()) async throws -> Int {
         guard (0.5...2.6).contains(meters) else { return 0 }
-        return try await save([quantity(height, .meter(), meters, start: date, end: date, id: "mb-height")])
+        return try await save([quantity(height, .meter(), meters, start: date, end: date, id: "mb-height")], tallied: false)
     }
 
     /// Most recent height sample from Apple Health, in metres, or nil if none/denied.
@@ -857,16 +796,66 @@ final class HealthKitManager {
     }
 
     /// `version` defaults to the constant syncVersion — fine for immutable data (sleep, manual,
-    /// workout). The reconciled-activity path passes a monotonic version so re-syncs can replace.
+    /// workout). writeActivity passes a monotonic version so re-syncs can replace.
     private func syncMetadata(_ id: String, version: Int? = nil) -> [String: Any] {
         [HKMetadataKeySyncIdentifier: id, HKMetadataKeySyncVersion: version ?? syncVersion]
     }
 
     @discardableResult
-    private func save(_ samples: [HKSample]) async throws -> Int {
-        guard !samples.isEmpty else { return 0 }
-        try await store.save(samples)
-        return samples.count
+    /// `tallied: false` for the scale and profile, whose writes can land mid-sync but aren't the band's.
+    private func save(_ samples: [HKSample], tallied: Bool = true) async throws -> Int {
+        let allowed = shareable(samples)
+        guard !allowed.isEmpty else { return 0 }
+        try await store.save(allowed)
+        if tallied { count(allowed) }
+        return allowed.count
+    }
+
+    // MARK: - Per-type tally for the sync report
+
+    private var tally: [String: Int]?
+
+    /// Counts what is written from here to `endTally`, per HealthKit type.
+    func beginTally() { tally = [:] }
+
+    func endTally() -> [String: Int] {
+        defer { tally = nil }
+        return tally ?? [:]
+    }
+
+    private func count(_ samples: [HKSample]) {
+        guard tally != nil else { return }
+        for s in samples { tally?[s.sampleType.identifier, default: 0] += 1 }
+    }
+
+    private func count(_ type: HKSampleType) {
+        guard tally != nil else { return }
+        tally?[type.identifier, default: 0] += 1
+    }
+
+    /// Set when a write dropped samples for permission. BandSyncer takes it after each write group
+    /// and leaves those files un-ACKed: an ACK makes the band delete a file this app never wrote.
+    private var skippedForPermission = false
+
+    func takeSkippedForPermission() -> Bool {
+        defer { skippedForPermission = false }
+        return skippedForPermission
+    }
+
+    /// One type switched off in Health → Data Access fails the whole save with "Not authorized", so
+    /// samples of a type this app can't write are dropped (and named in the log) instead.
+    private func shareable(_ samples: [HKSample]) -> [HKSample] {
+        var denied: Set<String> = []
+        let allowed = samples.filter { sample in
+            if canShare(sample.sampleType) { return true }
+            denied.insert(sample.sampleType.identifier)
+            return false
+        }
+        if !denied.isEmpty {
+            skippedForPermission = true
+            log.warning("Not allowed to write \(denied.sorted().joined(separator: ", "), privacy: .public) — skipped")
+        }
+        return allowed
     }
 }
 
@@ -876,7 +865,7 @@ enum HealthError: LocalizedError {
     case unavailable
     var errorDescription: String? {
         switch self {
-        case .unavailable: "O Apple Health não está disponível neste dispositivo."
+        case .unavailable: "Apple Health isn't available on this device."
         }
     }
 }
