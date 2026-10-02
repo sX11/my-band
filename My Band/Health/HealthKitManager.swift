@@ -420,6 +420,7 @@ final class HealthKitManager {
             if let mx = w.hrMax  { metadata["MiBandMaxHeartRate"] = mx }
             if let mn = w.hrMin  { metadata["MiBandMinHeartRate"] = mn }
             if let style = w.swimStyle { metadata["MiBandSwimStyle"] = style }
+            metadata["MiBandWorkoutKind"] = w.kind.rawValue
             // Weather at the workout's location/time (Open-Meteo). Apple Health shows condition,
             // temperature and humidity in the workout detail. Humidity is a fraction (0–1) in the
             // percent unit; condition is the HKWeatherCondition raw value.
@@ -724,6 +725,73 @@ final class HealthKitManager {
         }
     }
 
+    // MARK: - Workout history (read, ADR 0009)
+
+    /// The newest workouts this app wrote, newest first. Only this app's: another source's workout
+    /// would read as the band's. A locked iPhone throws `errorDatabaseInaccessible`.
+    func recentWorkouts(limit: Int = 50) async throws -> [WorkoutRecord] {
+        let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
+        let descriptor = HKSampleQueryDescriptor(
+            predicates: [.workout(mine)],
+            sortDescriptors: [SortDescriptor(\.startDate, order: .reverse)],
+            limit: limit)
+        return try await descriptor.result(for: store).map(record)
+    }
+
+    private func record(_ w: HKWorkout) -> WorkoutRecord {
+        let bpm = HKUnit.count().unitDivided(by: .minute())
+        var distanceTypes = [distance, distanceCycling, distanceSwimming]
+        if #available(iOS 18.0, *) { distanceTypes.append(HKQuantityType(.distanceRowing)) }
+        let meters = distanceTypes.lazy
+            .compactMap { w.statistics(for: $0)?.sumQuantity()?.doubleValue(for: .meter()) }
+            .first { $0 > 0 }
+        let hr = w.statistics(for: heartRate)
+        let meta = w.metadata ?? [:]
+        let flaggedIndoor = (meta[HKMetadataKeyIndoorWorkout] as? NSNumber)?.boolValue
+        let swimLocation = (meta[HKMetadataKeySwimmingLocationType] as? NSNumber)?.intValue
+            ?? w.workoutActivities.first?.workoutConfiguration.swimmingLocationType.rawValue
+        let kind = (meta["MiBandWorkoutKind"] as? String).flatMap(WorkoutKind.init(rawValue:))
+            ?? Self.kind(w.workoutActivityType, indoor: flaggedIndoor ?? false,
+                         openWater: swimLocation == HKWorkoutSwimmingLocationType.openWater.rawValue)
+        // The write stores indoor = false for every swim, so a swim's location comes from its kind.
+        let indoor: Bool? = switch kind {
+        case .poolSwim: true
+        case .openWaterSwim: false
+        default: flaggedIndoor
+        }
+        // The band's own summary HR wins; the 1 Hz series only exists when its details file arrived.
+        return WorkoutRecord(
+            id: w.uuid,
+            kind: kind,
+            start: w.startDate, end: w.endDate, duration: w.duration,
+            distanceMeters: meters,
+            activeKcal: w.statistics(for: activeEnergy)?.sumQuantity()?.doubleValue(for: .kilocalorie()),
+            hrAvg: (meta["MiBandAverageHeartRate"] as? Double) ?? hr?.averageQuantity()?.doubleValue(for: bpm),
+            hrMax: (meta["MiBandMaxHeartRate"] as? Double) ?? hr?.maximumQuantity()?.doubleValue(for: bpm),
+            hrMin: (meta["MiBandMinHeartRate"] as? Double) ?? hr?.minimumQuantity()?.doubleValue(for: bpm),
+            indoor: indoor,
+            averageMETs: (meta[HKMetadataKeyAverageMETs] as? HKQuantity)?.doubleValue(for: Self.metUnit))
+    }
+
+    /// Inverse of `activityType(_:)`, for workouts written before `MiBandWorkoutKind`. Lossy: trail
+    /// runs read back as runs, treks as hikes, free training as a generic workout.
+    private static func kind(_ type: HKWorkoutActivityType, indoor: Bool, openWater: Bool) -> WorkoutKind {
+        switch type {
+        case .running:                         indoor ? .treadmill : .running
+        case .walking:                         .walking
+        case .hiking:                          .hiking
+        case .cycling:                         indoor ? .indoorCycling : .outdoorCycling
+        case .swimming:                        openWater ? .openWaterSwim : .poolSwim
+        case .elliptical:                      .elliptical
+        case .rowing:                          indoor ? .rowingMachine : .rowing
+        case .jumpRope:                        .jumpRoping
+        case .highIntensityIntervalTraining:   .hiit
+        case .yoga:                            .yoga
+        case .traditionalStrengthTraining:     .strengthTraining
+        default:                               .other
+        }
+    }
+
     // MARK: - Helpers
 
     // MARK: - Body mass (scale)
@@ -857,6 +925,24 @@ final class HealthKitManager {
         }
         return allowed
     }
+}
+
+// MARK: - WorkoutRecord
+
+/// A workout read back from Apple Health for the Workouts screen; held in memory only.
+struct WorkoutRecord: Identifiable {
+    let id: UUID
+    let kind: WorkoutKind
+    let start: Date
+    let end: Date
+    let duration: TimeInterval
+    let distanceMeters: Double?
+    let activeKcal: Double?
+    let hrAvg: Double?
+    let hrMax: Double?
+    let hrMin: Double?
+    let indoor: Bool?
+    let averageMETs: Double?
 }
 
 // MARK: - Errors

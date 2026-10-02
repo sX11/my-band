@@ -4,7 +4,8 @@ import SwiftUI
 //
 // Live band status, battery, last Apple Health sync and the sync action, the band's alarms and
 // settings, today's activity read live from the band (ADR 0005), the latest health readings from
-// the last sync (ADR 0006), and the workout running on the band (ADR 0008).
+// the last sync (ADR 0006), the workout running on the band (ADR 0008), and the way to past
+// workouts read back from Apple Health (ADR 0009).
 
 struct DashboardView: View {
 
@@ -29,6 +30,7 @@ struct DashboardView: View {
     @State private var showMetrics = false
     @State private var showHealthSync = false
     @State private var showWorkout = false
+    @State private var showWorkouts = false
 
     private var connected: Bool { band.connectionState.isConnected }
     /// Mid-handshake (or scanning) — a reconnect is already under way, so the button waits.
@@ -52,6 +54,10 @@ struct DashboardView: View {
                     }
                     metrics
                     syncSection
+                    MBButton(title: "Workouts", variant: .secondary, size: .lg,
+                             icon: "figure.run", block: true) {
+                        showWorkouts = true
+                    }
                     MBButton(title: "Customize", variant: .secondary, size: .lg,
                              icon: "square.grid.2x2", block: true, disabled: !connected) {
                         showCustomize = true
@@ -81,6 +87,7 @@ struct DashboardView: View {
         .sheet(isPresented: $showMetrics) { LatestMetricsView(deviceID: syncer.currentDevice?.id) }
         .sheet(isPresented: $showHealthSync) { HealthSyncView() }
         .sheet(isPresented: $showWorkout) { WorkoutLiveView() }
+        .sheet(isPresented: $showWorkouts) { WorkoutsView() }
         .task(id: connected) {
             guard connected else { return }
             alarms.requestList()

@@ -7,8 +7,9 @@ private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband"
 //
 // The sport types Mi Band 10 records, mapped 1:1 to GadgetBridge's ActivityKind subset that
 // the Xiaomi summary parsers emit. HealthKit mapping lives in HealthKitManager.
+// Raw values are stored in each workout's Health metadata: renaming a case orphans old workouts.
 
-enum WorkoutKind {
+enum WorkoutKind: String {
     case running, walking, hiking, trekking, trailRun, treadmill
     case outdoorCycling, indoorCycling
     case freeTraining, hiit, yoga

@@ -125,13 +125,7 @@ struct WorkoutLiveView: View {
         return lines.joined(separator: " ")
     }
 
-    private func row(_ label: String, _ value: String) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label).font(.mbBody).foregroundStyle(MB.textPrimary)
-            Spacer()
-            Text(value).font(.mbBody).monospacedDigit().foregroundStyle(MB.textPrimary)
-        }
-    }
+    private func row(_ label: String, _ value: String) -> some View { MBListRow(label: label, value: value) }
 }
 
 // MARK: - Formatting
@@ -141,17 +135,24 @@ enum WorkoutFormat {
         (meters / 1000).formatted(.number.precision(.fractionLength(2)).locale(MBFormat.locale))
     }
 
-    /// Cycling reads as speed, foot sports as pace; nothing until there is 100 m to divide by.
     static func pace(_ w: WorkoutLiveService.Workout) -> (label: String, value: String)? {
-        guard let meters = w.distanceMeters, meters >= 100 else { return nil }
-        let elapsed = w.movingSeconds
-        guard elapsed > 0 else { return nil }
-        if w.kind == .outdoorCycling {
-            let kmh = meters / elapsed * 3.6
+        w.distanceMeters.flatMap { pace(meters: $0, seconds: w.movingSeconds, kind: w.kind) }
+    }
+
+    /// Cycling reads as speed, foot sports as pace, anything else as neither; nothing until there
+    /// is 100 m to divide by.
+    static func pace(meters: Double, seconds: TimeInterval, kind: WorkoutKind?) -> (label: String, value: String)? {
+        guard meters >= 100, seconds > 0 else { return nil }
+        switch kind {
+        case .outdoorCycling, .indoorCycling:
+            let kmh = meters / seconds * 3.6
             return ("Average speed", kmh.formatted(.number.precision(.fractionLength(1)).locale(MBFormat.locale)) + " km/h")
+        case .running, .trailRun, .treadmill, .walking, .hiking, .trekking:
+            let perKm = Int(seconds / (meters / 1000))
+            return ("Average pace", String(format: "%d:%02d /km", perKm / 60, perKm % 60))
+        default:
+            return nil
         }
-        let perKm = Int(elapsed / (meters / 1000))
-        return ("Average pace", String(format: "%d:%02d /km", perKm / 60, perKm % 60))
     }
 }
 
