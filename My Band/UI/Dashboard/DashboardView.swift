@@ -25,7 +25,6 @@ struct DashboardView: View {
     @State private var showCustomize = false
     @State private var showProfile = false
     @State private var showAlarms = false
-    @State private var showReminders = false
     @State private var showSettings = false
     @State private var showMetrics = false
     @State private var showHealthSync = false
@@ -53,10 +52,6 @@ struct DashboardView: View {
                     }
                     metrics
                     syncSection
-                    MBButton(title: "Reminders", variant: .secondary, size: .lg,
-                             icon: "bell", block: true) {
-                        showReminders = true
-                    }
                     MBButton(title: "Customize", variant: .secondary, size: .lg,
                              icon: "square.grid.2x2", block: true, disabled: !connected) {
                         showCustomize = true
@@ -82,7 +77,6 @@ struct DashboardView: View {
         .sheet(isPresented: $showCustomize) { CustomizeView() }
         .sheet(isPresented: $showProfile) { ProfileView() }
         .sheet(isPresented: $showAlarms) { AlarmsView() }
-        .sheet(isPresented: $showReminders) { RemindersView() }
         .sheet(isPresented: $showSettings) { BandSettingsView() }
         .sheet(isPresented: $showMetrics) { LatestMetricsView(deviceID: syncer.currentDevice?.id) }
         .sheet(isPresented: $showHealthSync) { HealthSyncView() }

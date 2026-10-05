@@ -37,11 +37,12 @@ struct RootView: View {
                                onReconfigure: forget)
                     .transition(.opacity)
             case .ready:
-                // Sleep & trends left of the Dashboard (ADR 0010), Workouts right of it (ADR 0009).
+                // Sleep & trends left of the Dashboard (ADR 0010), Workouts right of it (ADR 0009), then Reminders.
                 TabView(selection: $page) {
                     TrendsView(isActive: page == 0).tag(0)
                     DashboardView(onForget: forget).tag(1)
                     WorkoutsView(isActive: page == 2).tag(2)
+                    RemindersView(isActive: page == 3).tag(3)
                 }
                 .tabViewStyle(.page(indexDisplayMode: .always))
                 .background(MB.bgApp.ignoresSafeArea())
