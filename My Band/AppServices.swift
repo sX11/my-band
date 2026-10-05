@@ -24,6 +24,7 @@ final class AppServices {
     let customization = CustomizationManager()
     let scaleManager  = ScaleManager()
     let alarms        = AlarmService()
+    let reminders     = ReminderService()
     let bandSettings  = BandSettingsService()
     let todayActivity = TodayActivityService()
     let workoutLive   = WorkoutLiveService()
@@ -44,9 +45,11 @@ final class AppServices {
         bandSyncer.latestMetrics = latestMetrics
         bandSyncer.syncLog = syncLog
         bandSyncer.workoutLive = workoutLive
+        bandSyncer.reminders = reminders
         bandSyncer.setup(manager: bandManager, context: container.mainContext)
         customization.setup(manager: bandManager)
         alarms.setup(manager: bandManager)
+        reminders.setup(manager: bandManager)
         bandSettings.setup(manager: bandManager)
         todayActivity.setup(manager: bandManager)
         workoutLive.setup(manager: bandManager)

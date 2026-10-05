@@ -10,13 +10,16 @@ import EventKit
 //   • reminders     (Schedule / CMD_REMINDERS_*)   — EventKit reminders still to fire, ≤20
 //
 // Calendar sync is replace-semantics (the band swaps its whole event set), so it's idempotent.
-// Reminders have no bulk-replace, so this app's reminders on the band are deleted before
+// Reminders have no bulk-replace, so the reminders this push created are deleted before
 // re-creating — this mirrors the iPhone's reminders without accumulating duplicates on the band.
+// Ones added on the Reminders screen (ReminderService) are left alone.
 
 @MainActor
 final class CalendarSyncService {
 
     private weak var bandManager: BandManager?
+    /// Owns the band's reminder list and create acks; reminders go through it.
+    var reminders: ReminderService?
     private let store = EKEventStore()
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "CalSync")
 
@@ -123,12 +126,17 @@ final class CalendarSyncService {
         // Only reminders that will still fire: an overdue one is created on the band in the past.
         let now = Date()
         let upcoming = await fetchDueReminders()
-            .compactMap { r in Self.fireDate(of: r, after: now).map { (title: r.title ?? "Reminder", fires: $0) } }
+            .compactMap { r in
+                Self.fireDate(of: r, after: now).map {
+                    (title: ReminderService.truncated(r.title ?? "Reminder"), fires: $0,
+                     repeats: Self.repeatRule(r.recurrenceRules?.first, firing: $0))
+                }
+            }
             .sorted { $0.fires < $1.fires }
             .prefix(maxReminders)
 
         // Skip the delete+recreate churn when the upcoming set hasn't changed since the last push.
-        let sig = signature(upcoming.map { "\($0.title)|\($0.fires.timeIntervalSince1970)" }
+        let sig = signature(upcoming.map { "\($0.title)|\($0.fires.timeIntervalSince1970)|\($0.repeats.mode)" }
             .joined(separator: ";"))
         guard UserDefaults.standard.string(forKey: Self.lastRemindersKey) != sig else {
             log.debug("Reminders unchanged — skipping push")
@@ -137,65 +145,87 @@ final class CalendarSyncService {
 
         // Without the band's list there is nothing to reconcile against; the unsaved signature
         // makes the next sync try again.
-        guard let onBand = await fetchBandReminders() else {
+        guard let reminders, let onBand = await reminders.fetchList() else {
             log.info("Band didn't list its reminders — skipping push")
             return
         }
 
-        // Only this app's reminders are deleted: an id acked on a previous push, or one whose title
+        // Only this push's reminders are deleted: an id acked on a previous push, or one whose title
         // and time match what was pushed (its create-ack was missed, so its id was never known).
+        // One added on the Reminders screen is never this push's, even with the same title and time.
         let previousIDs = Set((UserDefaults.standard.array(forKey: Self.createdReminderIDsKey) as? [Int] ?? []).map { UInt32($0) })
         let previousKeys = Set(UserDefaults.standard.stringArray(forKey: Self.pushedRemindersKey) ?? [])
+        let protected = reminders.protectedIDs
         let stale = onBand.reminder
+            .filter { !protected.contains($0.id) }
             .filter { previousIDs.contains($0.id) || previousKeys.contains(Self.reminderKey($0.reminderDetails)) }
             .map(\.id)
         if !stale.isEmpty {
             log.info("Deleting \(stale.count) reminder(s) from the band")
-            bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.reminderDeleteCommand(ids: stale))
+            reminders.delete(ids: stale)
         }
 
+        // Creates still in flight (an add on the Reminders screen) aren't on the list yet.
         let slots = onBand.hasMaxReminders && onBand.maxReminders > 0
-            ? Int(onBand.maxReminders) - (onBand.reminder.count - stale.count)
+            ? Int(onBand.maxReminders) - (onBand.reminder.count - stale.count) - reminders.inFlight
             : maxReminders
         let toPush = upcoming.prefix(max(0, slots))
-            .map { XiaomiProto.reminderDetails(date: $0.fires, title: $0.title) }
+            .map { XiaomiProto.reminderDetails(date: $0.fires, title: $0.title, repeatMode: $0.repeats.mode) }
 
         // The band assigns each reminder's id and returns it in the create ack.
-        var ackedIDs: [Int] = []
-        bandManager?.onScheduleAck = { id in ackedIDs.append(Int(id)) }
-        defer { bandManager?.onScheduleAck = nil }
-
-        for details in toPush {
-            bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.reminderCreateCommand(details))
-        }
-
-        let deadline = ContinuousClock.now + .seconds(5)
-        while ackedIDs.count < toPush.count, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
-        }
+        let ackedIDs = await reminders.create(toPush).map { Int($0) }
+        reminders.requestList()
         UserDefaults.standard.set(ackedIDs, forKey: Self.createdReminderIDsKey)
         UserDefaults.standard.set(toPush.map(Self.reminderKey), forKey: Self.pushedRemindersKey)
-        UserDefaults.standard.set(sig, forKey: Self.lastRemindersKey)
+        // A create left unconfirmed keeps the signature unsaved, so the next sync tries again.
+        if ackedIDs.count == toPush.count {
+            UserDefaults.standard.set(sig, forKey: Self.lastRemindersKey)
+        }
         log.info("Pushed \(toPush.count) of \(upcoming.count) reminder(s), \(ackedIDs.count) acked")
     }
 
-    /// The band's reminder list, or nil if it didn't answer in time.
-    private func fetchBandReminders() async -> Xiaomi_Reminders? {
-        guard let bandManager else { return nil }
-        var list: Xiaomi_Reminders?
-        bandManager.onReminderList = { list = $0 }
-        defer { bandManager.onReminderList = nil }
-        bandManager.sendEncryptedCommand(protoBytes: XiaomiProto.remindersGetCommand())
-        let deadline = ContinuousClock.now + .seconds(3)
-        while list == nil, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
+    /// The band's repeat for an iPhone recurrence, anchored on the next fire time. Only a plain,
+    /// open-ended every-1 rule maps: the band has no interval and its weekly repeat holds one
+    /// weekday, so anything else goes as its next occurrence and is re-pushed after it fires.
+    static func repeatRule(_ rule: EKRecurrenceRule?, firing: Date, calendar: Calendar = .current) -> ReminderService.Repeat {
+        // An empty list means the same as none; a rule synced from elsewhere may carry either.
+        func set<T>(_ a: [T]?) -> [T]? { a?.isEmpty == false ? a : nil }
+        guard let rule, rule.interval == 1, set(rule.setPositions) == nil,
+              set(rule.weeksOfTheYear) == nil, set(rule.daysOfTheYear) == nil,
+              // The band's repeat never ends, so a rule that does goes one occurrence at a time.
+              rule.recurrenceEnd == nil else { return .once }
+        let days = set(rule.daysOfTheWeek)
+        let monthDays = set(rule.daysOfTheMonth)?.map(\.intValue)
+        let months = set(rule.monthsOfTheYear)?.map(\.intValue)
+        // A day or month the rule names is fine when it is the one the reminder fires on anyway.
+        let firingDay = calendar.component(.day, from: firing)
+        let firingMonth = calendar.component(.month, from: firing)
+        let dayMatches = monthDays == nil || monthDays == [firingDay]
+        let monthMatches = months == nil || months == [firingMonth]
+        switch rule.frequency {
+        case .daily:
+            return days == nil && monthDays == nil && months == nil ? .daily : .once
+        case .weekly:
+            guard monthDays == nil, months == nil else { return .once }
+            guard let days else { return .weekly }
+            let weekday = calendar.component(.weekday, from: firing)
+            return days.count == 1 && days[0].weekNumber == 0 && days[0].dayOfTheWeek.rawValue == weekday ? .weekly : .once
+        case .monthly:
+            return days == nil && months == nil && dayMatches ? .monthly : .once
+        case .yearly:
+            return days == nil && monthMatches && dayMatches ? .yearly : .once
+        @unknown default:
+            return .once
         }
-        return list
     }
 
     /// Title and local wall time, the only fields the band echoes back that identify a reminder.
-    static func reminderKey(_ d: Xiaomi_ReminderDetails) -> String {
-        "\(d.title)|\(d.date.year)-\(d.date.month)-\(d.date.day) \(d.time.hour):\(d.time.minute)"
+    static func reminderKey(_ d: Xiaomi_ReminderDetails) -> String { ReminderService.key(d) }
+
+    /// Makes the next sync push the iPhone's reminders even if they haven't changed: one was
+    /// deleted on the Reminders screen.
+    static func invalidateReminders() {
+        UserDefaults.standard.removeObject(forKey: lastRemindersKey)
     }
 
     /// Clears what was pushed, so a newly paired band gets the full set on its first sync.

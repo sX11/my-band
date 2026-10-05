@@ -58,6 +58,7 @@ struct My_BandApp: App {
                 .environment(services.customization)
                 .environment(services.scaleManager)
                 .environment(services.alarms)
+                .environment(services.reminders)
                 .environment(services.bandSettings)
                 .environment(services.todayActivity)
                 .environment(services.workoutLive)

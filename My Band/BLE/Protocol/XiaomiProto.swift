@@ -207,8 +207,11 @@ enum XiaomiProto {
         return (try? cmd.serializedData()) ?? Data()
     }
 
-    /// Builds a ReminderDetails from a date/time and title (one-shot reminder).
-    static func reminderDetails(date: Date, title: String) -> Xiaomi_ReminderDetails {
+    /// GadgetBridge's REPETITION_WEEKLY, the one repeat mode that also fills `repeatFlags`.
+    static let weeklyRepeatMode: UInt32 = 5
+
+    /// Builds a ReminderDetails from a date/time and title; `repeatMode` 0 = once (see ReminderService.Repeat).
+    static func reminderDetails(date: Date, title: String, repeatMode: UInt32 = 0) -> Xiaomi_ReminderDetails {
         let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
         var d = Xiaomi_Date()
         d.year  = UInt32(comps.year  ?? 2025)
@@ -221,8 +224,11 @@ enum XiaomiProto {
         var details = Xiaomi_ReminderDetails()
         details.date        = d
         details.time        = t
-        details.repeatMode  = 0    // once
-        details.repeatFlags = 64   // unset (GadgetBridge sentinel)
+        details.repeatMode  = repeatMode
+        // Weekly carries the weekday, Mon = 1 … Sun = 7, as GadgetBridge sends it; 64 is its "unset".
+        details.repeatFlags = repeatMode == weeklyRepeatMode
+            ? UInt32((Calendar.current.component(.weekday, from: date) + 5) % 7 + 1)
+            : 64
         details.title       = title
         return details
     }
