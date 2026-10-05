@@ -3,16 +3,20 @@ import HealthKit
 
 // MARK: - WorkoutsView
 //
-// The newest workouts this app wrote to Apple Health, read back on open and never stored
-// (ADR 0009). Totals only: routes, graphs and splits stay in Apple Health.
+// The page right of the Dashboard: the newest workouts this app wrote to Apple Health, read
+// back each time the page appears and never stored (ADR 0009). Totals only: routes, graphs and
+// splits stay in Apple Health.
 
 struct WorkoutsView: View {
 
-    @Environment(\.dismiss) private var dismiss
+    /// Loads only while this is the selected page, so the paged TabView preloading it next to the
+    /// Dashboard doesn't read Health, or raise its prompt, unseen.
+    var isActive: Bool
 
     @State private var months: [(month: Date, items: [WorkoutRecord])] = []
     @State private var loaded = false
     @State private var errorText: String?
+    @State private var selected: WorkoutRecord?
 
     var body: some View {
         NavigationStack {
@@ -30,7 +34,9 @@ struct WorkoutsView: View {
                     ForEach(months, id: \.month) { group in
                         Section(group.month.formatted(.dateTime.month(.wide).year().locale(MBFormat.locale))) {
                             ForEach(group.items) { w in
-                                NavigationLink { WorkoutDetailView(workout: w) } label: { WorkoutRow(workout: w) }
+                                // A sheet, not a push: the page swipe would fight a pushed view's swipe back.
+                                Button { selected = w } label: { WorkoutRow(workout: w) }
+                                    .foregroundStyle(MB.textPrimary)
                             }
                         }
                         .listRowBackground(MB.surfaceCard)
@@ -46,20 +52,30 @@ struct WorkoutsView: View {
             .background(MB.bgApp.ignoresSafeArea())
             .refreshable { await load() }
             .navigationTitle("Workouts")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
             .tint(MB.accent)
+            .sheet(item: $selected) { w in
+                NavigationStack {
+                    WorkoutDetailView(workout: w)
+                        .toolbar {
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button("Done") { selected = nil }
+                            }
+                        }
+                }
+                .preferredColorScheme(.dark)
+                .tint(MB.accent)
+            }
         }
         .preferredColorScheme(.dark)
-        .task { await load() }
+        .task(id: isActive) {
+            guard isActive else { return }
+            await load()
+        }
     }
 
     private func load() async {
         do {
-            // A no-op once answered; asks only if this sheet opens before any sync did.
+            // A no-op once answered; asks only if this page opens before any sync did.
             try await HealthKitManager.shared.requestAuthorization()
             months = Self.byMonth(try await HealthKitManager.shared.recentWorkouts())
             errorText = nil

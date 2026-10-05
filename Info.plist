@@ -46,7 +46,7 @@
 	<key>NSCalendarsUsageDescription</key>
 	<string>My Band sends your upcoming calendar events to the Mi Band 10 so you can see them on your wrist.</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>My Band reads Apple Health to avoid writing duplicate data, to estimate workout effort from your age and weight, and to list the workouts it saved from your Mi Band 10.</string>
+	<string>My Band reads Apple Health to avoid writing duplicate data, to estimate workout effort from your age and weight, to list the workouts it saved from your Mi Band 10, and to chart your last seven days of sleep, resting heart rate, steps, SpO₂ and weight.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>My Band writes the data synced from your Mi Band 10 to Apple Health: sleep, heart rate (including resting), steps, SpO₂, calories, distance, body temperature, VO₂ max, and workouts with GPS routes.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>

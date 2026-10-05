@@ -773,6 +773,59 @@ final class HealthKitManager {
             averageMETs: (meta[HKMetadataKeyAverageMETs] as? HKQuantity)?.doubleValue(for: Self.metUnit))
     }
 
+    // MARK: - Trends (read, ADR 0010)
+
+    /// One value per day for the `days` days ending today, every source merged the way Apple
+    /// Health merges them: a daily sum for cumulative types, a daily average otherwise.
+    func dailyTrend(_ id: HKQuantityTypeIdentifier, unit: HKUnit, days: Int = SleepTrend.days) async throws -> [DayValue] {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        guard let start = cal.date(byAdding: .day, value: -(days - 1), to: today),
+              let end = cal.date(byAdding: .day, value: 1, to: today) else { return [] }
+        let type = HKQuantityType(id)
+        let cumulative = type.aggregationStyle == .cumulative
+        let descriptor = HKStatisticsCollectionQueryDescriptor(
+            predicate: .quantitySample(type: type, predicate: HKQuery.predicateForSamples(withStart: start, end: end)),
+            options: cumulative ? .cumulativeSum : .discreteAverage,
+            anchorDate: today,
+            intervalComponents: DateComponents(day: 1))
+        return try await descriptor.result(for: store).statistics().compactMap { stats in
+            let q = cumulative ? stats.sumQuantity() : stats.averageQuantity()
+            return q.map { DayValue(day: stats.startDate, value: $0.doubleValue(for: unit)) }
+        }
+    }
+
+    /// Asleep minutes by stage for the `days` nights ending today, from every source's sleep samples.
+    func sleepTrend(days: Int = SleepTrend.days) async throws -> [SleepTrend.Night] {
+        let cal = Calendar.current
+        let now = Date()
+        let today = cal.startOfDay(for: now)
+        guard let firstDay = cal.date(byAdding: .day, value: -(days - 1), to: today),
+              let start = cal.date(byAdding: .hour, value: -SleepTrend.nightCutoffHours, to: firstDay) else { return [] }
+        let descriptor = HKSampleQueryDescriptor(
+            predicates: [.categorySample(type: sleepType,
+                                         predicate: HKQuery.predicateForSamples(withStart: start, end: now))],
+            sortDescriptors: [SortDescriptor(\.startDate)])
+        let mine = HKSource.default()
+        let intervals = try await descriptor.result(for: store).compactMap { s -> SleepTrend.Interval? in
+            guard let stage = Self.trendStage(s.value) else { return nil }
+            return .init(start: s.startDate, end: s.endDate, stage: stage, preferred: s.sourceRevision.source == mine)
+        }
+        return SleepTrend.nights(intervals, days: days, today: now, calendar: cal)
+    }
+
+    /// In bed is dropped; awake is kept only to override other sources in the merge.
+    private static func trendStage(_ value: Int) -> SleepTrend.Stage? {
+        switch HKCategoryValueSleepAnalysis(rawValue: value) {
+        case .asleepDeep: .deep
+        case .asleepCore: .core
+        case .asleepREM: .rem
+        case .asleepUnspecified: .unspecified
+        case .awake: .awake
+        default: nil
+        }
+    }
+
     /// Inverse of `activityType(_:)`, for workouts written before `MiBandWorkoutKind`. Lossy: trail
     /// runs read back as runs, treks as hikes, free training as a generic workout.
     private static func kind(_ type: HKWorkoutActivityType, indoor: Bool, openWater: Bool) -> WorkoutKind {
