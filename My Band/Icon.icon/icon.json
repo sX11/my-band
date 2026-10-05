@@ -1,47 +1,48 @@
 {
   "fill" : {
-    "solid" : "display-p3:0.48627,0.49804,1.00000,1.00000"
+    "linear-gradient" : [
+      "display-p3:0.11984,0.12903,0.25013,1.00000",
+      "display-p3:0.03993,0.04301,0.06112,1.00000"
+    ]
   },
   "groups" : [
     {
       "layers" : [
         {
           "fill" : {
-            "linear-gradient" : [
-              "extended-gray:0.00000,1.00000",
-              "extended-gray:0.25000,1.00000"
-            ]
+            "solid" : "display-p3:0.92680,0.40525,0.48679,1.00000"
           },
-          "image-name" : "SVG_1 - Layer.svg copiar 6 4.png",
-          "name" : "SVG_1 - Layer.svg copiar 6 4",
-          "opacity" : 1,
-          "position" : {
-            "scale" : 0.9,
-            "translation-in-points" : [
-              217.21875,
-              3.5
-            ]
-          }
-        },
-        {
-          "fill" : {
-            "solid" : "display-p3:0.94039,0.74576,0.61015,1.00000"
-          },
-          "image-name" : "SVG_1 - Layer.svg 2.png",
-          "name" : "SVG_1 - Layer.svg 2",
-          "opacity" : 1,
-          "position" : {
-            "scale" : 1,
-            "translation-in-points" : [
-              217.21875,
-              0
-            ]
-          }
+          "image-name" : "pulse-dot.png",
+          "name" : "pulse-dot",
+          "opacity" : 1
         }
       ],
       "shadow" : {
         "kind" : "neutral",
-        "opacity" : 0.6
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0
+      }
+    },
+    {
+      "layers" : [
+        {
+          "fill" : {
+            "linear-gradient" : [
+              "extended-gray:1.00000,1.00000",
+              "extended-gray:0.80000,1.00000"
+            ]
+          },
+          "image-name" : "monogram.png",
+          "name" : "monogram",
+          "opacity" : 1
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
       },
       "translucency" : {
         "enabled" : true,
