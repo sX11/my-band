@@ -125,6 +125,7 @@ final class BandSyncer {
     var latestMetrics: LatestMetricsStore?
     var syncLog: HealthSyncLog?
     var workoutLive: WorkoutLiveService?
+    var reminders: ReminderService?
     var workoutWindows = WorkoutWindows()
 
     private weak var bandManager: BandManager?
@@ -166,6 +167,7 @@ final class BandSyncer {
         workoutGps.setup(manager: manager)
         findPhone.setup(manager: manager)
         calendarSync.setup(manager: manager)
+        calendarSync.reminders = reminders
         weatherSync.setup(manager: manager)
 
         workoutGps.onWorkoutFinished = { [weak self] fileIds in

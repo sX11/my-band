@@ -106,6 +106,7 @@ struct RootView: View {
     private func forget() {
         band.disconnect()
         AppServices.shared.alarms.reset()
+        AppServices.shared.reminders.reset()
         AppServices.shared.bandSettings.reset()
         AppServices.shared.todayActivity.reset()
         AppServices.shared.workoutLive.reset()

@@ -1,4 +1,4 @@
-- [ ] Recurring iPhone reminders reach the band as one-shot reminders #reminders #worth(later) #where(My Band/BLE/Protocol/XiaomiProto.swift:224) #added(2026-09-26)
+- [x] Recurring iPhone reminders reach the band as one-shot reminders #reminders #where(My Band/BLE/Protocol/XiaomiProto.swift:224) #added(2026-09-26) #done(2026-10-05)
 	> @anchor: details.repeatMode  = 0    // once
 	> reminderDetails always sends repeatMode 0, so an EKReminder with a recurrence rule is
 	> pushed as its next occurrence only. Each sync re-pushes the next one, so it only

@@ -37,6 +37,7 @@ My Band/
 │   ├── FindPhoneService.swift    # "Encontrar telefone": alarme no iPhone (band→app CMD_FIND_PHONE)
 │   ├── CalendarSyncService.swift # Push app→band: idioma, calendário e lembretes (EventKit)
 │   ├── WeatherSyncService.swift  # Push app→band: tempo atual + previsão (Open-Meteo)
+│   ├── ReminderService.swift     # Lembretes da pulseira: lista, criar, apagar; dono único da lista e dos acks de criação
 │   ├── BandSettingsService.swift # Configurações da pulseira (FC, SpO₂, estresse, lembretes, tela): GET/SET + releitura
 │   ├── TodayActivityService.swift # Leitura única do realtime stats para o card Today da Dashboard
 │   ├── WorkoutLiveService.swift  # Treino em curso na pulseira (status 8/26 + realtime + GPS) para o card de treino (ADR 0008)
@@ -82,6 +83,7 @@ My Band/
     ├── Customize/                # Watch faces e apps RPK
     ├── Workouts/                 # Lista de treinos lida do Apple Health (ADR 0009)
     ├── Trends/                   # Tendências de 7 dias do Apple Health (ADR 0010)
+    ├── Reminders/                # Lembretes da pulseira: criar/apagar (ReminderService)
     ├── Settings/                 # Configurações gerais
     └── LiveActivity/             # WorkoutActivityController: Live Activity do treino (ADR 0008)
 ```
@@ -209,7 +211,9 @@ Alguns recursos são **push** da pulseira: ela manda o comando e o app reage. `B
 
 > **O tempo é request-driven — a pulseira pede, o app responde.** A Mi Band 10 envia `CMD_REQUEST_CONDITIONS_FOR_LOCATION` (type=10, subtype=3) ao conectar e ao abrir a tela de tempo; a tela fica **aguardando a resposta a esse request**, então o push proativo (ao fim do `syncToHealth()`) sozinho não popula o widget. `BandManager.handleWeatherCommand` roteia subtype=3 para o callback `onWeatherConditionsRequest`, e `WeatherSyncService` responde com um push completo (location → current → forecast). A resposta **ecoa a chave/nome de localização que a banda pediu** (`requestedKey`/`requestedName`) para que ela vincule os dados; sem request, o push usa a localização padrão com `isCurrentLocation=true`. Status≠0 das respostas da banda aos nossos pushes (subtypes 0/1/7) é logado. Espelha `XiaomiWeatherService.onConditionRequestReceived` do GadgetBridge.
 
-> **Id de lembrete é atribuído pela banda.** O create não carrega id; a banda responde com `schedule.ackId` (type=17, subtype=15). `BandManager.onScheduleAck` captura esses ids, que `CalendarSyncService` persiste (`UserDefaults`) junto com título e hora de cada lembrete enviado. No sync seguinte ele lê a lista da banda (`onReminderList`) e apaga os ids que conhece **e** os que batem em título+hora com o que enviou — um ack perdido não deixa mais um lembrete órfão disparando para sempre, e lembretes criados por outro app não são tocados. Sem a lista, o push é adiado para o próximo sync. `Esquecer pulseira` limpa esse estado (`CalendarSyncService.forgetBand`).
+> **Lembretes criados no app.** A tela Reminders (`ReminderService`) cria lembretes direto na pulseira, com título (≤20 caracteres, limite do GadgetBridge, não confirmado na Band 10), data/hora e repetição (`repeatMode` 0/1/5/7/8 = uma vez/diária/semanal/mensal/anual; semanal leva o dia da semana em `repeatFlags`, seg=1…dom=7, como o GadgetBridge). O limite vem do `maxReminders` da lista; sem ele, o app não limita. `ReminderService` é o **único** dono de `onReminderList`/`onScheduleAck` — o `CalendarSyncService` usa `fetchList`/`create` dele — e casa cada ack com a criação mais antiga em espera (a pulseira responde em ordem). Os lembretes criados aqui ficam em `UserDefaults` por título+hora (não pelo id do ack, que um ack perdido deslocaria) e o push dos lembretes do iPhone nunca os apaga; um lembrete do iPhone com o mesmo título e hora fica protegido junto.
+>
+> **Id de lembrete é atribuído pela banda.** O create não carrega id; a banda responde com `schedule.ackId` (type=17, subtype=15). `ReminderService` captura esses ids (`BandManager.onScheduleAck`) e os repassa ao `CalendarSyncService`, que os persiste (`UserDefaults`) junto com título e hora de cada lembrete enviado. No sync seguinte ele lê a lista da banda (`onReminderList`) e apaga os ids que conhece **e** os que batem em título+hora com o que enviou — um ack perdido não deixa mais um lembrete órfão disparando para sempre, e lembretes criados por outro app não são tocados. Sem a lista, o push é adiado para o próximo sync. `Esquecer pulseira` limpa esse estado (`CalendarSyncService.forgetBand`).
 
 > **Frames > MTU.** Calendário com muitos eventos passa do ATT MTU. `BandManager.writeSPP` fragmenta a frame em chunks do tamanho do MTU (`maximumWriteValueLength`); a banda reassembla pelo comprimento declarado na frame. Pacotes de auth/init cabem em um chunk — caminho do handshake inalterado.
 
@@ -488,6 +492,7 @@ Versão atual: **1.2.0** — ver `CHANGELOG.md` para o histórico completo. Pró
 5. O `CheckBandBatteryIntent` — em especial o `CMD_BATTERY` sob demanda fora do init pós-auth (a resposta chega no mesmo `handleSystemCommand`, mas nunca foi exercitada com o link já aberto há tempo). E se a Mi Band 10 expõe o Battery Service `0x180F` a apps (a linha `Services:` do log da conexão responde), se a `2A19` lê sem erro pós-auth e se o número bate com o widget Baterias — o log imprime os dois (`via GATT 2A19` / `via protobuf — keeping GATT`).
 6. A tela Workouts — se `MiBandWorkoutKind` e o local da natação voltam do Apple Health num treino real, e o pedido de acesso ao abrir antes do primeiro sync.
 7. A página Sleep & trends — se o sono de várias fontes soma cada minuto uma vez só (o iPhone grava `asleepUnspecified` sobreposto à noite da pulseira) e se as noites caem no dia certo com o corte das 18:00.
+8. A tela Reminders — o `maxReminders` que a Mi Band 10 informa (a linha `Reminders: N of max M` do log), se ela corta títulos acima de 20 caracteres, e se os modos de repetição mensal/anual/semanal disparam como esperado.
 
 Home Assistant foi cortado do roadmap; fora das páginas Workouts e Sleep & trends, a UI segue sem histórico nem gráficos de saúde por decisão (ADR 0005, que substitui o 0001, 0006, 0009 e 0010).
 
