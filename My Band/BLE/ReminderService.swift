@@ -77,10 +77,14 @@ final class ReminderService {
     /// Creates sent but not yet on the band's list: waiting for an ack, or acked and not re-read.
     var inFlight: Int { ackWaiters.count + ackedCreates }
 
-    var canAdd: Bool {
-        guard loaded else { return false }
-        guard let maxReminders else { return true }
-        return reminders.count + inFlight < maxReminders
+    var canAdd: Bool { canAdd(1) }
+
+    /// Free slots on the band, nil until it reports a limit.
+    var freeSlots: Int? { maxReminders.map { max(0, $0 - reminders.count - inFlight) } }
+
+    func canAdd(_ count: Int) -> Bool {
+        guard loaded, count > 0 else { return false }
+        return freeSlots.map { count <= $0 } ?? true
     }
 
     /// The ids of reminders added here, which the iPhone-reminders push leaves alone.
@@ -122,32 +126,47 @@ final class ReminderService {
         bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.remindersGetCommand())
     }
 
-    func add(title: String, date: Date, repeatRule: Repeat) {
-        guard canAdd else {
-            log.warning("Reminder not added: \(self.reminders.count, privacy: .public) of \(self.maxReminders ?? -1, privacy: .public) slots used")
-            return
+    /// One reminder per date, same title and repeat: the band holds a single time per reminder, so
+    /// "every day at 10, 13 and 16" is three daily reminders. Returns how many the band acked; all
+    /// or nothing is checked against the free slots, but a lost ack can still leave a partial set.
+    @discardableResult
+    func add(title: String, dates: [Date], repeatRule: Repeat) async -> Int {
+        guard canAdd(dates.count) else {
+            log.warning("Reminders not added: \(dates.count, privacy: .public) needed, \(self.freeSlots ?? -1, privacy: .public) free")
+            return 0
         }
-        let details = XiaomiProto.reminderDetails(date: date, title: Self.truncated(title), repeatMode: repeatRule.mode)
-        let key = Self.key(details)
-        addedHere[key] = false
-        saveAddedHere()
-        create(details) { [weak self] id in
-            guard let self else { return }
-            // Unacked and never listed: the create most likely didn't land, so don't keep a key
-            // that would protect a future reminder with the same title and time.
-            if id == nil, self.addedHere[key] == false {
+        let title = Self.truncated(title)
+        var answered = 0
+        var acked = 0
+        for date in dates {
+            let details = XiaomiProto.reminderDetails(date: date, title: title, repeatMode: repeatRule.mode)
+            let key = Self.key(details)
+            addedHere[key] = false
+            create(details) { [weak self] id in
+                answered += 1
+                if id != nil { acked += 1 }
+                // Unacked and never listed: the create most likely didn't land, so don't keep a key
+                // that would protect a future reminder with the same title and time.
+                guard let self, id == nil, self.addedHere[key] == false else { return }
                 self.addedHere[key] = nil
                 self.saveAddedHere()
             }
-            self.requestList()
         }
+        saveAddedHere()
+        while answered < dates.count {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        requestList()
+        return acked
     }
 
-    func delete(_ reminder: Reminder) {
-        reminders.removeAll { $0.id == reminder.id }
-        bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.reminderDeleteCommand(ids: [reminder.id]))
+    func delete(_ group: [Reminder]) {
+        let ids = Set(group.map(\.id))
+        guard !ids.isEmpty else { return }
+        reminders.removeAll { ids.contains($0.id) }
+        bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.reminderDeleteCommand(ids: Array(ids)))
         // The push skips an unchanged set, so without this a deleted iPhone reminder stays gone.
-        if !reminder.addedHere { CalendarSyncService.invalidateReminders() }
+        if group.contains(where: { !$0.addedHere }) { CalendarSyncService.invalidateReminders() }
         requestList()
     }
 
