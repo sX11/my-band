@@ -26,10 +26,21 @@ final class AlarmService {
     }
 
     static let everyDay: UInt32 = 0x7F
+    /// The Mi Band 10 holds 10 alarms; used until the band's own `maxAlarms` arrives.
+    static let defaultCapacity = 10
 
     private(set) var alarms: [Alarm] = []
     private(set) var maxAlarms: Int?
     private(set) var loaded = false
+    /// Creates sent but not yet acked: the list doesn't count them yet, and a list read before the
+    /// band commits one would let a second tap past the limit. Each expires if its ack never comes.
+    private var pendingCreates: [UUID] = []
+    /// Acked creates the list hasn't been re-read for yet.
+    private var ackedCreates = 0
+
+    var capacity: Int { maxAlarms ?? Self.defaultCapacity }
+    /// Unknown until the list is read, so adding waits for it rather than overfilling the band.
+    var canAdd: Bool { loaded && alarms.count + pendingCreates.count + ackedCreates < capacity }
 
     private weak var bandManager: BandManager?
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Alarms")
@@ -56,6 +67,8 @@ final class AlarmService {
         alarms = []
         maxAlarms = nil
         loaded = false
+        pendingCreates = []
+        ackedCreates = 0
     }
 
     func requestList() {
@@ -63,9 +76,21 @@ final class AlarmService {
     }
 
     func add(hour: Int, minute: Int, repeatDays: UInt32, smart: Bool) {
+        guard canAdd else {
+            log.warning("Alarm not added: \(self.alarms.count, privacy: .public) of \(self.capacity, privacy: .public) slots used")
+            return
+        }
         let details = Self.details(hour: hour, minute: minute, repeatDays: repeatDays, enabled: true, smart: smart)
         bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.alarmCreateCommand(details))
-        // The band assigns the id; the list is re-read when its create ack arrives.
+        // The band assigns the id; the list is re-read on its create ack.
+        let token = UUID()
+        pendingCreates.append(token)
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            guard let self, self.pendingCreates.contains(token) else { return }
+            self.pendingCreates.removeAll { $0 == token }
+            self.requestList()
+        }
     }
 
     func setEnabled(_ alarm: Alarm, _ enabled: Bool) {
@@ -127,8 +152,13 @@ final class AlarmService {
             maxAlarms = list.hasMaxAlarms ? Int(list.maxAlarms) : nil
             alarms = list.alarm.map(Self.alarm(from:)).sorted { ($0.hour, $0.minute) < ($1.hour, $1.minute) }
             loaded = true
+            ackedCreates = 0
             log.info("Alarms: \(self.alarms.count, privacy: .public) of max \(self.maxAlarms ?? -1, privacy: .public)")
         case XiaomiScheduleCmd.alarmCreate:
+            if !pendingCreates.isEmpty {
+                pendingCreates.removeFirst()
+                ackedCreates += 1
+            }
             requestList()
         default:
             break

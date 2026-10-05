@@ -4,7 +4,8 @@ import SwiftUI
 //
 // Live band status, battery, last Apple Health sync and the sync action, the band's alarms and
 // settings, today's activity read live from the band (ADR 0005), the latest health readings from
-// the last sync (ADR 0006), and the workout running on the band (ADR 0008).
+// the last sync (ADR 0006), and the workout running on the band (ADR 0008). Past workouts are
+// the next page over (`WorkoutsView`, ADR 0009).
 
 struct DashboardView: View {
 
@@ -16,7 +17,6 @@ struct DashboardView: View {
     @Environment(WorkoutLiveService.self) private var workout
     @Environment(LatestMetricsStore.self) private var latest
     @Environment(HealthSyncLog.self) private var syncLog
-    @Environment(\.scenePhase) private var scenePhase
     var onForget: () -> Void
 
     @State private var syncing = false
@@ -81,23 +81,6 @@ struct DashboardView: View {
         .sheet(isPresented: $showMetrics) { LatestMetricsView(deviceID: syncer.currentDevice?.id) }
         .sheet(isPresented: $showHealthSync) { HealthSyncView() }
         .sheet(isPresented: $showWorkout) { WorkoutLiveView() }
-        .task(id: connected) {
-            guard connected else { return }
-            alarms.requestList()
-            settings.requestAll()
-        }
-        .task(id: connected && scenePhase == .active) {
-            // SwiftUI keeps .task running in the background; each reading makes the band measure
-            // heart rate, so it only polls while the app is in front.
-            guard connected, scenePhase == .active else {
-                today.finish()
-                return
-            }
-            while !Task.isCancelled {
-                today.refresh()
-                try? await Task.sleep(for: .seconds(5 * 60))
-            }
-        }
     }
 
     // MARK: Header

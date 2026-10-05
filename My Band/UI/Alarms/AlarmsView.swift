@@ -17,10 +17,7 @@ struct AlarmsView: View {
     @State private var newSmart = false
 
     private var connected: Bool { band.connectionState.isConnected }
-    private var atCapacity: Bool {
-        guard let max = alarms.maxAlarms else { return false }
-        return alarms.alarms.count >= max
-    }
+    private var atCapacity: Bool { alarms.loaded && !alarms.canAdd }
 
     /// Mon … Sun, matching the band's bit order (Mon = 1 … Sun = 64).
     private static let dayLetters = ["M", "T", "W", "T", "F", "S", "S"]
@@ -78,8 +75,8 @@ struct AlarmsView: View {
     }
 
     private var capacityText: String {
-        guard let max = alarms.maxAlarms else { return "On the band" }
-        return "On the band · \(alarms.alarms.count) of \(max)"
+        guard alarms.loaded else { return "On the band" }
+        return "On the band · \(alarms.alarms.count) of \(alarms.capacity)"
     }
 
     private func row(_ alarm: AlarmService.Alarm) -> some View {
@@ -118,8 +115,12 @@ struct AlarmsView: View {
                 }
             }
             .tint(MB.accent)
+            if atCapacity {
+                Text("The band holds \(alarms.capacity) alarms. Delete one to add another.")
+                    .font(.mbFootnote).foregroundStyle(MB.textTertiary)
+            }
             MBButton(title: atCapacity ? "Band is full" : "Add alarm", variant: .primary, size: .lg,
-                     icon: "plus", block: true, disabled: !connected || atCapacity) {
+                     icon: "plus", block: true, disabled: !connected || !alarms.canAdd) {
                 let c = Calendar.current.dateComponents([.hour, .minute], from: newTime)
                 alarms.add(hour: c.hour ?? 7, minute: c.minute ?? 0, repeatDays: newDays, smart: newSmart)
             }

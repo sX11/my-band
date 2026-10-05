@@ -197,10 +197,7 @@ struct LatestMetricsView: View {
         return day.formatted(.dateTime.weekday(.wide).day().month(.abbreviated).locale(MBFormat.locale))
     }
 
-    private static func duration(_ seconds: TimeInterval) -> String {
-        let minutes = Int((seconds / 60).rounded())
-        return "\(minutes / 60) h \(String(format: "%02d", minutes % 60)) min"
-    }
+    private static func duration(_ seconds: TimeInterval) -> String { MBFormat.hoursMinutes(seconds) }
 
     /// "8:00–13:00, 14:00–15:00" — the set bits, merged into runs.
     static func standingDetail(_ mask: Int?) -> String? {

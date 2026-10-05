@@ -23,4 +23,10 @@ enum MBFormat {
     }
 
     static func number(_ n: Int) -> String { n.formatted(.number.locale(locale)) }
+
+    /// "7 h 05 min".
+    static func hoursMinutes(_ seconds: TimeInterval) -> String {
+        let minutes = Int((seconds / 60).rounded())
+        return "\(minutes / 60) h \(String(format: "%02d", minutes % 60)) min"
+    }
 }
