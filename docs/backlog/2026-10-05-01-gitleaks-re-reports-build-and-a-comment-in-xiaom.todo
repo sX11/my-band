@@ -1,0 +1,6 @@
+- [ ] gitleaks re-reports build/ and a comment in XiaomiCrypto.swift on every scan #tooling #worth(later) #where(My Band/BLE/Crypto/XiaomiCrypto.swift:121) #added(2026-10-05)
+	> @anchor: //   encrypt outgoing commands: key=sessionKeys.encrypti
+	> gitleaks dir ignores .gitignore, so it scans build/ (a swift-protobuf fixture) and
+	> flags two comment lines naming the session keys as generic-api-key. Both are false
+	> positives; a .gitleaksignore with those fingerprints, or a config allowlisting
+	> build/, would make a real hit stand out.
