@@ -37,6 +37,10 @@ final class HealthKitManager {
     private let vo2Max      = HKQuantityType(.vo2Max)
     private let distanceCycling  = HKQuantityType(.distanceCycling)
     private let distanceSwimming = HKQuantityType(.distanceSwimming)
+    private let distanceRowing   = HKQuantityType(.distanceRowing)
+    private let distanceSnow     = HKQuantityType(.distanceDownhillSnowSports)
+    private let distanceSkating  = HKQuantityType(.distanceSkatingSports)
+    private let distancePaddle   = HKQuantityType(.distancePaddleSports)
     private let swimStrokes      = HKQuantityType(.swimmingStrokeCount)
     private let bodyMass         = HKQuantityType(.bodyMass)
     private let bodyMassIndex    = HKQuantityType(.bodyMassIndex)
@@ -56,11 +60,11 @@ final class HealthKitManager {
     private var shareTypes: Set<HKSampleType> {
         var types: Set<HKSampleType> = [sleepType, heartRate, stepCount, distance, activeEnergy, spo2,
          bodyTemp, restingHR, vo2Max, distanceCycling, distanceSwimming, swimStrokes,
+         distanceRowing, distanceSnow, distanceSkating, distancePaddle,
          bodyMass, bodyMassIndex, height, workoutType, routeType,
          physicalEffort, runningSpeed, runningStride, cyclingSpeedType, hrRecovery]
         if #available(iOS 18.0, *) {
             types.insert(HKQuantityType(.estimatedWorkoutEffortScore))
-            types.insert(HKQuantityType(.distanceRowing))
         }
         return types
     }
@@ -353,14 +357,7 @@ final class HealthKitManager {
                 samples.append(quantity(activeEnergy, .kilocalorie(), kcal,
                                         start: w.startDate, end: w.endDate, id: "mb-wkcal-\(key)"))
             }
-            if let dist = w.distanceMeters {
-                var distType = Self.distanceType(w.kind, distance, distanceCycling, distanceSwimming)
-                // Rowing got its own quantity on iOS 18; before that it fell into the default
-                // distanceWalkingRunning branch, silently inflating the walking total.
-                if #available(iOS 18.0, *), w.kind == .rowing || w.kind == .rowingMachine,
-                   canShare(HKQuantityType(.distanceRowing)) {
-                    distType = HKQuantityType(.distanceRowing)
-                }
+            if let dist = w.distanceMeters, let distType = distanceType(w.kind) {
                 samples.append(quantity(distType, .meter(), dist,
                                         start: w.startDate, end: w.endDate, id: "mb-wdist-\(key)"))
             }
@@ -588,6 +585,55 @@ final class HealthKitManager {
         case .elliptical:                            .elliptical
         case .rowing, .rowingMachine:                .rowing
         case .jumpRoping:                            .jumpRope
+        case .triathlon:                             .swimBikeRun
+        case .sailing:                               .sailing
+        case .paddleSports:                          .paddleSports
+        case .waterPolo:                             .waterPolo
+        case .waterSports:                           .waterSports
+        case .diving:                                .underwaterDiving
+        case .surfing:                               .surfingSports
+        case .climbing:                              .climbing
+        case .skating:                               .skatingSports
+        case .stairClimbing:                         .stairClimbing
+        case .stairs:                                .stairs
+        case .stepTraining:                          .stepTraining
+        case .coreTraining:                          .coreTraining
+        case .flexibility:                           .flexibility
+        case .pilates:                               .pilates
+        case .gymnastics:                            .gymnastics
+        case .crossTraining:                         .crossTraining
+        case .mixedCardio:                           .mixedCardio
+        case .functionalStrength:                    .functionalStrengthTraining
+        case .dance:                                 .cardioDance
+        case .boxing:                                .boxing
+        case .wrestling:                             .wrestling
+        case .martialArts:                           .martialArts
+        case .taiChi:                                .taiChi
+        case .kickboxing:                            .kickboxing
+        case .fencing:                               .fencing
+        case .soccer:                                .soccer
+        case .basketball:                            .basketball
+        case .volleyball:                            .volleyball
+        case .baseball:                              .baseball
+        case .softball:                              .softball
+        case .americanFootball:                      .americanFootball
+        case .hockey:                                .hockey
+        case .tableTennis:                           .tableTennis
+        case .badminton:                             .badminton
+        case .tennis:                                .tennis
+        case .cricket:                               .cricket
+        case .handball:                              .handball
+        case .bowling:                               .bowling
+        case .squash:                                .squash
+        case .golf:                                  .golf
+        case .curling:                               .curling
+        case .snowSports:                            .snowSports
+        case .snowboarding:                          .snowboarding
+        case .downhillSkiing:                        .downhillSkiing
+        case .archery:                               .archery
+        case .equestrian:                            .equestrianSports
+        case .fishing:                               .fishing
+        case .discSports:                            .discSports
         case .hiit:                                  .highIntensityIntervalTraining
         case .yoga:                                  .yoga
         case .strengthTraining:                      .traditionalStrengthTraining
@@ -627,18 +673,31 @@ final class HealthKitManager {
 
     private static func isIndoor(_ kind: WorkoutKind) -> Bool {
         switch kind {
-        case .treadmill, .indoorCycling, .elliptical, .rowingMachine, .hiit, .yoga, .freeTraining, .strengthTraining: true
+        case .treadmill, .indoorCycling, .elliptical, .rowingMachine, .hiit, .yoga, .freeTraining, .strengthTraining,
+             .stairClimbing, .stairs, .stepTraining, .coreTraining, .flexibility, .pilates, .gymnastics,
+             .crossTraining, .mixedCardio, .functionalStrength, .dance, .boxing, .wrestling, .martialArts,
+             .taiChi, .kickboxing, .fencing, .tableTennis, .badminton, .squash, .bowling, .curling,
+             .basketball, .handball: true
         default: false
         }
     }
 
-    private static func distanceType(_ kind: WorkoutKind, _ walkRun: HKQuantityType,
-                                     _ cycling: HKQuantityType, _ swimming: HKQuantityType) -> HKQuantityType {
+    /// nil where no HealthKit distance fits, or the fitting one was denied: falling back to
+    /// distanceWalkingRunning would silently inflate the walking total.
+    private func distanceType(_ kind: WorkoutKind) -> HKQuantityType? {
+        let type: HKQuantityType
         switch kind {
-        case .outdoorCycling, .indoorCycling: cycling
-        case .poolSwim, .openWaterSwim:        swimming
-        default:                               walkRun
+        case .outdoorCycling, .indoorCycling:                    type = distanceCycling
+        case .poolSwim, .openWaterSwim:                          type = distanceSwimming
+        case .rowing, .rowingMachine:                            type = distanceRowing
+        case .downhillSkiing, .snowboarding, .snowSports:        type = distanceSnow
+        case .skating:                                           type = distanceSkating
+        case .paddleSports:                                      type = distancePaddle
+        case .triathlon, .sailing, .surfing, .waterSports, .waterPolo, .diving,
+             .equestrian, .fishing:                              return nil
+        default:                                                 return distance
         }
+        return canShare(type) ? type : nil
     }
 
     /// Quantity type for the in-workout GPS speed series. Only kinds whose speed has a dedicated
@@ -740,8 +799,8 @@ final class HealthKitManager {
 
     private func record(_ w: HKWorkout) -> WorkoutRecord {
         let bpm = HKUnit.count().unitDivided(by: .minute())
-        var distanceTypes = [distance, distanceCycling, distanceSwimming]
-        if #available(iOS 18.0, *) { distanceTypes.append(HKQuantityType(.distanceRowing)) }
+        let distanceTypes = [distance, distanceCycling, distanceSwimming, distanceRowing,
+                             distanceSnow, distanceSkating, distancePaddle]
         let meters = distanceTypes.lazy
             .compactMap { w.statistics(for: $0)?.sumQuantity()?.doubleValue(for: .meter()) }
             .first { $0 > 0 }
@@ -838,6 +897,55 @@ final class HealthKitManager {
         case .elliptical:                      .elliptical
         case .rowing:                          indoor ? .rowingMachine : .rowing
         case .jumpRope:                        .jumpRoping
+        case .swimBikeRun:                     .triathlon
+        case .sailing:                         .sailing
+        case .paddleSports:                    .paddleSports
+        case .waterPolo:                       .waterPolo
+        case .waterSports:                     .waterSports
+        case .underwaterDiving:                .diving
+        case .surfingSports:                   .surfing
+        case .climbing:                        .climbing
+        case .skatingSports:                   .skating
+        case .stairClimbing:                   .stairClimbing
+        case .stairs:                          .stairs
+        case .stepTraining:                    .stepTraining
+        case .coreTraining:                    .coreTraining
+        case .flexibility:                     .flexibility
+        case .pilates:                         .pilates
+        case .gymnastics:                      .gymnastics
+        case .crossTraining:                   .crossTraining
+        case .mixedCardio:                     .mixedCardio
+        case .functionalStrengthTraining:      .functionalStrength
+        case .cardioDance:                     .dance
+        case .boxing:                          .boxing
+        case .wrestling:                       .wrestling
+        case .martialArts:                     .martialArts
+        case .taiChi:                          .taiChi
+        case .kickboxing:                      .kickboxing
+        case .fencing:                         .fencing
+        case .soccer:                          .soccer
+        case .basketball:                      .basketball
+        case .volleyball:                      .volleyball
+        case .baseball:                        .baseball
+        case .softball:                        .softball
+        case .americanFootball:                .americanFootball
+        case .hockey:                          .hockey
+        case .tableTennis:                     .tableTennis
+        case .badminton:                       .badminton
+        case .tennis:                          .tennis
+        case .cricket:                         .cricket
+        case .handball:                        .handball
+        case .bowling:                         .bowling
+        case .squash:                          .squash
+        case .golf:                            .golf
+        case .curling:                         .curling
+        case .snowSports:                      .snowSports
+        case .snowboarding:                    .snowboarding
+        case .downhillSkiing:                  .downhillSkiing
+        case .archery:                         .archery
+        case .equestrianSports:                .equestrian
+        case .fishing:                         .fishing
+        case .discSports:                      .discSports
         case .highIntensityIntervalTraining:   .hiit
         case .yoga:                            .yoga
         case .traditionalStrengthTraining:     .strengthTraining

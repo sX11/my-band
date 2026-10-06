@@ -5,17 +5,25 @@ private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband"
 
 // MARK: - WorkoutKind
 //
-// The sport types Mi Band 10 records, mapped 1:1 to GadgetBridge's ActivityKind subset that
-// the Xiaomi summary parsers emit. HealthKit mapping lives in HealthKitManager.
+// The sport types Mi Band 10 records: one kind per HealthKit activity type, with every
+// GadgetBridge workoutType code that has one folded onto it. HealthKit mapping lives in
+// HealthKitManager.
 // Raw values are stored in each workout's Health metadata: renaming a case orphans old workouts.
 
 enum WorkoutKind: String {
     case running, walking, hiking, trekking, trailRun, treadmill
     case outdoorCycling, indoorCycling
     case freeTraining, hiit, yoga
-    case strengthTraining                               // Treino de Força (code 17 / subtype 0x11)
+    case strengthTraining                               // Treino de Força (workoutType 308, freestyle layout)
     case poolSwim, openWaterSwim
     case elliptical, rowing, rowingMachine, jumpRoping
+    case triathlon, sailing, paddleSports, waterPolo, waterSports, diving, surfing, climbing,
+         skating, stairClimbing, stairs, stepTraining, coreTraining, flexibility, pilates,
+         gymnastics, crossTraining, mixedCardio, functionalStrength, dance, boxing, wrestling,
+         martialArts, taiChi, kickboxing, fencing, soccer, basketball, volleyball, baseball,
+         softball, americanFootball, hockey, tableTennis, badminton, tennis, cricket, handball,
+         bowling, squash, golf, curling, snowSports, snowboarding, downhillSkiing, archery,
+         equestrian, fishing, discSports
     case other
 
     /// Whether a phone GPS stream is useful for this sport. Indoor / stationary sports (strength,
@@ -23,10 +31,18 @@ enum WorkoutKind: String {
     /// the band starts them immediately instead of waiting for, and recording, a fix it won't use.
     var usesGps: Bool {
         switch self {
-        case .running, .trailRun, .walking, .hiking, .trekking, .outdoorCycling, .openWaterSwim:
+        case .running, .trailRun, .walking, .hiking, .trekking, .outdoorCycling, .openWaterSwim,
+             .triathlon, .climbing, .hockey, .sailing, .paddleSports, .waterSports, .surfing,
+             .skating, .soccer, .baseball, .softball, .americanFootball, .cricket, .golf, .snowSports, .snowboarding,
+             .downhillSkiing, .equestrian, .fishing, .discSports:
             return true
-        case .treadmill, .indoorCycling, .freeTraining, .hiit, .yoga, .strengthTraining,
-             .poolSwim, .elliptical, .rowing, .rowingMachine, .jumpRoping, .other:
+        case .treadmill, .indoorCycling, .freeTraining, .hiit, .yoga, .strengthTraining, .poolSwim,
+             .elliptical, .rowing, .rowingMachine, .jumpRoping, .waterPolo, .diving,
+             .stairClimbing, .stairs, .stepTraining, .coreTraining, .flexibility, .pilates,
+             .gymnastics, .crossTraining, .mixedCardio, .functionalStrength, .dance, .boxing,
+             .wrestling, .martialArts, .taiChi, .kickboxing, .fencing, .basketball, .volleyball,
+             .tableTennis, .badminton, .tennis, .handball, .bowling, .squash, .curling,
+             .archery, .other:
             return false
         }
     }
@@ -446,30 +462,78 @@ enum WorkoutSummaryParser {
         }
     }
 
-    /// Subset of XiaomiWorkoutType.fromCode used by the V2 walking/cycling files whose kind
-    /// comes from a payload field rather than the file-id subtype.
+    /// XiaomiWorkoutType.fromCode (GadgetBridge), folded onto one kind per HealthKit activity type.
+    /// Also decides the GPS reply at workout start, so an outdoor sport must not map to a kind
+    /// whose `usesGps` is false.
     static func workoutKind(fromCode code: Int) -> WorkoutKind? {
         switch code {
-        case 1:  .running
-        case 2:  .walking
-        case 3:  .hiking
-        case 4:  .trekking
-        case 5:  .trailRun
-        case 6:  .outdoorCycling
-        case 7:  .indoorCycling
-        case 8:  .freeTraining
-        case 9:  .poolSwim
-        case 10: .openWaterSwim
-        case 11: .elliptical
-        case 12: .yoga
-        case 13: .rowingMachine
-        case 14: .jumpRoping
-        case 15: .walking
-        case 16:  .hiit
-        // Strength training uses subtype 0x08 (freestyle layout), version 10, with workoutType=308.
+        case 1:                          .running
+        case 2, 15, 207, 333:            .walking
+        case 3:                          .hiking
+        case 4:                          .trekking
+        case 5:                          .trailRun
+        case 6, 206:                     .outdoorCycling
+        case 7, 324:                     .indoorCycling
+        case 8:                          .freeTraining
+        case 16:                         .hiit
+        case 12:                         .yoga
         // Confirmed from hardware log: subtype=0x8 version=10 workoutType code=308.
-        case 308: .strengthTraining
-        case 107: .rowing
+        case 308:                        .strengthTraining
+        case 9:                          .poolSwim
+        case 10:                         .openWaterSwim
+        case 11:                         .elliptical
+        case 107:                        .rowing
+        case 13:                         .rowingMachine
+        case 14:                         .jumpRoping
+        case 17:                         .triathlon
+        case 100:                        .sailing
+        case 101, 105, 106, 115:         .paddleSports
+        case 102:                        .waterPolo
+        case 103, 104, 108, 112:         .waterSports
+        case 110:                        .diving
+        case 113, 114:                   .surfing
+        case 200:                        .climbing
+        case 201, 202, 700, 707:         .skating
+        case 300:                        .stairClimbing
+        case 301:                        .stairs
+        case 302, 326:                   .stepTraining
+        case 303, 322, 323:              .coreTraining
+        case 304, 307:                   .flexibility
+        case 305:                        .pilates
+        case 306, 327...329:             .gymnastics
+        case 309:                        .crossTraining
+        case 310, 325, 332, 399:         .mixedCardio
+        case 311...321, 331:             .functionalStrength
+        case 400...412, 499:             .dance
+        case 500:                        .boxing
+        case 501:                        .wrestling
+        case 502, 504...507, 509, 511:   .martialArts
+        case 503:                        .taiChi
+        case 330, 508:                   .kickboxing
+        case 510:                        .fencing
+        case 600, 616, 621:              .soccer
+        case 601:                        .basketball
+        case 602:                        .volleyball
+        case 603:                        .baseball
+        case 604:                        .softball
+        case 605:                        .americanFootball
+        case 606, 704:                   .hockey
+        case 607:                        .tableTennis
+        case 608:                        .badminton
+        case 609:                        .tennis
+        case 610:                        .cricket
+        case 611:                        .handball
+        case 612:                        .bowling
+        case 613:                        .squash
+        case 619:                        .golf
+        case 701:                        .curling
+        case 702, 703, 705, 706:         .snowSports
+        case 708:                        .snowboarding
+        case 709:                        .downhillSkiing
+        case 800:                        .archery
+        case 802, 10000:                 .equestrian
+        case 806:                        .fishing
+        case 807:                        .discSports
         default: nil
         }
     }
