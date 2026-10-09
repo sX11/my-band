@@ -49,6 +49,15 @@ final class WeatherSyncService: NSObject {
     private let proactiveThrottle: TimeInterval = 30 * 60
     private let lastProactivePushKey = "myband.lastWeatherPush"
 
+    // The band asks once per saved location, every ~15 min, and with GPS on they all resolve to the
+    // same coordinates — 4+ identical Open-Meteo calls per wake, enough to draw HTTP 429 on a
+    // carrier-shared IP. One shared fetch per ~1 km cell; a recent forecast stands in when it fails.
+    private var forecastCache: [String: (data: OpenMeteoResponse, at: Date)] = [:]
+    private var forecastInFlight: [String: Task<(data: OpenMeteoResponse, fresh: Bool), Error>] = [:]
+    private var forecastCooldownUntil: [String: Date] = [:]
+    private let forecastFreshFor: TimeInterval = 10 * 60
+    private let forecastUsableFor: TimeInterval = 3 * 60 * 60
+
     func setup(manager: BandManager) {
         bandManager = manager
         locationManager.delegate = self
@@ -80,16 +89,19 @@ final class WeatherSyncService: NSObject {
 
         let target = await resolveLocation(requestedKey: requestedKey, requestedName: requestedName)
         do {
-            let data = try await fetch(latitude: target.lat, longitude: target.lon)
-            lastConditions = WorkoutWeather(wmoCode: data.current.weatherCode,
-                                            temperatureC: data.current.temperature2M,
-                                            humidityPct: data.current.relativeHumidity2M)
+            let (data, fresh) = try await forecast(latitude: target.lat, longitude: target.lon)
+            if fresh {
+                lastConditions = WorkoutWeather(wmoCode: data.current.weatherCode,
+                                                temperatureC: data.current.temperature2M,
+                                                humidityPct: data.current.relativeHumidity2M)
+            }
             sendToBand(data, name: target.name, code: target.code, isCurrent: target.isCurrent)
-            if proactive {
+            // A stale stand-in must not hold off the next proactive push that could fetch fresh data.
+            if proactive && fresh {
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastProactivePushKey)
             }
         } catch {
-            log.error("Weather fetch failed: \(error.localizedDescription)")
+            log.error("Weather fetch failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -227,6 +239,54 @@ final class WeatherSyncService: NSObject {
 
     // MARK: - Open-Meteo fetch
 
+    /// `fresh` is false when a cached forecast stands in for a failed fetch.
+    private func forecast(latitude: Double, longitude: Double) async throws -> (data: OpenMeteoResponse, fresh: Bool) {
+        let cell = String(format: "%.2f,%.2f", latitude, longitude)
+        if let hit = forecastCache[cell], Date().timeIntervalSince(hit.at) < forecastFreshFor { return (hit.data, true) }
+        if let pending = forecastInFlight[cell] { return try await pending.value }
+        // The band's per-location requests reach here seconds apart, each after its own geocode, so
+        // without a cooldown every one of them would send its own request into the same rate limit.
+        if let until = forecastCooldownUntil[cell], Date() < until {
+            return try staleForecast(cell, after: WeatherCooldownError(until: until))
+        }
+
+        let task = Task { () throws -> (data: OpenMeteoResponse, fresh: Bool) in
+            do {
+                let data = try await fetch(latitude: latitude, longitude: longitude)
+                let now = Date()
+                forecastCache = forecastCache.filter { now.timeIntervalSince($0.value.at) < forecastUsableFor }
+                forecastCache[cell] = (data, now)
+                forecastCooldownUntil[cell] = nil
+                return (data, true)
+            } catch {
+                forecastCooldownUntil[cell] = Date().addingTimeInterval(Self.cooldown(after: error))
+                return try staleForecast(cell, after: error)
+            }
+        }
+        forecastInFlight[cell] = task
+        defer { forecastInFlight[cell] = nil }
+        return try await task.value
+    }
+
+    /// The last forecast for the cell, if it is under `forecastUsableFor` old and still covers
+    /// today: after midnight its first daily entry is yesterday, which the band would show as today.
+    private func staleForecast(_ cell: String, after error: Error) throws -> (data: OpenMeteoResponse, fresh: Bool) {
+        guard let hit = forecastCache[cell], Date().timeIntervalSince(hit.at) < forecastUsableFor,
+              let firstDay = hit.data.daily.time.first,
+              let tz = TimeZone(secondsFromGMT: hit.data.utcOffsetSeconds) else { throw error }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = tz
+        guard calendar.isDate(Date(timeIntervalSince1970: TimeInterval(firstDay)), inSameDayAs: Date()) else { throw error }
+        let age = Int(Date().timeIntervalSince(hit.at) / 60)
+        log.notice("Open-Meteo unavailable (\(error.localizedDescription, privacy: .public)) — reusing the forecast from \(age, privacy: .public) min ago")
+        return (hit.data, false)
+    }
+
+    private static func cooldown(after error: Error) -> TimeInterval {
+        guard let http = error as? HTTPStatusError, http.status == 429 else { return 60 }
+        return min(max(http.retryAfter ?? 5 * 60, 60), 15 * 60)
+    }
+
     private func fetch(latitude: Double, longitude: Double) async throws -> OpenMeteoResponse {
         var comps = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
         comps.queryItems = [
@@ -258,13 +318,16 @@ final class WeatherSyncService: NSObject {
             request.timeoutInterval = timeout
             do {
                 let (bytes, response) = try await URLSession.shared.data(for: request)
-                guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                    throw URLError(.badServerResponse)
+                guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                guard http.statusCode == 200 else {
+                    let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+                    throw HTTPStatusError(status: http.statusCode, retryAfter: retryAfter)
                 }
                 return bytes
             } catch {
                 attempt += 1
-                if attempt > retries { throw error }
+                // An immediate retry into a rate limit only earns a second 429.
+                if attempt > retries || (error as? HTTPStatusError)?.status == 429 { throw error }
                 log.debug("Weather fetch retry \(attempt) after: \(error.localizedDescription)")
             }
         }
@@ -435,6 +498,17 @@ struct WorkoutWeather {
     let wmoCode: Int
     let temperatureC: Double
     let humidityPct: Double
+}
+
+private struct HTTPStatusError: LocalizedError {
+    let status: Int
+    let retryAfter: TimeInterval?
+    var errorDescription: String? { "HTTP \(status)" }
+}
+
+private struct WeatherCooldownError: LocalizedError {
+    let until: Date
+    var errorDescription: String? { "cooling down after a failed fetch until \(until.formatted(date: .omitted, time: .standard))" }
 }
 
 // MARK: - Open-Meteo response model
