@@ -101,14 +101,16 @@ final class HealthKitManager {
     // and (3) clearing whatever this app already wrote for the window as a backstop, so a
     // reclassified stage (same start, different type — not caught by a stable id alone) still gets
     // superseded instead of sitting alongside the old one.
-    func writeSleep(_ sessions: [SleepSession]) async throws -> Int {
+    /// `clearExisting: false` skips the backstop delete, which a locked phone refuses — the caller
+    /// then leaves the file un-ACKed so an unlocked sync clears and rewrites the night.
+    func writeSleep(_ sessions: [SleepSession], clearExisting: Bool = true) async throws -> Int {
         guard !sessions.isEmpty else { return 0 }
         var samples: [HKSample] = []
         for group in Self.groupOverlapping(sessions) {
             guard let start = group.map(\.startDate).min(), let end = group.map(\.endDate).max(),
                   end > start else { continue }
 
-            try await deleteExistingSleep(overlapping: start, to: end)
+            if clearExisting { try await deleteExistingSleep(overlapping: start, to: end) }
 
             // Enclosing in-bed window so Apple Health reports "Time in Bed" alongside the stages.
             let inBedId = "mb-inbed-\(Int(start.timeIntervalSince1970))"
