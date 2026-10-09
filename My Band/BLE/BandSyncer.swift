@@ -1,6 +1,7 @@
 import Foundation
 import SwiftData
 import OSLog
+import HealthKit
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -120,6 +121,10 @@ final class BandSyncer {
     private(set) var isSyncing = false
     private(set) var lastSyncDate: Date?
     private(set) var lastHealthSync: Date?
+    /// A sync with the phone locked left files on the band for an unlocked one to rewrite. Lifts the
+    /// background-wake throttle and triggers a sync on unlock (BackgroundSyncManager).
+    private(set) var filesAwaitingUnlock = false
+    var unlockedSyncDue: Bool { filesAwaitingUnlock && Self.healthReadable }
     private(set) var lastError: Error?
     private(set) var currentDevice: BandDevice?
     var latestMetrics: LatestMetricsStore?
@@ -268,6 +273,7 @@ final class BandSyncer {
         var manualSamples = 0
         var workouts = 0
         var healthSamplesWritten = 0
+        var deferredForLock = false
     }
 
     @discardableResult
@@ -304,6 +310,7 @@ final class BandSyncer {
         let outcome = try await reportingFailure {
             try await processActivityFiles(fileIds, manager: manager, context: context)
         }
+        filesAwaitingUnlock = outcome.deferredForLock
         markSynced(context)
 
         log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
@@ -354,6 +361,7 @@ final class BandSyncer {
             try await processActivityFiles(fileIds, manager: manager, context: context,
                                            addingToLastReport: true)
         }
+        if outcome.deferredForLock { filesAwaitingUnlock = true }
         markSynced(context)
         log.info("Targeted workout sync done — \(outcome.healthSamplesWritten) samples written")
         return outcome
@@ -558,6 +566,7 @@ final class BandSyncer {
         // any other, then ACKed at once to unstick the band. It used to be ACKed unread, silently
         // discarding whatever it held — a night's sleep file, the largest, is the likeliest one to be
         // caught mid-stream. The early ACK's only exposure is a batch write failing later in this sync.
+        // With the phone locked a file whose rewrite needs an unlocked sync is not ACKed early either.
         for fileId in fileIds where !handled.contains(fileId) {
             for _ in 0 ..< 3 {
                 let delivered: (id: Data, data: Data)
@@ -574,10 +583,25 @@ final class BandSyncer {
                     await route(delivered.id, delivered.data)
                 }
                 if delivered.id == fileId { break }
+                if !Self.healthReadable, (sleepIds + workoutIds + detailIds).contains(delivered.id) {
+                    log.warning("Asked for \(fileId.hexString), band sent \(delivered.id.hexString) — phone locked, leaving both for a sync after unlock")
+                    outcome.deferredForLock = true
+                    break
+                }
                 log.warning("Asked for \(fileId.hexString), band sent \(delivered.id.hexString) — routed it, ACKing to unstick, retrying")
                 sendAck(fileId: delivered.id, manager: manager)
             }
         }
+
+        // Weight, age, sleep cleanup and recovery pairing read Health, which a locked phone refuses
+        // while still accepting saves. Everything is written; the files those reads feed stay
+        // un-ACKed so an unlocked sync rewrites them in full under the same sync identifiers.
+        let healthReadable = Self.healthReadable
+        if !healthReadable {
+            log.notice("Phone locked — sleep, workout and daily detail files left un-ACKed for a sync after unlock")
+            outcome.deferredForLock = !(sleepIds + workoutIds + detailIds).isEmpty
+        }
+        var sleepCleared = healthReadable
 
         // Isolated from the rest of the batch: a throwing sleep write used to propagate out of here,
         // skipping the manual/workout/daily-detail writes and every ACK after it — so a sleep write
@@ -586,7 +610,14 @@ final class BandSyncer {
         _ = HealthKitManager.shared.takeSkippedForPermission()
         do {
             if !sleepToWrite.isEmpty {
-                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite)
+                do {
+                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite, clearExisting: sleepCleared)
+                } catch let error as HKError where error.code == .errorDatabaseInaccessible && sleepCleared {
+                    // The phone locked after `healthReadable` was read.
+                    sleepCleared = false
+                    outcome.deferredForLock = true
+                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite, clearExisting: false)
+                }
                 outcome.sleepSessions = sleepToWrite.count
             }
             if !sleepVitals.isEmpty {
@@ -594,9 +625,9 @@ final class BandSyncer {
                 outcome.minuteSamples += sleepVitals.count
             }
             // Sleep files ACK'd after both sessions and vitals are written.
-            ackUnlessSkipped(sleepIds, "sleep", manager: manager)
+            if sleepCleared { ackUnlessSkipped(sleepIds, "sleep", manager: manager) }
         } catch {
-            log.error("Sleep write failed — \(sleepIds.count) sleep file(s) left un-ACKed for the next sync: \(error.localizedDescription)")
+            log.error("Sleep write failed — \(sleepIds.count) sleep file(s) left un-ACKed for the next sync: \(error.localizedDescription, privacy: .public)")
         }
 
         // ACK every file we successfully fetched — NOT gated on the write batch being non-empty.
@@ -609,12 +640,6 @@ final class BandSyncer {
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeManualSamples(manualToWrite)
         }
         ackUnlessSkipped(manualIds, "manual", manager: manager)
-
-        // Weight, age, sleep cleanup and recovery pairing read Health, which a locked phone refuses
-        // while still accepting saves. Everything is written; the files those reads feed stay
-        // un-ACKed so an unlocked sync rewrites them in full under the same sync identifiers.
-        let healthReadable = Self.healthReadable
-        if !healthReadable { log.notice("Phone locked — workout and daily detail files left un-ACKed for a sync after unlock") }
 
         _ = HealthKitManager.shared.takeSkippedForPermission()
         if !workoutsToWrite.isEmpty {
@@ -639,11 +664,14 @@ final class BandSyncer {
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(detailMinutes)
             outcome.healthSamplesWritten += try await HealthKitManager.shared.writeActivity(detailMinutes, excludingWorkouts: windows)
             // Cardio Recovery: pairs recent workouts already in Health with the post-workout
-            // per-minute HR this batch carries. Best-effort — must not block the ACKs below.
-            do {
-                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeHeartRateRecoveries(minutes: detailMinutes)
-            } catch {
-                log.error("Cardio recovery write failed: \(error.localizedDescription)")
+            // per-minute HR this batch carries. Best-effort — must not block the ACKs below. It reads
+            // Health, so a locked phone defers it with the un-ACKed detail files.
+            if healthReadable {
+                do {
+                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeHeartRateRecoveries(minutes: detailMinutes)
+                } catch {
+                    log.error("Cardio recovery write failed: \(error.localizedDescription, privacy: .public)")
+                }
             }
         }
         if healthReadable { ackUnlessSkipped(detailIds, "daily detail", manager: manager) }
@@ -687,7 +715,8 @@ final class BandSyncer {
     private static let sleepRepairKey = "sleepHistoryRepairedV1"
 
     private func repairSleepHistoryOnce(context: ModelContext) async {
-        guard !UserDefaults.standard.bool(forKey: Self.sleepRepairKey) else { return }
+        // The repair's cleanup delete needs a readable Health store; it runs on an unlocked sync.
+        guard !UserDefaults.standard.bool(forKey: Self.sleepRepairKey), Self.healthReadable else { return }
         let all = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
         guard !all.isEmpty else {
             UserDefaults.standard.set(true, forKey: Self.sleepRepairKey)

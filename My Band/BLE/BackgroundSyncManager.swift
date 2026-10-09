@@ -42,6 +42,7 @@ final class BackgroundSyncManager {
     private weak var manager: BandManager?
     private weak var syncer: BandSyncer?
     private var didRegister = false
+    private var unlockObserver: NSObjectProtocol?
 
     /// The in-flight sync, shared by every concurrent caller so duplicate triggers coalesce.
     private var inFlight: Task<BandSyncer.HealthSyncOutcome, Error>?
@@ -89,6 +90,31 @@ final class BackgroundSyncManager {
     func configure(manager: BandManager, syncer: BandSyncer) {
         self.manager = manager
         self.syncer = syncer
+        #if canImport(UIKit)
+        if unlockObserver == nil {
+            unlockObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in self?.syncAfterUnlockIfPending() }
+            }
+        }
+        #endif
+    }
+
+    /// A locked sync left files on the band for an unlocked one to rewrite — until that runs, sleep
+    /// written without its cleanup can show a reclassified stage twice. Nothing else syncs on unlock.
+    private func syncAfterUnlockIfPending() {
+        guard syncer?.filesAwaitingUnlock == true else { return }
+        let assertion = beginAssertion(name: "unlock-sync")
+        Task { @MainActor in
+            defer { endAssertion(assertion) }
+            do {
+                let outcome = try await syncNow(retryStaleLink: false)
+                log.notice("Unlock sync done — \(outcome.healthSamplesWritten) samples")
+            } catch {
+                log.error("Unlock sync failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     // MARK: - Scheduling
@@ -238,7 +264,7 @@ final class BackgroundSyncManager {
         #if canImport(UIKit)
         guard UIApplication.shared.applicationState == .background else { return }
         #endif
-        if let last = syncer?.lastHealthSync, Date().timeIntervalSince(last) < autoSyncStaleness {
+        if syncer?.unlockedSyncDue != true, let last = syncer?.lastHealthSync, Date().timeIntervalSince(last) < autoSyncStaleness {
             log.debug("Background wake — Health synced recently, skipping")
             return
         }
