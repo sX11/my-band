@@ -485,6 +485,9 @@ final class HealthKitManager {
             if let track = Self.route(forWorkoutStart: w.startDate, in: routes) {
                 do { try await attachRoute(track, to: workout) }
                 catch { log.error("Workout route attach failed (start \(key)): \(error.localizedDescription)") }
+            } else if w.kind.usesGps {
+                // The GPS file came in another sync, or the band recorded none (no fix at the start).
+                log.notice("Outdoor workout at \(key, privacy: .public) has no GPS track in this sync (\(routes.count, privacy: .public) track(s))")
             }
         }
         return (written, saved)
@@ -797,6 +800,26 @@ final class HealthKitManager {
             sortDescriptors: [SortDescriptor(\.startDate, order: .reverse)],
             limit: limit)
         return try await descriptor.result(for: store).map(record)
+    }
+
+    /// The GPS route this app saved with a workout, in recorded order; empty when it has none.
+    func route(ofWorkout id: UUID) async throws -> [CLLocation] {
+        let workouts = try await HKSampleQueryDescriptor(
+            predicates: [.workout(HKQuery.predicateForObject(with: id))], sortDescriptors: [], limit: 1)
+            .result(for: store)
+        guard let workout = workouts.first else { return [] }
+        let routes = try await HKSampleQueryDescriptor(
+            predicates: [.sample(type: routeType, predicate: HKQuery.predicateForObjects(from: workout))],
+            sortDescriptors: [SortDescriptor(\.startDate)], limit: HKObjectQueryNoLimit)
+            .result(for: store)
+            .compactMap { $0 as? HKWorkoutRoute }
+        var locations: [CLLocation] = []
+        for route in routes {
+            for try await location in HKWorkoutRouteQueryDescriptor(route).results(for: store) {
+                locations.append(location)
+            }
+        }
+        return locations
     }
 
     private func record(_ w: HKWorkout) -> WorkoutRecord {

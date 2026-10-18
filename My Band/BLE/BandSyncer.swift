@@ -495,6 +495,7 @@ final class BandSyncer {
                     workoutIds.append(fileId)
                 } else if meta.isWorkoutGps {
                     let track = WorkoutGpsParser.parse(fileData, meta: meta)
+                    log.notice("Workout GPS file: \(track.count, privacy: .public) point(s) for session at \(meta.timestamp.description, privacy: .public)")
                     if !track.isEmpty {
                         workoutRoutes[Int(meta.timestamp.timeIntervalSince1970)] = track
                     }

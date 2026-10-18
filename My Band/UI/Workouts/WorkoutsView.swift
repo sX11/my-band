@@ -1,11 +1,12 @@
 import SwiftUI
 import HealthKit
+import MapKit
 
 // MARK: - WorkoutsView
 //
 // The page right of the Dashboard: the newest workouts this app wrote to Apple Health, read
-// back each time the page appears and never stored (ADR 0009). Totals only: routes, graphs and
-// splits stay in Apple Health.
+// back each time the page appears and never stored (ADR 0009). Totals and the GPS route; graphs
+// and splits stay in Apple Health.
 
 struct WorkoutsView: View {
 
@@ -43,7 +44,7 @@ struct WorkoutsView: View {
                     }
                     Section {
                     } footer: {
-                        Text("From Apple Health, only workouts My Band wrote. Open the Health app for the route and heart-rate graph.")
+                        Text("From Apple Health, only workouts My Band wrote. Open the Health app for the heart-rate graph.")
                             .font(.mbFootnote).foregroundStyle(MB.textTertiary)
                     }
                 }
@@ -143,13 +144,56 @@ private struct WorkoutRow: View {
     }
 }
 
+// MARK: - WorkoutRouteMap
+
+private struct WorkoutRouteMap: View {
+    let route: [CLLocationCoordinate2D]
+
+    var body: some View {
+        Map(initialPosition: .rect(Self.bounds(route)), interactionModes: [.pan, .zoom]) {
+            MapPolyline(coordinates: route)
+                .stroke(MB.accent, style: StrokeStyle(lineWidth: 4, lineCap: .round, lineJoin: .round))
+            if let start = route.first {
+                Annotation("Start", coordinate: start) { dot(MB.ok) }
+            }
+            if let end = route.last {
+                Annotation("Finish", coordinate: end) { dot(MB.danger) }
+            }
+        }
+        .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+        .colorScheme(.dark)
+    }
+
+    private func dot(_ color: Color) -> some View {
+        Circle().fill(color).frame(width: 12, height: 12)
+            .overlay(Circle().stroke(MB.textPrimary, lineWidth: 2))
+    }
+
+    /// The route's bounding box with a margin, so the line doesn't touch the edges.
+    private static func bounds(_ route: [CLLocationCoordinate2D]) -> MKMapRect {
+        let rect = route.map { MKMapPoint($0) }
+            .reduce(MKMapRect.null) { $0.union(MKMapRect(origin: $1, size: MKMapSize(width: 0, height: 0))) }
+        let margin = max(rect.width, rect.height) * 0.15 + 200
+        return rect.insetBy(dx: -margin, dy: -margin)
+    }
+}
+
 // MARK: - WorkoutDetailView
 
 struct WorkoutDetailView: View {
     let workout: WorkoutRecord
 
+    @State private var route: [CLLocationCoordinate2D] = []
+
     var body: some View {
         List {
+            if route.count >= 2 {
+                Section {
+                    WorkoutRouteMap(route: route)
+                        .frame(height: 220)
+                        .listRowInsets(EdgeInsets())
+                }
+            }
             Section {
                 row("Sport", workout.kind.title)
                 row("Date", workout.start.formatted(.dateTime.weekday(.wide).day().month(.wide).year().locale(MBFormat.locale)))
@@ -188,6 +232,10 @@ struct WorkoutDetailView: View {
         .background(MB.bgApp.ignoresSafeArea())
         .navigationTitle(workout.kind.title)
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: workout.id) {
+            guard workout.indoor != true else { return }
+            route = (try? await HealthKitManager.shared.route(ofWorkout: workout.id))?.map(\.coordinate) ?? []
+        }
     }
 
     private func row(_ label: String, _ value: String) -> some View { MBListRow(label: label, value: value) }
