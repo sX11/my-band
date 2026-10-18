@@ -4,7 +4,7 @@ import OSLog
 
 // MARK: - GetSleepStateIntent
 //
-// "Você está dormindo?" — the Shortcuts-native replacement for the Home Assistant "sono
+// "Are you asleep?" — the Shortcuts-native replacement for the Home Assistant "sono
 // detectado" trigger that was cut from the roadmap. Instead of the app owning an automation
 // (turn off the bedroom lights, run a script), it just answers this question; the user's own
 // Shortcuts Personal Automation decides what to do with the answer.

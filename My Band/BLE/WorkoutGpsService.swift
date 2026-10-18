@@ -44,6 +44,10 @@ final class WorkoutGpsService: NSObject {
 
     private var gpsFixAcquired = false
     private var workoutStarted = false
+    /// Answers "GPS disabled" when no fix arrives in time, so the band never waits on silence.
+    private var fixTimeout: Task<Void, Never>?
+    private let fixWait: Duration = .seconds(60)
+    private var openLogged = false
 
     // MARK: - Local recording (app-owned, not streamed to the band)
     //
@@ -103,7 +107,14 @@ final class WorkoutGpsService: NSObject {
     // MARK: - Incoming band commands
 
     private func handleWorkoutOpen(sport: UInt32) {
-        log.debug("Workout open request (sport=\(sport))")
+        // The band repeats the request every 1-5 s: notice (kept in the device log) only for the
+        // first of a workout, debug for the repeats.
+        if openLogged {
+            log.debug("Workout open request repeated (sport=\(sport))")
+        } else {
+            openLogged = true
+            log.notice("Workout open request (sport=\(sport, privacy: .public), location auth=\(self.locationManager.authorizationStatus.rawValue, privacy: .public))")
+        }
 
         // Skip GPS for indoor / stationary sports (strength, yoga, pool, machines…). Reply "GPS
         // disabled" so the band starts immediately without waiting for a fix it won't record, and
@@ -133,6 +144,7 @@ final class WorkoutGpsService: NSObject {
             isActive       = true
             gpsFixAcquired = false
             workoutStarted = false
+            armFixTimeout()
             locationManager.requestWhenInUseAuthorization()
 
         case .authorizedWhenInUse:
@@ -142,6 +154,7 @@ final class WorkoutGpsService: NSObject {
                 isActive       = true
                 gpsFixAcquired = false
                 workoutStarted = false
+                armFixTimeout()
                 locationManager.startUpdatingLocation()
             }
 
@@ -151,12 +164,13 @@ final class WorkoutGpsService: NSObject {
                 gpsFixAcquired = false
                 workoutStarted = false
                 log.info("Starting CoreLocation for workout (sport=\(sport))")
+                armFixTimeout()
                 locationManager.startUpdatingLocation()
             }
             // No reply yet — wait for first fix; onLocation sends the GPS-ready reply.
 
         case .denied, .restricted:
-            log.info("Location denied/restricted — replying GPS disabled")
+            log.debug("Location denied/restricted — replying GPS disabled")
             replyGpsDisabled()
 
         @unknown default:
@@ -188,6 +202,7 @@ final class WorkoutGpsService: NSObject {
                 workoutStarted = false
             }
         case 3:
+            openLogged = false
             if localMode == .strength {
                 finalizeStrengthAndStartRecovery(fileIds: fileIds)
             } else {
@@ -326,7 +341,19 @@ final class WorkoutGpsService: NSObject {
         bandManager?.sendEncryptedCommand(protoBytes: XiaomiProto.workoutOpenReplyCommand(gpsReady: true))
     }
 
+    private func armFixTimeout() {
+        fixTimeout?.cancel()
+        fixTimeout = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: self?.fixWait ?? .seconds(60))
+            guard let self, !Task.isCancelled, self.isActive, !self.gpsFixAcquired else { return }
+            self.log.notice("No GPS fix in \(self.fixWait, privacy: .public) — replying GPS disabled")
+            self.replyGpsDisabled()
+        }
+    }
+
     private func stopGps() {
+        fixTimeout?.cancel(); fixTimeout = nil
+        openLogged     = false
         isActive       = false
         gpsFixAcquired = false
         workoutStarted = false
@@ -376,7 +403,13 @@ extension WorkoutGpsService: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.log.error("CoreLocation error: \(error.localizedDescription)")
+            // locationUnknown means no fix yet and CoreLocation keeps trying; the band keeps asking,
+            // so wait (armFixTimeout answers if it never comes).
+            if (error as? CLError)?.code == .locationUnknown {
+                if self.isActive && !self.gpsFixAcquired { self.log.debug("No GPS fix yet — still waiting") }
+                return
+            }
+            self.log.error("CoreLocation error: \(error.localizedDescription, privacy: .public)")
             if self.isActive && !self.gpsFixAcquired { self.replyGpsDisabled() }
         }
     }
@@ -391,7 +424,8 @@ extension WorkoutGpsService: CLLocationManagerDelegate {
 
         if !gpsFixAcquired {
             gpsFixAcquired = true
-            log.info("GPS fix acquired — replying GPS ready to band")
+            fixTimeout?.cancel(); fixTimeout = nil
+            log.notice("GPS fix acquired (±\(Int(loc.horizontalAccuracy), privacy: .public) m) — replying GPS ready to band")
             replyGpsReady()
         }
 

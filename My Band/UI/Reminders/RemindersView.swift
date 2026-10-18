@@ -2,8 +2,8 @@ import SwiftUI
 
 // MARK: - RemindersView
 //
-// The page right of Workouts: the band's reminders. Swipe left to delete, add a new one with a
-// title, a date and time, and a repeat; "Every day" takes several times. Every change goes
+// The page right of Workouts: the band's reminders. Swipe left to delete, right to edit one added
+// here; add a new one with a title, a date and time, and a repeat; "Every day" takes several times. Every change goes
 // straight to the band and the list is re-read from it (see ReminderService). Reminders pushed
 // from the iPhone's Reminders app show here too; deleting one only lasts until the next sync
 // pushes it again.
@@ -34,15 +34,19 @@ struct RemindersView: View {
     @State private var newTimes: [TimeSlot] = [TimeSlot(time: Calendar.current.date(byAdding: .hour, value: 1, to: .now) ?? .now)]
     @State private var adding = false
     @State private var resultText: String?
+    /// The reminders being edited; saving deletes them and adds the form's set in their place.
+    @State private var editing: [ReminderService.Reminder]?
 
     private var connected: Bool { band.connectionState.isConnected }
     private var titleIsValid: Bool { !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     private var newDates: [Date] { newRepeat == .daily ? Self.nextOccurrences(newTimes.map(\.time)) : [newDate] }
-    private var fits: Bool { reminders.canAdd(newDates.count) }
+    /// The edited reminders' slots come free when they're deleted on save.
+    private var fits: Bool { reminders.canAdd(newDates.count, freeing: editing ?? []) }
     private var atCapacity: Bool { reminders.loaded && !fits }
 
     var body: some View {
         NavigationStack {
+            ScrollViewReader { proxy in
             List {
                 if !connected {
                     Section {
@@ -53,6 +57,10 @@ struct RemindersView: View {
                 }
                 remindersSection
                 newReminderSection
+            }
+            .onChange(of: editing?.first?.id) { _, id in
+                if id != nil { withAnimation { proxy.scrollTo(Self.formID, anchor: .top) } }
+            }
             }
             .scrollContentBackground(.hidden)
             .background(MB.bgApp.ignoresSafeArea())
@@ -74,8 +82,19 @@ struct RemindersView: View {
             ForEach(Self.grouped(reminders.reminders)) { group in
                 row(group)
                     .swipeActions {
-                        Button("Delete", role: .destructive) { reminders.delete(group.items) }
-                            .disabled(!connected)
+                        Button("Delete", role: .destructive) {
+                            if editing?.first?.id == group.id { cancelEdit() }
+                            reminders.delete(group.items)
+                        }
+                        .disabled(!connected)
+                    }
+                    .swipeActions(edge: .leading) {
+                        // An iPhone reminder would be overwritten by the next sync; edit it in Reminders.
+                        if group.first.addedHere {
+                            Button("Edit") { startEdit(group) }
+                                .tint(MB.accent)
+                                .disabled(!connected)
+                        }
                     }
             }
         } header: {
@@ -112,7 +131,7 @@ struct RemindersView: View {
     // MARK: - New reminder
 
     private var newReminderSection: some View {
-        Section("New reminder") {
+        Section(editing == nil ? "New reminder" : "Edit reminder") {
             HStack {
                 TextField("Title", text: $newTitle)
                     .font(.mbSubhead)
@@ -124,6 +143,7 @@ struct RemindersView: View {
                 Text("\(newTitle.count)/\(ReminderService.maxTitleLength)")
                     .font(.mbFootnote).monospacedDigit().foregroundStyle(MB.textTertiary)
             }
+            .id(Self.formID)
             Picker("Repeat", selection: $newRepeat) {
                 ForEach(ReminderService.Repeat.allCases, id: \.self) { Text($0.title).tag($0) }
             }
@@ -143,8 +163,14 @@ struct RemindersView: View {
                     .font(.mbFootnote).foregroundStyle(MB.warn)
             }
             MBButton(title: atCapacity ? "Band is full" : addTitle, variant: .primary, size: .lg,
-                     icon: "plus", block: true, disabled: !connected || !fits || !titleIsValid || adding) {
+                     icon: editing == nil ? "plus" : "checkmark", block: true,
+                     disabled: !connected || !fits || !titleIsValid || adding) {
                 add()
+            }
+            if editing != nil {
+                Button("Cancel", action: cancelEdit)
+                    .font(.mbSubhead)
+                    .frame(maxWidth: .infinity)
             }
         }
         .listRowBackground(MB.surfaceCard)
@@ -169,7 +195,8 @@ struct RemindersView: View {
     }
 
     private var addTitle: String {
-        newDates.count > 1 ? "Add \(newDates.count) reminders" : "Add reminder"
+        if editing != nil { return "Save" }
+        return newDates.count > 1 ? "Add \(newDates.count) reminders" : "Add reminder"
     }
 
     private var capacityHint: String {
@@ -184,17 +211,71 @@ struct RemindersView: View {
         let dates = newDates
         let title = newTitle
         let repeatRule = newRepeat
+        let replacing = editing ?? []
         adding = true
         resultText = nil
         Task {
-            let acked = await reminders.add(title: title, dates: dates, repeatRule: repeatRule)
+            let acked: Int
+            if replacing.isEmpty {
+                acked = await reminders.add(title: title, dates: dates, repeatRule: repeatRule)
+            } else {
+                guard let n = await reminders.replace(replacing, title: title, dates: dates, repeatRule: repeatRule) else {
+                    adding = false
+                    resultText = "Not enough free slots on the band. Nothing was changed."
+                    return
+                }
+                acked = n
+                editing = nil
+            }
             adding = false
             if acked < dates.count {
                 resultText = "The band confirmed \(acked) of \(dates.count). Check the list before adding again."
-            } else {
+            } else if replacing.isEmpty {
                 newTitle = ""
+            } else {
+                resetForm()
             }
         }
+    }
+
+    private static let formID = "reminder-form"
+
+    private func startEdit(_ group: ReminderGroup) {
+        let r = group.first
+        editing = group.items
+        newTitle = r.title
+        newRepeat = r.repeatRule
+        newDate = Self.nextOccurrence(of: r.date, r.repeatRule)
+        newTimes = group.items.map { TimeSlot(time: $0.date) }
+        resultText = nil
+    }
+
+    private func cancelEdit() {
+        editing = nil
+        resetForm()
+    }
+
+    private func resetForm() {
+        let inAnHour = Calendar.current.date(byAdding: .hour, value: 1, to: .now) ?? .now
+        newTitle = ""
+        newRepeat = .once
+        newDate = inAnHour
+        newTimes = [TimeSlot(time: inAnHour)]
+        resultText = nil
+    }
+
+    /// A repeating reminder's band date is its first occurrence, usually past: the form gets the
+    /// next one, so saving an edit doesn't move it to today.
+    private static func nextOccurrence(of anchor: Date, _ rule: ReminderService.Repeat) -> Date {
+        let parts: Set<Calendar.Component> = switch rule {
+        case .once, .daily: []
+        case .weekly: [.weekday, .hour, .minute]
+        case .monthly: [.day, .hour, .minute]
+        case .yearly: [.month, .day, .hour, .minute]
+        }
+        guard !parts.isEmpty, anchor < .now else { return max(anchor, .now) }
+        let cal = Calendar.current
+        return cal.nextDate(after: .now, matching: cal.dateComponents(parts, from: anchor), matchingPolicy: .nextTime) ?? .now
     }
 
     // MARK: - Grouping

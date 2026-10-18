@@ -4,9 +4,9 @@ import SwiftData
 @main
 struct My_BandApp: App {
 
-    // static: garantia de única inicialização por processo.
-    // App structs do SwiftUI podem ser recriadas durante setup de cena,
-    // o que faria um `var` recriar o container (e o store SQLite) a cada vez.
+    // static: guarantees a single initialisation per process.
+    // SwiftUI App structs can be recreated during scene setup,
+    // which would make a `var` recreate the container (and the SQLite store) each time.
     static let sharedModelContainer: ModelContainer = {
         let schema = Schema([
             BandDevice.self,
@@ -17,8 +17,8 @@ struct My_BandApp: App {
         do {
             return try ModelContainer(for: schema, configurations: [config])
         } catch {
-            // Store corrompido (ex: watchdog kill durante gravação).
-            // Em dev: apaga e recria. Em prod isso perderia dados — trocar por migração adequada.
+            // Corrupted store (e.g. a watchdog kill mid-write).
+            // In dev: delete and recreate. In production this would lose data — replace with a proper migration.
             let storeURL = config.url
             try? FileManager.default.removeItem(at: storeURL)
             try? FileManager.default.removeItem(at: storeURL.deletingPathExtension().appendingPathExtension("store-shm"))
@@ -65,7 +65,7 @@ struct My_BandApp: App {
                 .environment(services.latestMetrics)
                 .environment(services.syncLog)
                 .onOpenURL { url in
-                    // Shared file ("Abrir com → My Band") for a .bin/.rpk. Installs against the
+                    // Shared file ("Open with → My Band") for a .bin/.rpk. Installs against the
                     // live connection; progress/result surface in CustomizeView.
                     Task { await services.customization.installFromFile(url) }
                 }
@@ -74,13 +74,13 @@ struct My_BandApp: App {
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
-                // Garante que há um pedido de sync agendado.
+                // Makes sure a sync request is scheduled.
                 BackgroundSyncManager.shared.scheduleNext()
             case .active:
-                // Voltando ao foreground após tempo em background: reassume a conexão. O
-                // auto-reconnect do BLE normalmente já mantém o link, mas uma queda com o app
-                // suspenso pode ter deixado nada pendente — este empurrão evita um "desconectado"
-                // morto sem como reconectar.
+                // Back in the foreground after time in the background: resume the connection. BLE
+                // auto-reconnect normally keeps the link, but a drop while the app was suspended
+                // may have left nothing pending — this nudge avoids a dead "disconnected"
+                // with no way to reconnect.
                 AppServices.shared.reconnectIfNeeded()
                 // iOS only starts a Live Activity in the foreground; a workout begun in the pocket waits for this.
                 AppServices.shared.workoutActivity.retryIfNeeded()

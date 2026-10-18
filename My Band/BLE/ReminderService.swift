@@ -82,9 +82,12 @@ final class ReminderService {
     /// Free slots on the band, nil until it reports a limit.
     var freeSlots: Int? { maxReminders.map { max(0, $0 - reminders.count - inFlight) } }
 
-    func canAdd(_ count: Int) -> Bool {
+    /// Whether `count` new reminders fit once `freeing` are deleted; only freed ones still listed count.
+    func canAdd(_ count: Int, freeing: [Reminder] = []) -> Bool {
         guard loaded, count > 0 else { return false }
-        return freeSlots.map { count <= $0 } ?? true
+        let listed = Set(reminders.map(\.id))
+        let freed = freeing.filter { listed.contains($0.id) }.count
+        return freeSlots.map { count <= $0 + freed } ?? true
     }
 
     /// The ids of reminders added here, which the iPhone-reminders push leaves alone.
@@ -157,6 +160,28 @@ final class ReminderService {
             try? await Task.sleep(for: .milliseconds(100))
         }
         requestList()
+        return acked
+    }
+
+    /// Replaces `old` with a new set: nil if it doesn't fit, leaving `old` untouched; otherwise how
+    /// many the band acked. A delete the band didn't take is sent once more, so an edit doesn't
+    /// leave the old reminder next to the new one.
+    func replace(_ old: [Reminder], title: String, dates: [Date], repeatRule: Repeat) async -> Int? {
+        guard canAdd(dates.count, freeing: old) else {
+            log.warning("Edit not saved: \(dates.count, privacy: .public) needed, \(self.freeSlots ?? -1, privacy: .public) free")
+            return nil
+        }
+        delete(old)
+        let acked = await add(title: title, dates: dates, repeatRule: repeatRule)
+        let oldIDs = Set(old.map(\.id))
+        if let list = await fetchList() {
+            let left = list.reminder.map(\.id).filter { oldIDs.contains($0) }
+            if !left.isEmpty {
+                log.warning("Edit: band still lists \(left.count, privacy: .public) replaced reminder(s) — deleting again")
+                delete(ids: left)
+                requestList()
+            }
+        }
         return acked
     }
 

@@ -27,6 +27,7 @@ final class CalendarSyncService {
     private let maxReminders = 20
     private static let createdReminderIDsKey = "myband.createdReminderIDs"
     private static let pushedRemindersKey = "myband.pushedReminders"
+    private static let titleCleanupDoneKey = "myband.reminderTitleCleanupDone"
 
     // Each section is pushed on every sync, but the payloads rarely change between syncs (language
     // almost never, calendar/reminders only when the user edits them). Pushing an unchanged set every
@@ -136,7 +137,8 @@ final class CalendarSyncService {
             .prefix(maxReminders)
 
         // Skip the delete+recreate churn when the upcoming set hasn't changed since the last push.
-        let sig = signature(upcoming.map { "\($0.title)|\($0.fires.timeIntervalSince1970)|\($0.repeats.mode)" }
+        // The version prefix makes the first sync on this build push, so the title cleanup below runs.
+        let sig = "2|" + signature(upcoming.map { "\($0.title)|\($0.fires.timeIntervalSince1970)|\($0.repeats.mode)" }
             .joined(separator: ";"))
         guard UserDefaults.standard.string(forKey: Self.lastRemindersKey) != sig else {
             log.debug("Reminders unchanged — skipping push")
@@ -152,17 +154,22 @@ final class CalendarSyncService {
 
         // Only this push's reminders are deleted: an id acked on a previous push, or one whose title
         // and time match what was pushed (its create-ack was missed, so its id was never known).
+        // Once per install, any reminder titled like an iPhone reminder being pushed too: copies
+        // pushed before ownership was kept are recognisable by nothing else. Only once, because a
+        // title alone also matches a reminder the band or another app created.
         // One added on the Reminders screen is never this push's, even with the same title and time.
         let previousIDs = Set((UserDefaults.standard.array(forKey: Self.createdReminderIDsKey) as? [Int] ?? []).map { UInt32($0) })
         let previousKeys = Set(UserDefaults.standard.stringArray(forKey: Self.pushedRemindersKey) ?? [])
+        let titleCleanup = !UserDefaults.standard.bool(forKey: Self.titleCleanupDoneKey)
+        let pushedTitles = titleCleanup ? Set(upcoming.map(\.title)) : []
         let protected = reminders.protectedIDs
         let stale = onBand.reminder
             .filter { !protected.contains($0.id) }
-            .filter { previousIDs.contains($0.id) || previousKeys.contains(Self.reminderKey($0.reminderDetails)) }
-            .map(\.id)
+            .filter { previousIDs.contains($0.id) || previousKeys.contains(Self.reminderKey($0.reminderDetails))
+                || pushedTitles.contains($0.reminderDetails.title) }
         if !stale.isEmpty {
             log.info("Deleting \(stale.count) reminder(s) from the band")
-            reminders.delete(ids: stale)
+            reminders.delete(ids: stale.map(\.id))
         }
 
         // Creates still in flight (an add on the Reminders screen) aren't on the list yet.
@@ -173,15 +180,30 @@ final class CalendarSyncService {
             .map { XiaomiProto.reminderDetails(date: $0.fires, title: $0.title, repeatMode: $0.repeats.mode) }
 
         // The band assigns each reminder's id and returns it in the create ack.
-        let ackedIDs = await reminders.create(toPush).map { Int($0) }
-        reminders.requestList()
-        UserDefaults.standard.set(ackedIDs, forKey: Self.createdReminderIDsKey)
-        UserDefaults.standard.set(toPush.map(Self.reminderKey), forKey: Self.pushedRemindersKey)
-        // A create left unconfirmed keeps the signature unsaved, so the next sync tries again.
-        if ackedIDs.count == toPush.count {
+        let ackedIDs = await reminders.create(toPush)
+        let owned = Self.owned(created: ackedIDs, pushed: toPush, deleting: stale,
+                               listedAfter: await reminders.fetchList())
+        UserDefaults.standard.set(owned.ids.map { Int($0) }, forKey: Self.createdReminderIDsKey)
+        UserDefaults.standard.set(owned.keys, forKey: Self.pushedRemindersKey)
+        UserDefaults.standard.set(true, forKey: Self.titleCleanupDoneKey)
+        // A create left unconfirmed, or a delete the band didn't take, keeps the signature unsaved,
+        // so the next sync tries again.
+        if ackedIDs.count == toPush.count && owned.undeleted == 0 {
             UserDefaults.standard.set(sig, forKey: Self.lastRemindersKey)
         }
         log.info("Pushed \(toPush.count) of \(upcoming.count) reminder(s), \(ackedIDs.count) acked")
+    }
+
+    /// What the push owns on the band after it ran: its creates, plus every reminder it deleted that
+    /// the band still lists (or all of them, with no list). A reminder stays the push's until the
+    /// band stops listing it, so a lost delete is retried.
+    static func owned(created: [UInt32], pushed: [Xiaomi_ReminderDetails], deleting: [Xiaomi_Reminder],
+                      listedAfter: Xiaomi_Reminders?) -> (ids: [UInt32], keys: [String], undeleted: Int) {
+        let listed = listedAfter.map { Set($0.reminder.map(\.id)) }
+        let undeleted = deleting.filter { listed?.contains($0.id) ?? true }
+        return (created + undeleted.map(\.id),
+                pushed.map(reminderKey) + undeleted.map { reminderKey($0.reminderDetails) },
+                undeleted.count)
     }
 
     /// The band's repeat for an iPhone recurrence, anchored on the next fire time. Only a plain,

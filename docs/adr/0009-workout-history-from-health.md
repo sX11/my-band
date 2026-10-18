@@ -13,3 +13,7 @@ What 0005 and 0006 keep: nothing new is stored, and there are no charts, routes,
 Limits, accepted: a locked iPhone refuses the read (`errorDatabaseInaccessible`) and the page says to unlock. Each workout written since this ADR carries the band's sport in its metadata (`MiBandWorkoutKind`). Workouts written before that rebuild the sport from the `HKWorkoutActivityType` plus the indoor and swim-location metadata, so a trail run reads as an outdoor run, a trek as a hike, and free training as a generic workout. Heart rate comes from the band's summary in the workout metadata, falling back to the workout's own statistics. If read access to workouts is switched off in Health, HealthKit returns an empty list rather than an error, so the page shows "No workouts yet".
 
 Rejected: keeping a local copy of each workout in SwiftData at sync time. It would duplicate what Apple Health already stores, and it would drift from Health whenever a workout is deleted there.
+
+## Addendum, 2026-10-18: the route
+
+The workout detail now shows the GPS route on a map, read back from the `HKWorkoutRoute` the app saved with the workout (`HealthKitManager.route(ofWorkout:)`). It replaces "no routes" above; charts, graphs and splits still stay in Apple Health. The route is read each time the detail opens and is never stored. Indoor workouts and workouts without a saved route show no map.
