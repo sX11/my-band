@@ -14,7 +14,7 @@ enum WorkoutKind: String {
     case running, walking, hiking, trekking, trailRun, treadmill
     case outdoorCycling, indoorCycling
     case freeTraining, hiit, yoga
-    case strengthTraining                               // Treino de Força (workoutType 308, freestyle layout)
+    case strengthTraining                               // Strength training (workoutType 308, freestyle layout)
     case poolSwim, openWaterSwim
     case elliptical, rowing, rowingMachine, jumpRoping
     case triathlon, sailing, paddleSports, waterPolo, waterSports, diving, surfing, climbing,

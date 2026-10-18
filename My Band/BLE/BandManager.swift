@@ -1231,7 +1231,7 @@ final class BandManager: NSObject {
     private func retryAuthAfterReconnect(reason: String) {
         guard !authRetryPending else { return }
         // Never spend the budget on a human. A pairing that takes three minutes would otherwise
-        // exhaust four retries and surface as "AuthKey incorreto" — the one diagnosis that sends
+        // exhaust four retries and surface as "Wrong AuthKey" — the one diagnosis that sends
         // the user off to re-extract a key that was right all along.
         guard !isWithinPairingWindow else {
             log.info("Skipping auth retry — pairing window still open (\(reason))")
