@@ -1,0 +1,8 @@
+- [ ] An iPhone reminder with several timed alerts reaches the band as one reminder at its next alert #reminders #worth(later) #where(My Band/BLE/CalendarSyncService.swift:131) #added(2026-10-18)
+	> @anchor: Self.fireDate(of: r, after: now).map {
+	> fireDate(of:after:) takes the earliest future alert, so a daily reminder with alerts
+	> at 10, 13, 16 and 19 is pushed as one daily band reminder at whichever is next. If no
+	> sync runs between alerts, the later ones don't fire on the band, and the set changes
+	> after each alert, so each sync re-pushes it. Undecided: pushing one daily band
+	> reminder per alert time fixes it at one slot per alert; whether the user's reminders
+	> are set up this way is unconfirmed.
