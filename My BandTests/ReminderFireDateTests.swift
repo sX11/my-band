@@ -80,6 +80,31 @@ struct ReminderFireDateTests {
         #expect(CalendarSyncService.reminderKey(echoed) == CalendarSyncService.reminderKey(pushed))
     }
 
+    private func bandReminder(_ id: UInt32, _ title: String, _ at: String) -> Xiaomi_Reminder {
+        var r = Xiaomi_Reminder()
+        r.id = id
+        r.reminderDetails = XiaomiProto.reminderDetails(date: date(at), title: title)
+        return r
+    }
+
+    @Test func reminderWhoseDeleteWasLostStaysOwned() {
+        let lost = bandReminder(7, "капли", "2026-10-17 16:00")
+        let gone = bandReminder(8, "капли", "2026-10-17 13:00")
+        let pushed = XiaomiProto.reminderDetails(date: date("2026-10-18 19:00"), title: "капли")
+        var after = Xiaomi_Reminders()
+        after.reminder = [lost, bandReminder(9, "капли", "2026-10-18 19:00")]
+        let owned = CalendarSyncService.owned(created: [9], pushed: [pushed], deleting: [lost, gone], listedAfter: after)
+        #expect(owned.ids == [9, 7])
+        #expect(owned.undeleted == 1)
+        #expect(owned.keys == [CalendarSyncService.reminderKey(pushed), CalendarSyncService.reminderKey(lost.reminderDetails)])
+    }
+
+    @Test func withoutAListEveryDeletedReminderStaysOwned() {
+        let deleting = [bandReminder(7, "капли", "2026-10-17 16:00")]
+        let owned = CalendarSyncService.owned(created: [], pushed: [], deleting: deleting, listedAfter: nil)
+        #expect(owned.ids == [7])
+    }
+
     @Test func eventAlertBecomesMinutesBefore() {
         let start = date("2026-09-27 10:00")
         let alarms = [EKAlarm(relativeOffset: -300), EKAlarm(absoluteDate: date("2026-09-27 09:30"))]
