@@ -11,6 +11,8 @@ struct BandSettingsView: View {
     @Environment(BandManager.self) private var band
     @Environment(BandSettingsService.self) private var settings
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(CalendarSyncService.pushCalendarKey) private var pushCalendar = true
+    @AppStorage(CalendarSyncService.pushRemindersKey) private var pushReminders = true
 
     private var connected: Bool { band.connectionState.isConnected }
 
@@ -34,6 +36,7 @@ struct BandSettingsView: View {
                 stressSection
                 activitySection
                 displaySection
+                fromIPhoneSection
             }
             .scrollContentBackground(.hidden)
             .background(MB.bgApp.ignoresSafeArea())
@@ -161,6 +164,21 @@ struct BandSettingsView: View {
             }
             .listRowBackground(MB.surfaceCard)
         }
+    }
+
+    // MARK: - From the iPhone
+
+    // App-side, not the band's record: CalendarSyncService reads it on the next sync's push.
+    private var fromIPhoneSection: some View {
+        Section {
+            toggle("Calendar events", isOn: pushCalendar) { pushCalendar = $0 }
+            toggle("iPhone reminders", isOn: pushReminders) { pushReminders = $0 }
+        } header: {
+            Text("Copies on the band")
+        } footer: {
+            Text("The band keeps its own copy and alerts even away from the iPhone. Turn off if the iPhone's notification already buzzes the band. Applied on the next sync; reminders added on the Reminders page stay.")
+        }
+        .listRowBackground(MB.surfaceCard)
     }
 
     // MARK: - Pieces

@@ -1,4 +1,4 @@
-- [ ] An iPhone reminder with several timed alerts reaches the band as one reminder at its next alert #reminders #worth(later) #where(My Band/BLE/CalendarSyncService.swift:131) #added(2026-10-18)
+- [x] An iPhone reminder with several timed alerts reaches the band as one reminder at its next alert #reminders #where(My Band/BLE/CalendarSyncService.swift:131) #added(2026-10-18) #done(2026-11-02)
 	> @anchor: Self.fireDate(of: r, after: now).map {
 	> fireDate(of:after:) takes the earliest future alert, so a daily reminder with alerts
 	> at 10, 13, 16 and 19 is pushed as one daily band reminder at whichever is next. If no

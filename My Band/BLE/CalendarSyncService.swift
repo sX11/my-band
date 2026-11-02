@@ -28,6 +28,13 @@ final class CalendarSyncService {
     private static let createdReminderIDsKey = "myband.createdReminderIDs"
     private static let pushedRemindersKey = "myband.pushedReminders"
     private static let titleCleanupDoneKey = "myband.reminderTitleCleanupDone"
+    static let pushCalendarKey = "myband.pushCalendar"
+    static let pushRemindersKey = "myband.pushReminders"
+
+    /// Off pushes an empty set, which clears the band's copies; on by default.
+    private static func pushEnabled(_ key: String) -> Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? true
+    }
 
     // Each section is pushed on every sync, but the payloads rarely change between syncs (language
     // almost never, calendar/reminders only when the user edits them). Pushing an unchanged set every
@@ -80,14 +87,15 @@ final class CalendarSyncService {
     // MARK: - Calendar
 
     private func pushCalendar() async {
-        guard await requestEventsAccess() else {
+        let enabled = Self.pushEnabled(Self.pushCalendarKey)
+        if enabled, !(await requestEventsAccess()) {
             log.info("Calendar access not granted — skipping")
             return
         }
         let now = Date()
         let end = Calendar.current.date(byAdding: .day, value: 30, to: now) ?? now
         let predicate = store.predicateForEvents(withStart: now, end: end, calendars: nil)
-        let events = store.events(matching: predicate)
+        let events = (enabled ? store.events(matching: predicate) : [])
             .sorted { $0.startDate < $1.startDate }
             .prefix(maxEvents)
             .map { ev -> Xiaomi_CalendarEvent in
@@ -119,18 +127,19 @@ final class CalendarSyncService {
     // MARK: - Reminders
 
     private func pushReminders() async {
-        guard await requestRemindersAccess() else {
+        let enabled = Self.pushEnabled(Self.pushRemindersKey)
+        if enabled, !(await requestRemindersAccess()) {
             log.info("Reminders access not granted — skipping")
             return
         }
 
         // Only reminders that will still fire: an overdue one is created on the band in the past.
+        // The band holds one time per reminder, so each alert becomes its own.
         let now = Date()
-        let upcoming = await fetchDueReminders()
-            .compactMap { r in
-                Self.fireDate(of: r, after: now).map {
-                    (title: ReminderService.truncated(r.title ?? "Reminder"), fires: $0,
-                     repeats: Self.repeatRule(r.recurrenceRules?.first, firing: $0))
+        let upcoming = (enabled ? await fetchDueReminders() : [])
+            .flatMap { r in
+                Self.upcomingFires(of: r, after: now).map {
+                    (title: ReminderService.truncated(r.title ?? "Reminder"), fires: $0.date, repeats: $0.repeats)
                 }
             }
             .sorted { $0.fires < $1.fires }
@@ -264,6 +273,55 @@ final class CalendarSyncService {
     /// time, else 09:00 on a date-only due day (the iOS default for all-day reminders).
     static func fireDate(due: DateComponents?, alarms: [EKAlarm], after now: Date,
                          calendar: Calendar = .current) -> Date? {
+        alertDates(due: due, alarms: alarms, calendar: calendar).filter { $0 > now }.min()
+    }
+
+    static func fireDate(of reminder: EKReminder, after now: Date) -> Date? {
+        fireDate(due: reminder.dueDateComponents, alarms: reminder.alarms ?? [], after: now)
+    }
+
+    /// Every alert of the reminder's current occurrence still to come, each with the band repeat it
+    /// maps to. A repeating reminder's alert that already passed rolls forward to its next
+    /// occurrence instead of dropping out until the iPhone moves the reminder on.
+    static func upcomingFires(due: DateComponents?, alarms: [EKAlarm], rule: EKRecurrenceRule?,
+                              after now: Date, calendar: Calendar = .current)
+        -> [(date: Date, repeats: ReminderService.Repeat)] {
+        Set(alertDates(due: due, alarms: alarms, calendar: calendar))
+            .compactMap { alert -> (date: Date, repeats: ReminderService.Repeat)? in
+                let repeats = repeatRule(rule, firing: alert, calendar: calendar)
+                guard let next = rolledForward(alert, by: repeats, after: now, calendar: calendar) else { return nil }
+                return (next, repeats)
+            }
+            .sorted { $0.date < $1.date }
+    }
+
+    static func upcomingFires(of reminder: EKReminder, after now: Date) -> [(date: Date, repeats: ReminderService.Repeat)] {
+        upcomingFires(due: reminder.dueDateComponents, alarms: reminder.alarms ?? [],
+                      rule: reminder.recurrenceRules?.first, after: now)
+    }
+
+    private static func rolledForward(_ date: Date, by repeats: ReminderService.Repeat, after now: Date,
+                                      calendar: Calendar) -> Date? {
+        let unit: Calendar.Component
+        let size: Int
+        switch repeats {
+        case .once: return date > now ? date : nil
+        case .daily: (unit, size) = (.day, 1)
+        case .weekly: (unit, size) = (.day, 7)
+        case .monthly: (unit, size) = (.month, 1)
+        case .yearly: (unit, size) = (.year, 1)
+        }
+        // Each step counts from the original date: stepping from the previous result would carry a
+        // clamped day on (Jan 31 → Feb 28 → Mar 28). Bounded so a years-overdue reminder can't spin.
+        for n in 0..<800 {
+            guard let next = calendar.date(byAdding: unit, value: n * size, to: date) else { return nil }
+            if next > now { return next }
+        }
+        return nil
+    }
+
+    /// The times the iPhone would alert for the reminder's current occurrence, past ones included.
+    private static func alertDates(due: DateComponents?, alarms: [EKAlarm], calendar: Calendar) -> [Date] {
         var base: Date?
         var dueDate: Date?
         if let comps = due, let y = comps.year, let m = comps.month, let d = comps.day {
@@ -278,12 +336,7 @@ final class CalendarSyncService {
             }
         }
         let alerts = alarms.filter(\.isTimed).compactMap { $0.absoluteDate ?? base?.addingTimeInterval($0.relativeOffset) }
-        let candidates = alerts.isEmpty ? [dueDate].compactMap { $0 } : alerts
-        return candidates.filter { $0 > now }.min()
-    }
-
-    static func fireDate(of reminder: EKReminder, after now: Date) -> Date? {
-        fireDate(due: reminder.dueDateComponents, alarms: reminder.alarms ?? [], after: now)
+        return alerts.isEmpty ? [dueDate].compactMap { $0 } : alerts
     }
 
     /// Minutes before `start` of the earliest alert. Nil for an alert at or after the start (an
