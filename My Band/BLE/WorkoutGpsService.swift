@@ -130,6 +130,8 @@ final class WorkoutGpsService: NSObject {
             return
         }
 
+        // workoutStarted is left alone here: the band can send "started" before this request and
+        // never repeats it (hardware log 2026-11-01), so only pause, finish and stopGps clear it.
         let authStatus = locationManager.authorizationStatus
 
         switch authStatus {
@@ -143,7 +145,6 @@ final class WorkoutGpsService: NSObject {
             log.info("Location not determined — requesting WhenInUse authorization")
             isActive       = true
             gpsFixAcquired = false
-            workoutStarted = false
             armFixTimeout()
             locationManager.requestWhenInUseAuthorization()
 
@@ -153,7 +154,6 @@ final class WorkoutGpsService: NSObject {
             if !isActive {
                 isActive       = true
                 gpsFixAcquired = false
-                workoutStarted = false
                 armFixTimeout()
                 locationManager.startUpdatingLocation()
             }
@@ -162,7 +162,6 @@ final class WorkoutGpsService: NSObject {
             if !isActive {
                 isActive       = true
                 gpsFixAcquired = false
-                workoutStarted = false
                 log.info("Starting CoreLocation for workout (sport=\(sport))")
                 armFixTimeout()
                 locationManager.startUpdatingLocation()
@@ -190,7 +189,7 @@ final class WorkoutGpsService: NSObject {
                     log.info("Strength workout started — recording sparse GPS")
                 }
             } else {
-                log.info("Workout started/resumed — GPS stream active")
+                log.notice("Workout started/resumed (status \(status, privacy: .public), GPS fix \(self.gpsFixAcquired, privacy: .public)) — GPS stream active")
                 workoutStarted = true
             }
         case 2:
