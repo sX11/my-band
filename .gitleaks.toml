@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+# `gitleaks dir` ignores .gitignore, so it walks Xcode's build/ output (swift-protobuf's test fixtures).
+[[allowlists]]
+description = "Xcode build output"
+paths = ['''^build/''']
+
+# Comments that name the session-key fields read as `key=...` to generic-api-key. Matched by
+# content, not by line number, so the allowlist survives edits to the file.
+[[allowlists]]
+description = "XiaomiCrypto comments naming session-key fields"
+regexTarget = "line"
+regexes = ['''^\s*//\s+(en|de)crypt (outgoing|incoming) commands: key=sessionKeys\.''']
