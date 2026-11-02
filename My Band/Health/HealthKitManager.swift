@@ -758,10 +758,48 @@ final class HealthKitManager {
         return try await save(samples)
     }
 
+    /// Attaches GPS tracks whose workout an earlier sync already wrote, matched by start time as in
+    /// `route(forWorkoutStart:in:)`. A workout that already has a route is skipped, so a file the band
+    /// re-offers can't add a second one. Reads Health, so the caller runs it only while unlocked.
+    func attachLateRoutes(_ routes: [Int: [WorkoutTrackPoint]]) async throws -> Int {
+        guard canShare(routeType) else { return 0 }
+        var attached = 0
+        for (key, track) in routes {
+            let start = Date(timeIntervalSince1970: TimeInterval(key))
+            let workout = try await ownWorkouts(startingBetween: start.addingTimeInterval(-120),
+                                                and: start.addingTimeInterval(120))
+                .min { abs($0.startDate.timeIntervalSince(start)) < abs($1.startDate.timeIntervalSince(start)) }
+            guard let workout else {
+                log.notice("GPS track at \(key, privacy: .public) matches no workout in Apple Health — not attached")
+                continue
+            }
+            guard try await !hasRoute(workout) else { continue }
+            try await attachRoute(track, to: workout)
+            attached += 1
+            log.notice("Attached a late GPS track (\(track.count, privacy: .public) point(s)) to the workout at \(key, privacy: .public)")
+        }
+        return attached
+    }
+
+    private func hasRoute(_ workout: HKWorkout) async throws -> Bool {
+        try await !HKSampleQueryDescriptor(
+            predicates: [.sample(type: routeType, predicate: HKQuery.predicateForObjects(from: workout))],
+            sortDescriptors: [], limit: 1)
+            .result(for: store).isEmpty
+    }
+
+    /// Workouts written by this app whose startDate falls in [start, end].
+    private func ownWorkouts(startingBetween start: Date, and end: Date) async throws -> [HKWorkout] {
+        try await ownWorkouts(in: HKQuery.predicateForSamples(withStart: start, end: end, options: .strictStartDate))
+    }
+
     /// Workouts written by this app whose endDate falls in [start, end].
     private func ownWorkouts(endingBetween start: Date, and end: Date) async throws -> [HKWorkout] {
+        try await ownWorkouts(in: HKQuery.predicateForSamples(withStart: start, end: end, options: .strictEndDate))
+    }
+
+    private func ownWorkouts(in time: NSPredicate) async throws -> [HKWorkout] {
         let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
-        let time = HKQuery.predicateForSamples(withStart: start, end: end, options: .strictEndDate)
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [mine, time])
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<[HKWorkout], Error>) in
             let q = HKSampleQuery(sampleType: workoutType, predicate: predicate,

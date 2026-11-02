@@ -651,6 +651,17 @@ final class BandSyncer {
                 .filter { result.saved[Int($0.startDate.timeIntervalSince1970)] != nil }
                 .map { .init(start: $0.startDate, end: $0.endDate) })
         }
+        // A GPS track whose summary came in an earlier sync goes onto the workout already in Health;
+        // the file is ACKed below, so this is the track's last chance. Best-effort, like HR recovery.
+        let writtenStarts = workoutsToWrite.map { Int($0.startDate.timeIntervalSince1970) }
+        let lateRoutes = workoutRoutes.filter { route in !writtenStarts.contains { abs($0 - route.key) <= 120 } }
+        if healthReadable, !lateRoutes.isEmpty {
+            do {
+                _ = try await HealthKitManager.shared.attachLateRoutes(lateRoutes)
+            } catch {
+                log.error("Late GPS route attach failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
         // Workout summary + GPS files: a GPS file can be pending without a parseable summary (its
         // summary was ACKed in an earlier sync), which used to leave it dangling forever.
         if healthReadable { ackUnlessSkipped(workoutIds, "workout", manager: manager) }
