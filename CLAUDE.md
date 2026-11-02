@@ -196,14 +196,14 @@ Some features are **push** from the band: it sends the command and the app react
 
 ### Configuration sent to the band (app → band)
 
-`CalendarSyncService` (language/calendar/reminders) and `WeatherSyncService` (weather, via Open-Meteo) do an encrypted push at the end of `BandSyncer.syncToHealth()`, together with the health/exercise data and while the link is up (best-effort — it does not bring down the health sync). Each section is independent — a denied permission or no network does not block the others.
+`CalendarSyncService` (language/calendar/reminders) and `WeatherSyncService` (weather, via Open-Meteo) do an encrypted push at the end of `BandSyncer.syncToHealth()`, together with the health/exercise data and while the link is up (best-effort — it does not bring down the health sync). Each section is independent — a denied permission or no network does not block the others. The calendar and iPhone-reminders sections can be switched off in Band settings › Copies on the band (`CalendarSyncService.pushCalendarKey` / `pushRemindersKey`, `UserDefaults`, on by default); off clears the app's pushed copies on the next sync.
 
 | Data | type | subtype | Proto | Source / notes |
 |---|---|---|---|---|
 | Language | 2 (SYSTEM) | 6 `CMD_LANGUAGE` | `system.language.code` | `Locale` → lowercase `"pt_br"` |
 | Calendar | 12 | 1 `CMD_CALENDAR_SET` | `calendar.calendarSync.event[]` | EventKit, next 30 days, ≤50, **replaces** the set on the band |
 | Reminder (list) | 17 (SCHEDULE) | 14 `CMD_REMINDERS_GET` | `schedule.reminders` | the band's list (ids, title/time, `maxReminders`), read before each push |
-| Reminder (create) | 17 | 15 `CMD_REMINDERS_CREATE` | `schedule.createReminder` | EventKit, only those that will still fire (alarm › due date › 09:00 if date only), ≤20 and ≤ the band's free slots |
+| Reminder (create) | 17 | 15 `CMD_REMINDERS_CREATE` | `schedule.createReminder` | EventKit, one band reminder per timed alert still to come (else due date › 09:00 if date only); for a plain daily/weekly/monthly/yearly repeat a passed alert rolls to its next time; ≤20 and ≤ the band's free slots |
 | Reminder (delete) | 17 | 18 `CMD_REMINDERS_DELETE` | `schedule.deleteReminder.id[]` | deletes only this app's reminders before recreating |
 | Weather (location) | 10 | 7 `CMD_ADD_LOCATION` | `weather.location` | `WeatherSyncService`, key `accu:<hash>` |
 | Weather (current) | 10 | 0 `CMD_SET_CURRENT_WEATHER` | `weather.current` | Open-Meteo, Guarapuava |

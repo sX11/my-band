@@ -302,21 +302,22 @@ final class CalendarSyncService {
 
     private static func rolledForward(_ date: Date, by repeats: ReminderService.Repeat, after now: Date,
                                       calendar: Calendar) -> Date? {
-        let step: DateComponents
+        let unit: Calendar.Component
+        let size: Int
         switch repeats {
         case .once: return date > now ? date : nil
-        case .daily: step = DateComponents(day: 1)
-        case .weekly: step = DateComponents(day: 7)
-        case .monthly: step = DateComponents(month: 1)
-        case .yearly: step = DateComponents(year: 1)
+        case .daily: (unit, size) = (.day, 1)
+        case .weekly: (unit, size) = (.day, 7)
+        case .monthly: (unit, size) = (.month, 1)
+        case .yearly: (unit, size) = (.year, 1)
         }
-        var next = date
-        // Bounded: a reminder overdue for years shouldn't spin; it simply isn't pushed.
-        for _ in 0..<800 where next <= now {
-            guard let stepped = calendar.date(byAdding: step, to: next) else { return nil }
-            next = stepped
+        // Each step counts from the original date: stepping from the previous result would carry a
+        // clamped day on (Jan 31 → Feb 28 → Mar 28). Bounded so a years-overdue reminder can't spin.
+        for n in 0..<800 {
+            guard let next = calendar.date(byAdding: unit, value: n * size, to: date) else { return nil }
+            if next > now { return next }
         }
-        return next > now ? next : nil
+        return nil
     }
 
     /// The times the iPhone would alert for the reminder's current occurrence, past ones included.

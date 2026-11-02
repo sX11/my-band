@@ -98,6 +98,18 @@ struct ReminderFireDateTests {
         #expect(result.map(\.date) == [date("2026-10-19 09:00")])
     }
 
+    @Test func monthlyRollForwardKeepsTheEndOfMonthDay() {
+        let rule = EKRecurrenceRule(recurrenceWith: .monthly, interval: 1, end: nil)
+        let result = fires(due(2026, 1, 31, 9, 0), [], rule, after: date("2026-03-01 08:00"))
+        #expect(result.map(\.date) == [date("2026-03-31 09:00")])
+    }
+
+    @Test func yearlyLeapDayReturnsToFebruary29InALeapYear() {
+        let rule = EKRecurrenceRule(recurrenceWith: .yearly, interval: 1, end: nil)
+        let result = fires(due(2024, 2, 29, 9, 0), [], rule, after: date("2027-03-01 08:00"))
+        #expect(result.map(\.date) == [date("2028-02-29 09:00")])
+    }
+
     @Test func duplicateAlertTimesCollapse() {
         let alarms = [EKAlarm(relativeOffset: 0), EKAlarm(absoluteDate: date("2026-10-18 16:00"))]
         #expect(fires(due(2026, 10, 18, 16, 0), alarms, nil, after: date("2026-10-18 14:00")).count == 1)
