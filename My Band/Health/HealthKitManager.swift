@@ -761,24 +761,32 @@ final class HealthKitManager {
     /// Attaches GPS tracks whose workout an earlier sync already wrote, matched by start time as in
     /// `route(forWorkoutStart:in:)`. A workout that already has a route is skipped, so a file the band
     /// re-offers can't add a second one. Reads Health, so the caller runs it only while unlocked.
-    func attachLateRoutes(_ routes: [Int: [WorkoutTrackPoint]]) async throws -> Int {
-        guard canShare(routeType) else { return 0 }
-        var attached = 0
+    /// Returns the keys whose attach failed or wasn't allowed, so their files can stay un-ACKed.
+    func attachLateRoutes(_ routes: [Int: [WorkoutTrackPoint]]) async -> Set<Int> {
+        guard canShare(routeType) else {
+            log.warning("Not allowed to write workout routes — holding \(routes.count, privacy: .public) GPS track(s)")
+            return Set(routes.keys)
+        }
+        var failed = Set<Int>()
         for (key, track) in routes {
             let start = Date(timeIntervalSince1970: TimeInterval(key))
-            let workout = try await ownWorkouts(startingBetween: start.addingTimeInterval(-120),
-                                                and: start.addingTimeInterval(120))
-                .min { abs($0.startDate.timeIntervalSince(start)) < abs($1.startDate.timeIntervalSince(start)) }
-            guard let workout else {
-                log.notice("GPS track at \(key, privacy: .public) matches no workout in Apple Health — not attached")
-                continue
+            do {
+                let workout = try await ownWorkouts(startingBetween: start.addingTimeInterval(-120),
+                                                    and: start.addingTimeInterval(120))
+                    .min { abs($0.startDate.timeIntervalSince(start)) < abs($1.startDate.timeIntervalSince(start)) }
+                guard let workout else {
+                    log.notice("GPS track at \(key, privacy: .public) matches no workout in Apple Health — not attached")
+                    continue
+                }
+                guard try await !hasRoute(workout) else { continue }
+                try await attachRoute(track, to: workout)
+                log.notice("Attached a late GPS track (\(track.count, privacy: .public) point(s)) to the workout at \(key, privacy: .public)")
+            } catch {
+                failed.insert(key)
+                log.error("Late GPS route attach failed (start \(key, privacy: .public)): \(error.localizedDescription, privacy: .public)")
             }
-            guard try await !hasRoute(workout) else { continue }
-            try await attachRoute(track, to: workout)
-            attached += 1
-            log.notice("Attached a late GPS track (\(track.count, privacy: .public) point(s)) to the workout at \(key, privacy: .public)")
         }
-        return attached
+        return failed
     }
 
     private func hasRoute(_ workout: HKWorkout) async throws -> Bool {
