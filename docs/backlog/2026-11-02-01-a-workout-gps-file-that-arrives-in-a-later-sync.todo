@@ -1,4 +1,4 @@
-- [ ] A workout GPS file that arrives in a later sync than its summary is ACKed and its route dropped #workouts #worth(yes) #where(My Band/BLE/BandSyncer.swift:496) #added(2026-11-02)
+- [x] A workout GPS file that arrives in a later sync than its summary is ACKed and its route dropped #workouts #where(My Band/BLE/BandSyncer.swift:496) #added(2026-11-02) #done(2026-11-02)
 	> @anchor: } else if meta.isWorkoutGps {
 	> The track goes into workoutRoutes, but writeWorkouts runs only when the same batch
 	> has a parsed summary (BandSyncer.swift:645), and nothing attaches a route to a

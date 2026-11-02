@@ -468,6 +468,7 @@ final class BandSyncer {
         var sleepIds:   [Data] = []
         var manualIds:  [Data] = []
         var workoutIds: [Data] = []
+        var gpsFileIds: [Int: Data] = [:]
         var detailIds:  [Data] = []
 
         // Routes one fetched, CRC-valid file into its batch (or writes and ACKs it inline).
@@ -498,6 +499,7 @@ final class BandSyncer {
                     log.notice("Workout GPS file: \(track.count, privacy: .public) point(s) for session at \(meta.timestamp.description, privacy: .public)")
                     if !track.isEmpty {
                         workoutRoutes[Int(meta.timestamp.timeIntervalSince1970)] = track
+                        gpsFileIds[Int(meta.timestamp.timeIntervalSince1970)] = fileId
                     }
                     workoutIds.append(fileId)
                 } else if meta.isWorkoutDetails {
@@ -651,9 +653,21 @@ final class BandSyncer {
                 .filter { result.saved[Int($0.startDate.timeIntervalSince1970)] != nil }
                 .map { .init(start: $0.startDate, end: $0.endDate) })
         }
+        // A GPS track whose summary came in an earlier sync goes onto the workout already in Health.
+        // One whose attach failed keeps its file un-ACKed, so the band offers it again.
+        let writtenStarts = workoutsToWrite.map { Int($0.startDate.timeIntervalSince1970) }
+        let lateRoutes = workoutRoutes.filter { route in !writtenStarts.contains { abs($0 - route.key) <= 120 } }
+        var heldGpsIds = Set<Data>()
+        if healthReadable, !lateRoutes.isEmpty {
+            let failed = await HealthKitManager.shared.attachLateRoutes(lateRoutes)
+            heldGpsIds = Set(failed.compactMap { gpsFileIds[$0] })
+            if !heldGpsIds.isEmpty {
+                log.warning("\(heldGpsIds.count, privacy: .public) GPS file(s) left un-ACKed — their route couldn't be attached")
+            }
+        }
         // Workout summary + GPS files: a GPS file can be pending without a parseable summary (its
         // summary was ACKed in an earlier sync), which used to leave it dangling forever.
-        if healthReadable { ackUnlessSkipped(workoutIds, "workout", manager: manager) }
+        if healthReadable { ackUnlessSkipped(workoutIds.filter { !heldGpsIds.contains($0) }, "workout", manager: manager) }
 
         // Daily details last: HR/SpO₂ and steps/distance/energy per minute, leaving out distance and
         // energy inside a workout, which the workout samples above already contribute.
