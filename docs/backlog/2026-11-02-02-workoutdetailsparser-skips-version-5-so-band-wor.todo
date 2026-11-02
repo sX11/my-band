@@ -1,0 +1,8 @@
+- [ ] WorkoutDetailsParser skips version 5, so band workouts lose their per-second heart rate #workouts #worth(yes) #where(My Band/BLE/PacketParser/WorkoutDetailsParser.swift:44) #added(2026-11-02)
+	> @anchor: skipping HR series
+	> Hardware log 2026-11-01: the walk's SPORTS DETAILS file was version 5, and only
+	> version 3 is decoded, so the workout reached Apple Health with no 1 Hz heart-rate
+	> series (and no heart-rate recovery, which pairs on that series). Blocked on a real
+	> capture: run a DEBUG build through a workout, save the file with
+	> dumpActivityFileFixture, and reverse-engineer it the way version 3 was (layout plus
+	> CRC-32).
