@@ -71,6 +71,38 @@ struct ReminderFireDateTests {
         #expect(fire(nil) == nil)
     }
 
+    private func daily() -> EKRecurrenceRule { EKRecurrenceRule(recurrenceWith: .daily, interval: 1, end: nil) }
+
+    private func fires(_ due: DateComponents?, _ alarms: [EKAlarm], _ rule: EKRecurrenceRule?,
+                       after now: Date) -> [(date: Date, repeats: ReminderService.Repeat)] {
+        CalendarSyncService.upcomingFires(due: due, alarms: alarms, rule: rule, after: now, calendar: calendar)
+    }
+
+    @Test func eachAlertOfADailyReminderBecomesItsOwnDailyReminder() {
+        let alarms = [10, 13, 16, 19].map { EKAlarm(absoluteDate: date("2026-10-18 \($0):00")) }
+        let result = fires(due(2026, 10, 18, 10, 0), alarms, daily(), after: date("2026-10-18 14:00"))
+        #expect(result.map(\.date) == [date("2026-10-18 16:00"), date("2026-10-18 19:00"),
+                                      date("2026-10-19 10:00"), date("2026-10-19 13:00")])
+        #expect(result.allSatisfy { $0.repeats == .daily })
+    }
+
+    @Test func passedAlertOfAOneOffReminderIsDropped() {
+        let alarms = [EKAlarm(absoluteDate: date("2026-10-18 10:00")), EKAlarm(absoluteDate: date("2026-10-18 16:00"))]
+        let result = fires(due(2026, 10, 18, 10, 0), alarms, nil, after: date("2026-10-18 14:00"))
+        #expect(result.map(\.date) == [date("2026-10-18 16:00")])
+        #expect(result.first?.repeats == .once)
+    }
+
+    @Test func overdueDailyReminderRollsToItsNextTime() {
+        let result = fires(due(2026, 10, 15, 9, 0), [], daily(), after: date("2026-10-18 14:00"))
+        #expect(result.map(\.date) == [date("2026-10-19 09:00")])
+    }
+
+    @Test func duplicateAlertTimesCollapse() {
+        let alarms = [EKAlarm(relativeOffset: 0), EKAlarm(absoluteDate: date("2026-10-18 16:00"))]
+        #expect(fires(due(2026, 10, 18, 16, 0), alarms, nil, after: date("2026-10-18 14:00")).count == 1)
+    }
+
     @Test func reminderKeyMatchesWhatWasPushed() {
         let pushed = XiaomiProto.reminderDetails(date: date("2026-09-27 15:30"), title: "Call")
         var echoed = Xiaomi_ReminderDetails()
