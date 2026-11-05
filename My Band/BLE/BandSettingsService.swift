@@ -30,6 +30,7 @@ final class BandSettingsService {
     private(set) var standingReminder: Xiaomi_StandingReminder?
     private(set) var goalNotification: Xiaomi_GoalNotification?
     private(set) var screenOnNotifications: Bool?
+    private(set) var vibration: Xiaomi_VibrationPatterns?
 
     var loaded: Bool { heartRate != nil || spo2 != nil || stress != nil }
 
@@ -51,6 +52,7 @@ final class BandSettingsService {
         standingReminder = nil
         goalNotification = nil
         screenOnNotifications = nil
+        vibration = nil
     }
 
     func requestAll() {
@@ -59,6 +61,12 @@ final class BandSettingsService {
             send(XiaomiProto.healthCommand(subtype: subtype))
         }
         send(XiaomiProto.screenOnNotificationsGetCommand())
+        send(XiaomiProto.vibrationPatternsGetCommand())
+        // Read-only probe: neither GadgetBridge nor this app knows which reply field carries the
+        // misc notification settings (only when locked / only when worn), so the replies are logged.
+        for setting: UInt32 in [1, 2] {
+            send(XiaomiProto.miscSettingGetCommand(setting: setting))
+        }
     }
 
     // MARK: - Heart rate
@@ -200,9 +208,29 @@ final class BandSettingsService {
         send(XiaomiProto.screenOnNotificationsGetCommand())
     }
 
+    // MARK: - Vibration
+
+    /// Preset the band assigns to an alert type (VibrationNotificationType: 1 calls, 4 notifications…).
+    func vibrationPreset(for type: UInt32) -> UInt32? {
+        vibration?.notificationType.first { $0.notificationType == type }?.preset
+    }
+
+    func setVibrationPreset(_ preset: UInt32, for type: UInt32) {
+        guard var v = vibration,
+              let i = v.notificationType.firstIndex(where: { $0.notificationType == type }) else { return }
+        v.notificationType[i].preset = preset
+        vibration = v
+        send(XiaomiProto.vibrationSetPresetCommand(notificationType: type, preset: preset))
+        send(XiaomiProto.vibrationPatternsGetCommand())
+    }
+
     // MARK: - Incoming
 
     private func handle(_ cmd: Xiaomi_Command) {
+        if cmd.type == XiaomiSystemCmd.cmdType {
+            handleSystem(cmd)
+            return
+        }
         if cmd.type == XiaomiNotificationCmd.cmdType {
             if cmd.subtype == XiaomiNotificationCmd.screenOnGet, cmd.hasNotification {
                 screenOnNotifications = cmd.notification.screenOnOnNotifications
@@ -224,6 +252,20 @@ final class BandSettingsService {
             standingReminder = h.standingReminder
         case XiaomiHealthCmd.goalNotificationGet where cmd.hasHealth && h.hasGoalNotification:
             goalNotification = h.goalNotification
+        default:
+            logAck(cmd)
+        }
+    }
+
+    private func handleSystem(_ cmd: Xiaomi_Command) {
+        switch cmd.subtype {
+        // A reply without the type mapping is partial (GadgetBridge drops it too): keep the last good one.
+        case XiaomiSystemCmd.vibrationGet where cmd.hasSystem && cmd.system.hasVibrationPatterns
+                                              && !cmd.system.vibrationPatterns.notificationType.isEmpty:
+            vibration = cmd.system.vibrationPatterns
+            log.info("Vibration from band ← \(cmd.system.vibrationPatterns.textFormatString(), privacy: .public)")
+        case XiaomiSystemCmd.miscSettingGet:
+            log.info("Misc setting reply ← \(cmd.textFormatString(), privacy: .public)")
         default:
             logAck(cmd)
         }

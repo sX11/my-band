@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - BandSettingsView
 //
 // The band's own settings: heart-rate, SpO₂ and stress monitoring, activity reminders, and the
-// screen on notifications, and the way into watch faces and apps. Every change goes straight to the band and is re-read from it (see
+// screen on notifications, alert vibration, and the way into watch faces and apps. Every change goes straight to the band and is re-read from it (see
 // BandSettingsService); a section appears once the band has reported it.
 
 struct BandSettingsView: View {
@@ -37,6 +37,7 @@ struct BandSettingsView: View {
                 stressSection
                 activitySection
                 displaySection
+                vibrationSection
                 if connected { customizeSection }
                 fromIPhoneSection
             }
@@ -167,6 +168,48 @@ struct BandSettingsView: View {
             }
             .listRowBackground(MB.surfaceCard)
         }
+    }
+
+    // MARK: - Vibration
+
+    // The band's VibrationNotificationType ids, from the proto's annotations; 2 and 8 are both
+    // marked "events" upstream and unconfirmed.
+    private static let vibrationTypes: [(id: UInt32, title: String)] = [
+        (1, "Calls"), (6, "Messages"), (4, "App notifications"), (3, "Alarms"),
+        (2, "Events"), (8, "Schedule"), (5, "Stand-up reminder"), (7, "Goal reached"),
+    ]
+
+    @ViewBuilder private var vibrationSection: some View {
+        if let v = settings.vibration {
+            Section {
+                ForEach(Self.vibrationTypes.filter { t in v.notificationType.contains { $0.notificationType == t.id } },
+                        id: \.id) { type in
+                    let current = settings.vibrationPreset(for: type.id) ?? 0
+                    Picker(type.title, selection: Binding(
+                        get: { current },
+                        set: { settings.setVibrationPreset($0, for: type.id) })) {
+                        ForEach(Self.patternChoices(v, current: current), id: \.id) {
+                            Text($0.name).tag($0.id)
+                        }
+                    }
+                }
+            } header: {
+                Text("Vibration")
+            } footer: {
+                Text("Which of the band's patterns each alert uses. Which apps alert at all is still chosen in Mi Fitness.")
+            }
+            .listRowBackground(MB.surfaceCard)
+        }
+    }
+
+    private static func patternChoices(_ v: Xiaomi_VibrationPatterns, current: UInt32) -> [(id: UInt32, name: String)] {
+        var choices = v.customVibrationPattern.map { p in
+            (id: p.id, name: p.name.isEmpty ? "Pattern \(p.id)" : p.name)
+        }
+        for id in Set(v.notificationType.map(\.preset) + [current]) where !choices.contains(where: { $0.id == id }) {
+            choices.append((id: id, name: "Pattern \(id)"))
+        }
+        return choices.sorted { $0.id < $1.id }
     }
 
     // MARK: - Customize

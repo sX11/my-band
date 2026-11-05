@@ -309,6 +309,24 @@ enum XiaomiProto {
         }
     }
 
+    static func vibrationPatternsGetCommand() -> Data {
+        bareCommand(type: XiaomiSystemCmd.cmdType, subtype: XiaomiSystemCmd.vibrationGet)
+    }
+
+    /// Not sent by GadgetBridge; the subtype and fields come from the proto's own annotation (2, 47).
+    static func vibrationSetPresetCommand(notificationType: UInt32, preset: UInt32) -> Data {
+        command(type: XiaomiSystemCmd.cmdType, subtype: XiaomiSystemCmd.vibrationSetPreset) {
+            $0.system.vibrationSetPreset.notificationType = notificationType
+            $0.system.vibrationSetPreset.preset = preset
+        }
+    }
+
+    static func miscSettingGetCommand(setting: UInt32) -> Data {
+        command(type: XiaomiSystemCmd.cmdType, subtype: XiaomiSystemCmd.miscSettingGet) {
+            $0.system.miscSettingGet.setting = setting
+        }
+    }
+
     /// CMD_ACTIVITY_FETCH_TODAY — lists today's pending activity file IDs.
     static func fetchTodayCommand() -> Data {
         var cmd = Xiaomi_Command()
