@@ -1064,7 +1064,7 @@ final class HealthKitManager {
 
     /// Most recent body-mass sample from Apple Health (the BLE scale keeps it fresh), in kg.
     /// Feeds the MET math (physical effort, average workout METs); nil when none/denied.
-    private func latestBodyMassKg() async throws -> Double? {
+    func latestBodyMassKg() async throws -> Double? {
         try await latestQuantity(of: bodyMass, unit: .gramUnit(with: .kilo))
     }
 

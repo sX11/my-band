@@ -61,12 +61,23 @@ final class ScaleManager: NSObject {
         lastWeightKg = reading.weightKg
         lastWeightDate = now
         log.info("Scale weight \(reading.weightKg, format: .fixed(precision: 2)) kg — writing to Apple Health")
+        write(reading.weightKg, date: now)
+    }
 
+    /// A weight typed in the Health sheet: written and shown exactly like a weighing.
+    func recordManual(_ kg: Double) async throws {
+        let now = Date()
+        lastWeightKg = kg
+        lastWeightDate = now
+        try await HealthKitManager.shared.writeBodyMass(kg, date: now, heightMeters: ProfileDefaults.heightMeters)
+    }
+
+    private func write(_ kg: Double, date now: Date) {
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await HealthKitManager.shared.requestAuthorization()
-                try await HealthKitManager.shared.writeBodyMass(reading.weightKg, date: now,
+                try await HealthKitManager.shared.writeBodyMass(kg, date: now,
                                                                 heightMeters: ProfileDefaults.heightMeters)
                 self.lastError = nil
             } catch {

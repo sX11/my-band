@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - BandSettingsView
 //
 // The band's own settings: heart-rate, SpO₂ and stress monitoring, activity reminders, and the
-// screen on notifications. Every change goes straight to the band and is re-read from it (see
+// screen on notifications, and the way into watch faces and apps. Every change goes straight to the band and is re-read from it (see
 // BandSettingsService); a section appears once the band has reported it.
 
 struct BandSettingsView: View {
@@ -11,6 +11,7 @@ struct BandSettingsView: View {
     @Environment(BandManager.self) private var band
     @Environment(BandSettingsService.self) private var settings
     @Environment(\.dismiss) private var dismiss
+    @State private var showCustomize = false
     @AppStorage(CalendarSyncService.pushCalendarKey) private var pushCalendar = true
     @AppStorage(CalendarSyncService.pushRemindersKey) private var pushReminders = true
 
@@ -36,6 +37,7 @@ struct BandSettingsView: View {
                 stressSection
                 activitySection
                 displaySection
+                if connected { customizeSection }
                 fromIPhoneSection
             }
             .scrollContentBackground(.hidden)
@@ -51,6 +53,7 @@ struct BandSettingsView: View {
         }
         .preferredColorScheme(.dark)
         .onAppear { if connected { settings.requestAll() } }
+        .sheet(isPresented: $showCustomize) { CustomizeView() }
     }
 
     // MARK: - Heart rate
@@ -164,6 +167,23 @@ struct BandSettingsView: View {
             }
             .listRowBackground(MB.surfaceCard)
         }
+    }
+
+    // MARK: - Customize
+
+    private var customizeSection: some View {
+        Section("Customize") {
+            Button { showCustomize = true } label: {
+                HStack {
+                    Label("Watch faces and apps", systemImage: "square.grid.2x2")
+                        .font(.mbSubhead).foregroundStyle(MB.textPrimary)
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(MB.textTertiary)
+                }
+            }
+        }
+        .listRowBackground(MB.surfaceCard)
     }
 
     // MARK: - From the iPhone

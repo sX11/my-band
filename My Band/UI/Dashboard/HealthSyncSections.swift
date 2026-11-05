@@ -1,57 +1,36 @@
 import SwiftUI
 
-// MARK: - HealthSyncView
+// MARK: - HealthSyncSections
 //
-// What the syncs sent to Apple Health: the last sync's samples per type and the band files behind
-// them, then every other type with the last time it was sent. Sync status, not health data.
+// The sync log at the foot of the Health sheet: what the last sync sent to Apple Health per type and
+// the band files behind it, then every other type with the last time it was sent. Sync status, not
+// health data.
 
-struct HealthSyncView: View {
+struct HealthSyncSections: View {
 
     @Environment(HealthSyncLog.self) private var syncLog
     @Environment(BandSyncer.self) private var syncer
-    @Environment(\.dismiss) private var dismiss
+
+    let now: Date
 
     var body: some View {
-        NavigationStack {
-            TimelineView(.periodic(from: .now, by: 30)) { context in
-                List {
-                    if let report = syncLog.last {
-                        lastSyncSection(report, now: context.date)
-                        filesSection(report)
-                        earlierSection(report, now: context.date)
-                    } else {
-                        Section {
-                            Text(syncer.lastHealthSync == nil
-                                 ? "Nothing synced yet."
-                                 : "The next sync will list what it sends.")
-                                .font(.mbFootnote).foregroundStyle(MB.textTertiary)
-                        }
-                        .listRowBackground(MB.surfaceCard)
-                    }
-                    Section {
-                    } footer: {
-                        Text("Counts are samples sent. Apple Health replaces a sample it already has, so a resent one isn't duplicated.")
-                            .font(.mbFootnote).foregroundStyle(MB.textTertiary)
-                    }
-                }
-                .scrollContentBackground(.hidden)
-                .background(MB.bgApp.ignoresSafeArea())
+        if let report = syncLog.last {
+            lastSyncSection(report, now: now)
+            filesSection(report)
+            earlierSection(report, now: now)
+        } else {
+            Section("Apple Health sync") {
+                Text(syncer.lastHealthSync == nil
+                     ? "Nothing synced yet."
+                     : "The next sync will list what it sends.")
+                    .font(.mbFootnote).foregroundStyle(MB.textTertiary)
             }
-            .navigationTitle("Apple Health")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-            .tint(MB.accent)
+            .listRowBackground(MB.surfaceCard)
         }
-        .preferredColorScheme(.dark)
     }
 
-    // MARK: Sections
-
     private func lastSyncSection(_ r: HealthSyncReport, now: Date) -> some View {
-        Section("Last sync · \(MBFormat.ago(r.at, now: now))\(r.failed ? " · failed part-way" : "")") {
+        Section("Synced to Apple Health · \(MBFormat.ago(r.at, now: now))\(r.failed ? " · failed part-way" : "")") {
             if r.byType.isEmpty {
                 Text("Nothing new to send.").font(.mbBody).foregroundStyle(MB.textSecondary)
             } else {
@@ -68,7 +47,7 @@ struct HealthSyncView: View {
     }
 
     private func filesSection(_ r: HealthSyncReport) -> some View {
-        Section("From the band") {
+        Section("Band files in that sync") {
             row("Files fetched", "\(r.filesFetched)")
             if r.filesFailed > 0 { row("Files not delivered", "\(r.filesFailed)") }
             if r.sleepSessions > 0 { row("Sleep sessions", "\(r.sleepSessions)") }

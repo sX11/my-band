@@ -79,8 +79,8 @@ My Band/
     ├── Dashboard/                # Main screen with a data summary
     ├── Setup/                    # Setup flow (AuthKey + HA)
     ├── Sleep/                    # Detailed sleep view
-    ├── Profile/                  # User profile (height → BMI in Apple Health)
-    ├── Customize/                # Watch faces and RPK apps
+    ├── Profile/                  # BodySection: height and weight in the Health sheet (→ BMI in Apple Health)
+    ├── Customize/                # Watch faces and RPK apps (opened from Band settings)
     ├── Workouts/                 # List of workouts read from Apple Health (ADR 0009)
     ├── Trends/                   # 7-day trends from Apple Health (ADR 0010)
     ├── Reminders/                # Page to the right of Workouts: band reminders, create/delete (ReminderService)
@@ -411,7 +411,7 @@ NSHealthShareUsageDescription
 
 The UI is built from the **Claude Design** handoff (`My Band — Design System`, a bundle exported from claude.ai/design). Recreate it faithfully in SwiftUI — copy the **visual result**, not the HTML/JSX structure of the prototypes.
 
-> **Apple Health is the surface for health data** (ADR 0005, which supersedes 0001). The Dashboard shows connection state, sync freshness, battery, alarms, band settings and the Today card — steps, kcal and HR read once from the band's realtime stats and never stored; stand hours come from the last sync's daily summary. The Latest metrics card opens the Health sheet with the latest value of each reading (HR, SpO₂, stress, temperature, day summary, last night, weight), kept as a single overwritten snapshot (ADR 0006). The history shown lives on two side pages, nothing stored: Workouts, with the app's own latest workouts (ADR 0009), and Sleep & trends, with 7-day charts of sleep, resting HR, steps, SpO₂ and weight (ADR 0010). Outside them, no history and no charts.
+> **Apple Health is the surface for health data** (ADR 0005, which supersedes 0001). The Dashboard shows connection state, sync freshness, battery, alarms, band settings and the Today card — steps, kcal and HR read once from the band's realtime stats and never stored; stand hours come from the last sync's daily summary. The Health card opens the Health sheet with the latest value of each reading (HR, SpO₂, stress, temperature, day summary, last night), kept as a single overwritten snapshot, plus height and weight to edit and the log of what the syncs sent to Apple Health (ADR 0006 and its addendum). The history shown lives on two side pages, nothing stored: Workouts, with the app's own latest workouts (ADR 0009), and Sleep & trends, with 7-day charts of sleep, resting HR, steps, SpO₂ and weight (ADR 0010). Outside them, no history and no charts.
 
 **The maker's fixed principles:**
 1. **Dark-mode first** — "I like night mode".
@@ -428,7 +428,7 @@ The UI is built from the **Claude Design** handoff (`My Band — Design System`,
 - **Continuous corners**: cards 16, sheets 20, hero/modal 28, round pills. **4-pt grid**, gutter 20, hit target ≥44.
 - **Icons**: SF Symbols (the web kit uses Lucide as a stand-in). Status is always color + symbol, never color alone.
 
-**Voice & copy (English):** sentence case, no emoji, address the user as **you**, device = "the band". Calm, factual tone ("Synced 2 min ago", "42 samples in Apple Health"). Health metrics only on the Today card (ADR 0005), on the Latest metrics card/sheet (ADR 0006), on the workout card and in the Live Activity while the band records a workout (ADR 0008), on the Workouts screen, with the workouts the app itself recorded (ADR 0009), and on the Sleep & trends page (ADR 0010); outside them a number is always about status/sync. Technical honesty: AuthKey/BLE shown in mono, AuthKey masked by default.
+**Voice & copy (English):** sentence case, no emoji, address the user as **you**, device = "the band". Calm, factual tone ("Synced 2 min ago", "42 samples in Apple Health"). Health metrics only on the Today card (ADR 0005), on the Health card/sheet (ADR 0006), on the workout card and in the Live Activity while the band records a workout (ADR 0008), on the Workouts screen, with the workouts the app itself recorded (ADR 0009), and on the Sleep & trends page (ADR 0010); outside them a number is always about status/sync. Technical honesty: AuthKey/BLE shown in mono, AuthKey masked by default.
 
 **Screens (`ui_kits/app/`):** `Dashboard` (connection status, sync freshness, battery, sync, alarms, band settings, the Today card — ADR 0005 —, the Health sheet — ADR 0006 — the live workout card — ADR 0008 — and, one swipe to the left, the Workouts page with the latest workouts read from Apple Health — ADR 0009 —, and, one swipe to the right, the Sleep & trends page — ADR 0010 —, and, after Workouts, the Reminders page), `Setup` (AuthKey + scan/connection), `Settings`. Connection status + sync freshness are first-class on every screen.
 
