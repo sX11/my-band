@@ -71,7 +71,7 @@ My Band/
 │   ├── SleepSession.swift        # SwiftData model of a sleep session
 │   ├── ActivityDay.swift         # SwiftData model of daily activity
 │   ├── LatestMetrics.swift       # Snapshot of the latest value of each reading, for the Health sheet (ADR 0006)
-│   ├── HealthSyncLog.swift       # What each sync sent to Apple Health, per type, for the Apple Health card's sheet
+│   ├── HealthSyncLog.swift       # What each sync sent to Apple Health, per type, for the Health sheet
 │   ├── WorkoutWindows.swift      # Windows of recorded workouts, so the daily detail excludes distance/energy (ADR 0007)
 │   └── HeartRateSample.swift     # SwiftData model of HR samples
 │

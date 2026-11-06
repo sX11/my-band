@@ -17,19 +17,23 @@ struct BodySection: View {
     @State private var message: String?
     @State private var isError = false
     @State private var saving = false
+    @FocusState private var focus: Field?
+
+    private enum Field { case height, weight }
 
     let now: Date
 
     private var knownWeightKg: Double? { scale.lastWeightKg ?? healthWeightKg }
 
-    private var heightChanged: Bool { Self.parse(heightInput).map { $0 != storedHeightCm } ?? !heightInput.isEmpty }
-    private var weightChanged: Bool { Self.parse(weightInput).map { $0 != knownWeightKg } ?? !weightInput.isEmpty }
+    // Compared as displayed: the field shows one decimal, so 72.34 kg on record is not an edit.
+    private var heightChanged: Bool { Self.changed(heightInput, from: storedHeightCm > 0 ? storedHeightCm : nil) }
+    private var weightChanged: Bool { Self.changed(weightInput, from: knownWeightKg) }
 
     var body: some View {
         Section {
-            field("Height", text: $heightInput, unit: "cm", placeholder: "180")
-            field("Weight", text: $weightInput, unit: "kg", placeholder: "75.0",
-                  detail: scale.lastWeightDate.map { "Weighed \(MBFormat.ago($0, now: now))" })
+            field(.height, "Height", text: $heightInput, unit: "cm", placeholder: "180")
+            field(.weight, "Weight", text: $weightInput, unit: "kg", placeholder: "75.0",
+                  detail: scale.lastWeightDate.map { "Updated \(MBFormat.ago($0, now: now))" })
             if heightChanged || weightChanged || saving {
                 Button(saving ? "Saving…" : "Save to Apple Health", action: save)
                     .disabled(saving)
@@ -45,11 +49,11 @@ struct BodySection: View {
         .listRowBackground(MB.surfaceCard)
         .task { await prefill() }
         .onChange(of: scale.lastWeightKg) { _, kg in
-            if let kg, !saving { weightInput = Self.format(kg) }
+            if let kg, !saving, focus != .weight { weightInput = Self.format(kg) }
         }
     }
 
-    private func field(_ label: String, text: Binding<String>, unit: String, placeholder: String,
+    private func field(_ id: Field, _ label: String, text: Binding<String>, unit: String, placeholder: String,
                        detail: String? = nil) -> some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
@@ -59,6 +63,7 @@ struct BodySection: View {
             Spacer()
             TextField(placeholder, text: text)
                 .keyboardType(.decimalPad)
+                .focused($focus, equals: id)
                 .multilineTextAlignment(.trailing)
                 .monospacedDigit()
                 .frame(maxWidth: 90)
@@ -69,6 +74,7 @@ struct BodySection: View {
     private func prefill() async {
         if heightInput.isEmpty, storedHeightCm > 0 { heightInput = Self.format(storedHeightCm) }
         if scale.lastWeightKg == nil {
+            try? await HealthKitManager.shared.requestAuthorization()
             healthWeightKg = (try? await HealthKitManager.shared.latestBodyMassKg()) ?? nil
         }
         if weightInput.isEmpty, let kg = knownWeightKg { weightInput = Self.format(kg) }
@@ -89,20 +95,26 @@ struct BodySection: View {
         message = nil
         Task {
             do {
-                try await HealthKitManager.shared.requestAuthorization()
+                let health = HealthKitManager.shared
+                try await health.requestAuthorization()
+                var refused = false
                 if let cm = newHeight {
-                    storedHeightCm = cm
-                    try await HealthKitManager.shared.writeHeight(meters: cm / 100)
+                    if try await health.writeHeight(meters: cm / 100) > 0 { storedHeightCm = cm } else { refused = true }
                 }
-                if let kg = newWeight {
-                    try await scale.recordManual(kg)
-                } else if newHeight != nil, let kg = scale.lastWeightKg, let date = scale.lastWeightDate {
+                if !refused, let kg = newWeight {
+                    if try await scale.recordManual(kg) > 0 { healthWeightKg = kg } else { refused = true }
+                } else if !refused, newHeight != nil, let m = ProfileDefaults.heightMeters {
                     // Same sync identifier as the weighing, so its BMI is replaced rather than duplicated.
-                    try await HealthKitManager.shared.writeBodyMass(kg, date: date, heightMeters: ProfileDefaults.heightMeters)
+                    if let kg = scale.lastWeightKg, let date = scale.lastWeightDate {
+                        try await health.writeBodyMass(kg, date: date, heightMeters: m)
+                    } else if let kg = healthWeightKg {
+                        try await health.writeBodyMassIndex(weightKg: kg, heightMeters: m)
+                    }
                 }
-                if let kg = newWeight { healthWeightKg = kg }
-                isError = false
-                message = "Saved to Apple Health."
+                isError = refused
+                message = refused
+                    ? "Apple Health didn't accept it. Allow My Band to write height and weight in Settings › Health."
+                    : "Saved to Apple Health."
             } catch {
                 isError = true
                 message = error.localizedDescription
@@ -118,6 +130,11 @@ struct BodySection: View {
 
     private static func parse(_ input: String) -> Double? {
         Double(input.replacingOccurrences(of: ",", with: ".").trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func changed(_ input: String, from known: Double?) -> Bool {
+        guard let value = parse(input) else { return !input.isEmpty }
+        return format(value) != known.map(format)
     }
 
     private static func format(_ value: Double) -> String {

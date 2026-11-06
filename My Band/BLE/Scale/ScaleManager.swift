@@ -64,12 +64,24 @@ final class ScaleManager: NSObject {
         write(reading.weightKg, date: now)
     }
 
-    /// A weight typed in the Health sheet: written and shown exactly like a weighing.
-    func recordManual(_ kg: Double) async throws {
+    /// A weight typed in the Health sheet, written like a weighing. Returns the samples Apple Health
+    /// accepted: 0 means write access is off, and the shown weight stays as it was.
+    @discardableResult
+    func recordManual(_ kg: Double) async throws -> Int {
         let now = Date()
-        lastWeightKg = kg
-        lastWeightDate = now
-        try await HealthKitManager.shared.writeBodyMass(kg, date: now, heightMeters: ProfileDefaults.heightMeters)
+        do {
+            let saved = try await HealthKitManager.shared.writeBodyMass(kg, date: now,
+                                                                        heightMeters: ProfileDefaults.heightMeters)
+            lastError = nil
+            if saved > 0 {
+                lastWeightKg = kg
+                lastWeightDate = now
+            }
+            return saved
+        } catch {
+            lastError = error.localizedDescription
+            throw error
+        }
     }
 
     private func write(_ kg: Double, date now: Date) {
