@@ -817,7 +817,7 @@ final class BandManager: NSObject {
         switch cmd.type {
         case XiaomiAuthCmd.cmdType:
             handleAuthCommand(subtype: cmd.subtype, protoBytes: protoBytes)
-        case XiaomiSystemCmd.cmdType where [XiaomiSystemCmd.miscSettingGet, XiaomiSystemCmd.vibrationGet,
+        case XiaomiSystemCmd.cmdType where [XiaomiSystemCmd.vibrationGet,
                                             XiaomiSystemCmd.vibrationSetPreset].contains(cmd.subtype):
             onSettingsCommand?(cmd)
         case XiaomiSystemCmd.cmdType:

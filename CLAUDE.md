@@ -495,7 +495,7 @@ Current version: **1.2.0** — see `CHANGELOG.md` for the full history. Next pha
 7. The Sleep & trends page — whether sleep from several sources counts each minute only once (the iPhone writes `asleepUnspecified` overlapping the band's night) and whether nights land on the right day with the 18:00 cutoff.
 8. The Reminders screen — the `maxReminders` the Mi Band 10 reports (the `Reminders: N of max M` line in the log), whether it truncates titles over 20 characters, and whether the monthly/yearly/weekly repeat modes fire as expected. And whether a daily reminder created with a time still to come today fires today and then every day, and how many times fit in the slots. And that the first sync on this build clears the duplicated iPhone reminders once, that a later sync retries a delete the band didn't take, and that editing a reminder replaces it without a duplicate.
 
-9. Band settings › Vibration — whether the band answers subtype 46 with a type mapping (`Vibration from band ←` in the log) and whether a preset set with subtype 47 sticks (the re-read shows it, and an alert buzzes with the new pattern). And what the misc-setting probe returns (`Misc setting reply ←` for settings 1 and 2), to tell whether "only when locked" / "only when worn" can be read and then set.
+9. Band settings › Vibration — whether the band answers subtype 46 with a type mapping (`Vibration from band ←` in the log) and whether a preset set with subtype 47 sticks (the re-read shows it, and an alert buzzes with the new pattern).
 
 Home Assistant was cut from the roadmap; outside the Workouts and Sleep & trends pages, the UI stays without health history or charts by decision (ADR 0005, which supersedes 0001, 0006, 0009 and 0010).
 

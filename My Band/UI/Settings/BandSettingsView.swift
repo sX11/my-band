@@ -173,10 +173,10 @@ struct BandSettingsView: View {
     // MARK: - Vibration
 
     // The band's VibrationNotificationType ids, from the proto's annotations; 2 and 8 are both
-    // marked "events" upstream and unconfirmed.
+    // marked "events" upstream, unconfirmed which is which, so both keep their id in the label.
     private static let vibrationTypes: [(id: UInt32, title: String)] = [
         (1, "Calls"), (6, "Messages"), (4, "App notifications"), (3, "Alarms"),
-        (2, "Events"), (8, "Schedule"), (5, "Stand-up reminder"), (7, "Goal reached"),
+        (2, "Events (type 2)"), (8, "Events (type 8)"), (5, "Stand-up reminder"), (7, "Goal reached"),
     ]
 
     @ViewBuilder private var vibrationSection: some View {
@@ -186,7 +186,7 @@ struct BandSettingsView: View {
                         id: \.id) { type in
                     let current = settings.vibrationPreset(for: type.id) ?? 0
                     Picker(type.title, selection: Binding(
-                        get: { current },
+                        get: { settings.vibrationPreset(for: type.id) ?? 0 },
                         set: { settings.setVibrationPreset($0, for: type.id) })) {
                         ForEach(Self.patternChoices(v, current: current), id: \.id) {
                             Text($0.name).tag($0.id)

@@ -62,11 +62,6 @@ final class BandSettingsService {
         }
         send(XiaomiProto.screenOnNotificationsGetCommand())
         send(XiaomiProto.vibrationPatternsGetCommand())
-        // Read-only probe: neither GadgetBridge nor this app knows which reply field carries the
-        // misc notification settings (only when locked / only when worn), so the replies are logged.
-        for setting: UInt32 in [1, 2] {
-            send(XiaomiProto.miscSettingGetCommand(setting: setting))
-        }
     }
 
     // MARK: - Heart rate
@@ -264,8 +259,6 @@ final class BandSettingsService {
                                               && !cmd.system.vibrationPatterns.notificationType.isEmpty:
             vibration = cmd.system.vibrationPatterns
             log.info("Vibration from band ← \(cmd.system.vibrationPatterns.textFormatString(), privacy: .public)")
-        case XiaomiSystemCmd.miscSettingGet:
-            log.info("Misc setting reply ← \(cmd.textFormatString(), privacy: .public)")
         default:
             logAck(cmd)
         }
