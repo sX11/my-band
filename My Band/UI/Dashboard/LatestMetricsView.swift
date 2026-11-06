@@ -3,15 +3,15 @@ import SwiftData
 
 // MARK: - LatestMetricsView
 //
-// The newest value of every health reading the app has from the band: the live one-shot from
-// TodayActivityService, the last sync's snapshot (LatestMetricsStore), the last night from SwiftData
-// and the scale's last weighing. Latest values only — trends and history belong to Apple Health.
+// The Health sheet: the newest value of every health reading the app has from the band (the live
+// one-shot from TodayActivityService, the last sync's snapshot in LatestMetricsStore, the last night
+// from SwiftData), height and weight to edit, and what the syncs sent to Apple Health. Latest values
+// only — trends and history belong to Apple Health.
 
 struct LatestMetricsView: View {
 
     @Environment(TodayActivityService.self) private var today
     @Environment(LatestMetricsStore.self) private var store
-    @Environment(ScaleManager.self) private var scale
     @Environment(\.dismiss) private var dismiss
 
     @Query private var recentSleep: [SleepSession]
@@ -68,7 +68,8 @@ struct LatestMetricsView: View {
                     summarySection(now: context.date)
                     readingsSection(now: context.date)
                     sleepSection
-                    bodySection(now: context.date)
+                    BodySection(now: context.date)
+                    HealthSyncSections(now: context.date)
                     Section {
                     } footer: {
                         Text(footer(now: context.date)).font(.mbFootnote).foregroundStyle(MB.textTertiary)
@@ -152,16 +153,6 @@ struct LatestMetricsView: View {
         }
     }
 
-    @ViewBuilder private func bodySection(now: Date) -> some View {
-        if let kg = scale.lastWeightKg {
-            Section("Body") {
-                row("Weight", kg.formatted(.number.precision(.fractionLength(1)).locale(MBFormat.locale)) + " kg",
-                    detail: scale.lastWeightDate.map { MBFormat.ago($0, now: now) })
-            }
-            .listRowBackground(MB.surfaceCard)
-        }
-    }
-
     private func row(_ label: String, _ value: String, detail: String? = nil) -> some View {
         HStack(alignment: .firstTextBaseline) {
             Text(label).font(.mbBody).foregroundStyle(MB.textPrimary)
@@ -181,7 +172,7 @@ struct LatestMetricsView: View {
         }
         // The snapshot's own time: it is saved as files arrive, so a sync that fails later still moved it.
         let updated = store.updatedAt.map { "Readings updated \(MBFormat.ago($0, now: now))." } ?? ""
-        return "\(updated) Apple Health keeps the full history.".trimmingCharacters(in: .whitespaces)
+        return "\(updated) Apple Health keeps the full history; a resent sample replaces the one it has, so it isn't counted twice.".trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: Formatting

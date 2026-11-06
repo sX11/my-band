@@ -224,6 +224,8 @@ enum XiaomiSystemCmd {
     static let deviceInfo:     UInt32 = 2    // CMD_DEVICE_INFO
     static let clock:          UInt32 = 3    // CMD_CLOCK (set time)
     static let language:       UInt32 = 6    // CMD_LANGUAGE (system.language.code = "pt_br")
+    static let vibrationGet:   UInt32 = 46   // vibration patterns: type → preset mapping + pattern ids
+    static let vibrationSetPreset: UInt32 = 47 // system.vibrationSetPreset; the band acks on the same subtype
     static let findPhone:      UInt32 = 17   // CMD_FIND_PHONE (band → app: ring the phone)
     static let deviceStateGet: UInt32 = 78   // CMD_DEVICE_STATE_GET
 }

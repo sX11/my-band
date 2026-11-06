@@ -11,3 +11,7 @@ The live stream cannot supply these: it carries only steps, calories and heart r
 What 0005 keeps: Apple Health stays the only place health data is stored as history and explored. The snapshot has no history, and the sheet has no charts or trends.
 
 Rejected: reading the latest values back from HealthKit (0005's reasons still hold — read authorization for every type, and it would show iPhone data as the band's). Also rejected: keeping the snapshot in memory only. It would empty on every launch until a sync ran, and a headless background sync would fill it where no one sees it.
+
+## Addendum (2026-11-05): one Health tile and sheet
+
+The owner merged the Apple Health tile (the sync log) into this one. The Dashboard shows a single full-width Health tile: the latest heart rate, the last sync's age and sample count, and the readings' foot lines. Its sheet keeps the sections above and adds a Body section, where height and weight are edited and written to Apple Health (the Profile sheet is gone), and ends with the sync log. The snapshot rules here are unchanged: no history, no charts. The weight shown is the scale's last weighing or, when there is none in memory, the newest weight read back from Apple Health — a single value to edit, not a history.

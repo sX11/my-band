@@ -1032,6 +1032,16 @@ final class HealthKitManager {
     // user's height is available in Apple Health (the scale only measures weight). Sync identifiers
     // key off the reading timestamp so a re-broadcast of the same weighing collapses to one sample.
 
+    /// BMI on its own, for a height change when the weight on record isn't one of the scale's weighings.
+    @discardableResult
+    func writeBodyMassIndex(weightKg: Double, heightMeters: Double, date: Date = Date()) async throws -> Int {
+        guard (2...500).contains(weightKg), heightMeters > 0.5 else { return 0 }
+        let key = Int(date.timeIntervalSince1970)
+        let bmi = weightKg / (heightMeters * heightMeters)
+        return try await save([quantity(bodyMassIndex, .count(), bmi, start: date, end: date, id: "mb-bmi-\(key)")],
+                              tallied: false)
+    }
+
     @discardableResult
     func writeBodyMass(_ kg: Double, date: Date, heightMeters: Double? = nil) async throws -> Int {
         guard (2...500).contains(kg) else { return 0 }   // reject implausible readings
@@ -1064,7 +1074,7 @@ final class HealthKitManager {
 
     /// Most recent body-mass sample from Apple Health (the BLE scale keeps it fresh), in kg.
     /// Feeds the MET math (physical effort, average workout METs); nil when none/denied.
-    private func latestBodyMassKg() async throws -> Double? {
+    func latestBodyMassKg() async throws -> Double? {
         try await latestQuantity(of: bodyMass, unit: .gramUnit(with: .kilo))
     }
 

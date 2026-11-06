@@ -2,9 +2,9 @@ import SwiftUI
 
 // MARK: - DashboardView
 //
-// Live band status, battery, last Apple Health sync and the sync action, the band's alarms and
-// settings, today's activity read live from the band (ADR 0005), the latest health readings from
-// the last sync (ADR 0006), and the workout running on the band (ADR 0008). Past workouts are
+// Live band status, battery and the sync action, the band's alarms and settings, today's activity
+// read live from the band (ADR 0005), the Health tile — latest readings from the last sync and when
+// it ran (ADR 0006) — and the workout running on the band (ADR 0008). Past workouts are
 // the next page over (`WorkoutsView`, ADR 0009).
 
 struct DashboardView: View {
@@ -22,12 +22,9 @@ struct DashboardView: View {
     @State private var syncing = false
     @State private var resultText: String?
     @State private var resultIsError = false
-    @State private var showCustomize = false
-    @State private var showProfile = false
     @State private var showAlarms = false
     @State private var showSettings = false
     @State private var showMetrics = false
-    @State private var showHealthSync = false
     @State private var showWorkout = false
 
     private var connected: Bool { band.connectionState.isConnected }
@@ -52,14 +49,6 @@ struct DashboardView: View {
                     }
                     metrics
                     syncSection
-                    MBButton(title: "Customize", variant: .secondary, size: .lg,
-                             icon: "square.grid.2x2", block: true, disabled: !connected) {
-                        showCustomize = true
-                    }
-                    MBButton(title: "Profile", variant: .secondary, size: .lg,
-                             icon: "person.text.rectangle", block: true) {
-                        showProfile = true
-                    }
                     Spacer(minLength: MB.Space.x6)
                     MBButton(title: "Forget band", variant: .ghost, size: .md, block: true,
                              action: onForget)
@@ -74,12 +63,9 @@ struct DashboardView: View {
                 today.refresh()
             }
         }
-        .sheet(isPresented: $showCustomize) { CustomizeView() }
-        .sheet(isPresented: $showProfile) { ProfileView() }
         .sheet(isPresented: $showAlarms) { AlarmsView() }
         .sheet(isPresented: $showSettings) { BandSettingsView() }
         .sheet(isPresented: $showMetrics) { LatestMetricsView(deviceID: syncer.currentDevice?.id) }
-        .sheet(isPresented: $showHealthSync) { HealthSyncView() }
         .sheet(isPresented: $showWorkout) { WorkoutLiveView() }
     }
 
@@ -120,11 +106,7 @@ struct DashboardView: View {
                     todayTile(now: context.date)
                 }
                 .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: MB.Space.x3) {
-                    healthSyncTile(now: context.date)
-                    metricsTile(now: context.date)
-                }
-                .fixedSize(horizontal: false, vertical: true)
+                healthTile(now: context.date)
             }
         }
     }
@@ -185,12 +167,12 @@ struct DashboardView: View {
         return latest.metrics.standingHours
     }
 
-    private func metricsTile(now: Date) -> some View {
+    private func healthTile(now: Date) -> some View {
         let m = latest.metrics
         return Button { showMetrics = true } label: {
             MBMetricTile(
-                icon: "waveform.path.ecg", tint: MB.hr, tintSoft: MB.hrSoft,
-                label: "Latest metrics",
+                icon: "heart.fill", tint: MB.hr, tintSoft: MB.hrSoft,
+                label: "Health",
                 value: m.heartRate.map { String(Int($0.value)) } ?? "—",
                 unit: m.heartRate != nil ? "bpm" : nil,
                 foot: metricsFoot(m, now: now)
@@ -200,8 +182,14 @@ struct DashboardView: View {
     }
 
     private func metricsFoot(_ m: LatestMetrics, now: Date) -> String {
-        guard !m.isEmpty else { return "Sync to see readings" }
         var lines: [String] = []
+        if let at = syncer.lastHealthSync {
+            let synced = "Synced \(MBFormat.ago(at, now: now))"
+            lines.append(syncLog.last.map { "\(synced) · \(healthSyncFoot($0))" } ?? synced)
+        } else {
+            lines.append("Never synced")
+        }
+        guard !m.isEmpty else { return (lines + ["Sync to see readings"]).joined(separator: "\n") }
         if let r = m.spo2 { lines.append("SpO₂ \(Int(r.value))%") }
         if let r = m.stress { lines.append("Stress \(Int(r.value))") }
         if let v = m.restingHR { lines.append("Resting \(v) bpm") }
@@ -236,18 +224,6 @@ struct DashboardView: View {
     private func healthSyncFoot(_ r: HealthSyncReport) -> String {
         let sent = "\(MBFormat.number(r.total)) samples sent"
         return r.failed ? "\(sent) · sync failed" : sent
-    }
-
-    private func healthSyncTile(now: Date) -> some View {
-        Button { showHealthSync = true } label: {
-            MBMetricTile(
-                icon: "heart.fill", tint: MB.hr, tintSoft: MB.hrSoft,
-                label: "Apple Health",
-                value: lastSyncText(now: now),
-                foot: syncLog.last.map(healthSyncFoot) ?? "last sync"
-            )
-        }
-        .buttonStyle(.plain)
     }
 
     private func alarmFoot(_ next: (alarm: AlarmService.Alarm, fires: Date)?, now: Date) -> String {
@@ -333,11 +309,6 @@ struct DashboardView: View {
     }
 
     // MARK: Derived
-
-    private func lastSyncText(now: Date) -> String {
-        guard let date = syncer.lastHealthSync else { return "Never" }
-        return MBFormat.ago(date, now: now, justNow: "Just now")
-    }
 
     private func lastChargeText(now: Date) -> String? {
         guard let date = band.batteryLastCharged else { return nil }
