@@ -210,6 +210,7 @@ final class BackgroundSyncManager {
     /// Foreground-aware sync. Concurrent callers share a single run.
     /// `disconnectWhenDone`: nil = disconnect only if we opened the link (live foreground links stay
     /// up); true/false force the behaviour (background wakes pass true to free the radio).
+    /// A caller that coalesces into a run in flight gets that run's `disconnectWhenDone`, not its own.
     @discardableResult
     func syncNow(disconnectWhenDone: Bool? = nil, retryStaleLink: Bool = true) async throws -> BandSyncer.HealthSyncOutcome {
         if let inFlight {
@@ -224,9 +225,31 @@ final class BackgroundSyncManager {
         return try await task.value
     }
 
+    /// Shortcuts and Siri give up on a slow intent; past this the intent answers from local data
+    /// while the sync it started runs on. Not measured against the system's own limit.
+    nonisolated static let intentDeadline: Duration = .seconds(15)
+
+    /// Thrown by `value(of:within:)` when the sync outlives the deadline; the sync is not cancelled.
+    struct StillSyncing: Error {}
+
+    /// Starts (or joins) a sync for an intent. Unstructured, so it survives the intent answering early.
+    func startIntentSync(disconnectWhenDone: Bool? = nil) -> Task<BandSyncer.HealthSyncOutcome, Error> {
+        Task { @MainActor in try await self.syncNow(disconnectWhenDone: disconnectWhenDone, retryStaleLink: false) }
+    }
+
+    static func value(of sync: Task<BandSyncer.HealthSyncOutcome, Error>,
+                      within deadline: Duration = intentDeadline) async throws -> BandSyncer.HealthSyncOutcome {
+        try await withThrowingTaskGroup(of: BandSyncer.HealthSyncOutcome?.self) { group in
+            group.addTask { try await sync.value }
+            group.addTask { try await Task.sleep(for: deadline); return nil }
+            defer { group.cancelAll() }
+            guard let first = try await group.next(), let outcome = first else { throw StillSyncing() }
+            return outcome
+        }
+    }
+
     private func performSync(disconnectWhenDone: Bool?) async throws -> BandSyncer.HealthSyncOutcome {
-        // On a cold launch triggered by a task, the UI .onAppear may not have wired deps yet.
-        try await awaitDependencies()
+        ensureDependencies()
         guard let manager, let syncer, let id = syncer.currentDevice?.peripheralIdentifier else {
             throw SyncError.noDeviceRecord
         }
@@ -304,13 +327,11 @@ final class BackgroundSyncManager {
         }
     }
 
-    /// Waits up to a few seconds for configure() to run on a cold, task-triggered launch.
-    private func awaitDependencies() async throws {
-        for _ in 0..<20 {
-            if manager != nil, syncer != nil { return }
-            try await Task.sleep(for: .milliseconds(250))
-        }
-        throw SyncError.noDeviceRecord
+    /// A cold launch for a BGTask or an intent may reach here before any launch path has wired the
+    /// services; bootstrap is idempotent and calls configure() synchronously, so no waiting is needed.
+    private func ensureDependencies() {
+        guard manager == nil || syncer == nil else { return }
+        AppServices.shared.bootstrap(container: My_BandApp.sharedModelContainer)
     }
 
     // MARK: - Background task assertion

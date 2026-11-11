@@ -18,9 +18,13 @@ struct SyncBandIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
+        AppServices.shared.bootstrap(container: My_BandApp.sharedModelContainer)
         do {
-            let outcome = try await BackgroundSyncManager.shared.syncNow(retryStaleLink: false)
+            let sync = BackgroundSyncManager.shared.startIntentSync()
+            let outcome = try await BackgroundSyncManager.value(of: sync)
             return .result(dialog: IntentDialog(stringLiteral: Self.summary(outcome)))
+        } catch is BackgroundSyncManager.StillSyncing {
+            return .result(dialog: "Still syncing with the band. The data will reach Apple Health shortly.")
         } catch SyncError.noDeviceRecord {
             return .result(dialog: "No band paired. Open My Band to set it up.")
         } catch SyncError.notConnected, SyncError.timeout {

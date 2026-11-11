@@ -125,7 +125,7 @@ final class BandManager: NSObject {
     // Callers awaiting a fully-authenticated link (e.g. the background sync task). Resumed on
     // auth success, or thrown on auth failure / disconnect / timeout. Separate from
     // authContinuation, which tracks a single in-flight authenticate() call.
-    private var connectWaiters: [CheckedContinuation<Void, Error>] = []
+    private var connectWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
 
     // Per-session sequence counter (single counter for all SPP frames sent)
     private var seqNum: UInt8 = 0
@@ -402,15 +402,7 @@ final class BandManager: NSObject {
             return
         }
 
-        let timeoutTask = Task { [weak self] in
-            try? await Task.sleep(for: timeout)
-            guard !Task.isCancelled else { return }
-            self?.resumeConnectWaiters(throwing: SyncError.timeout)
-        }
-        defer { timeoutTask.cancel() }
-
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            connectWaiters.append(c)
+        try await awaitAuthenticated(timeout: timeout) {
             reconnectToKnownDevice(identifier: identifier)
         }
     }
@@ -423,20 +415,28 @@ final class BandManager: NSObject {
         guard connectionState.isAuthInProgress || connectionState == .sessionConfig || isConnectInProgress else {
             throw SyncError.notConnected
         }
+        try await awaitAuthenticated(timeout: timeout) {}
+    }
+
+    /// Each waiter's timeout fails only that waiter: callers wait with different budgets, and a short
+    /// one must not cut a longer one short.
+    private func awaitAuthenticated(timeout: Duration, then start: () -> Void) async throws {
+        let id = UUID()
         let timeoutTask = Task { [weak self] in
             try? await Task.sleep(for: timeout)
             guard !Task.isCancelled else { return }
-            self?.resumeConnectWaiters(throwing: SyncError.timeout)
+            self?.connectWaiters.removeValue(forKey: id)?.resume(throwing: SyncError.timeout)
         }
         defer { timeoutTask.cancel() }
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            connectWaiters.append(c)
+            connectWaiters[id] = c
+            start()
         }
     }
 
     private func resumeConnectWaiters(throwing error: Error?) {
         guard !connectWaiters.isEmpty else { return }
-        let waiters = connectWaiters
+        let waiters = connectWaiters.values
         connectWaiters.removeAll()
         for c in waiters {
             if let error { c.resume(throwing: error) } else { c.resume() }

@@ -45,25 +45,43 @@ struct CheckBandBatteryIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<Int?> {
+        AppServices.shared.bootstrap(container: My_BandApp.sharedModelContainer)
         let band = AppServices.shared.bandManager
-        let hadLiveLink = band.connectionState.isConnected
+        // Mid-handshake counts as live, as in performSync: dropping it would kill a link (or a
+        // pairing) this intent didn't open.
+        let hadLiveLink = band.connectionState.isConnected || band.connectionState.isAuthInProgress
 
         // The link must survive the sync: the battery request below depends on it. With the default
         // (`disconnectWhenDone: nil`) the sync dropped the connection it had opened itself before the
         // CMD_BATTERY, so the intent answered with the stale in-memory level (or nil) and the link
         // dropped in the middle of the sync's final ACKs — which the band then re-offered on the next
         // connection. We release the radio only at the end, and only if we were the ones who opened it.
-        defer { if !hadLiveLink { band.disconnect(userInitiated: false) } }
-
+        //
         // Best-effort: if the band is out of range, we still answer with the last known level
         // instead of failing the shortcut (and therefore the whole automation).
+        let sync = BackgroundSyncManager.shared.startIntentSync(disconnectWhenDone: false)
+        var stillSyncing = false
+        defer { if !hadLiveLink && !stillSyncing { band.disconnect(userInitiated: false) } }
         do {
-            _ = try await BackgroundSyncManager.shared.syncNow(disconnectWhenDone: false, retryStaleLink: false)
+            _ = try await BackgroundSyncManager.value(of: sync)
+        } catch is BackgroundSyncManager.StillSyncing {
+            stillSyncing = true
         } catch {
             Self.log.error("Battery intent sync failed: \(error.localizedDescription)")
         }
 
-        await band.refreshBattery(timeout: Self.batteryRefreshWait)
+        if stillSyncing {
+            // Past the deadline: answer with the last known level, and release the link only once the
+            // sync is done with it — a CMD_BATTERY now would interleave with the fetch.
+            if !hadLiveLink {
+                Task { @MainActor in
+                    _ = try? await sync.value
+                    band.disconnect(userInitiated: false)
+                }
+            }
+        } else {
+            await band.refreshBattery(timeout: Self.batteryRefreshWait)
+        }
 
         guard let level = band.batteryLevel else { return .result(value: nil) }
 
