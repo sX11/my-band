@@ -327,6 +327,10 @@ final class BandSyncer {
             await weatherSync.pushWeather()
         }
 
+        // Last, so FETCH_TODAY isn't held behind a rewrite of every stored night.
+        dropExpiredRawDataDaily(context: context)
+        await reparseStoredSleepIfParserChanged(context: context)
+
         return outcome
     }
 
@@ -471,6 +475,7 @@ final class BandSyncer {
         var detailMinutes: [ActivityMinuteSample] = []
 
         var sleepIds:   [Data] = []
+        var heldOpenSleepIds = Set<Data>()
         var manualIds:  [Data] = []
         var workoutIds: [Data] = []
         var gpsFileIds: [Int: Data] = [:]
@@ -517,27 +522,27 @@ final class BandSyncer {
                     }
                     workoutIds.append(fileId)
                 } else if meta.isSleep {
-                    let parsed = meta.isSleepStages
-                        ? SleepStagesParser.parse(fileData, meta: meta)
-                        : SleepDetailsParser.parse(fileData, meta: meta)
+                    let parsed = Self.parseSleepFile(fileData, meta: meta)
                     let phaseCount = parsed.sessions.reduce(0) { $0 + $1.phases.count }
                     log.info("Sleep file \(fileId.hexString) (subtype=\(meta.subtype) v\(meta.version)): \(parsed.sessions.count) session(s), \(phaseCount) phase(s), \(parsed.heartRates.count) HR, \(parsed.spo2.count) SpO₂")
                     // A corrupt header never reaches the local store either: GetSleepStateIntent and
                     // the Health sheet read it, not just Apple Health.
-                    let validDates = HealthKitManager.validDateRange()
-                    let sessions = parsed.sessions.filter { validDates.contains($0.startDate) && validDates.contains($0.endDate) }
+                    let (sessions, vitals) = parsed.inRange(HealthKitManager.validDateRange())
+                    if Self.shouldHoldOpenSleepFile(parsed, inRange: sessions) {
+                        log.info("Sleep file \(fileId.hexString) is a night the band still has open with nothing to write yet — left un-ACKed so it comes back once closed")
+                        heldOpenSleepIds.insert(fileId)
+                        latestMetrics?.update { $0.record(vitals) }
+                        return
+                    }
                     for session in sessions {
                         // Always (re)write to HealthKit — its sync-identifier dedup makes this
                         // idempotent, so data deleted from Apple Health is restored on re-sync.
-                        // SwiftData insertion is still gated to avoid duplicate local records.
-                        _ = persistIfNew(session, context)
+                        // SwiftData keeps one record per distinct file.
+                        storeReport(session, raw: fileData, awakeFlag: parsed.awakeFlag, fetchedAt: Date(), context)
                         sleepToWrite.append(session)
                     }
                     // HR/SpO₂ recorded during sleep — written within the sleep window so
                     // Apple Health's sleep "Comparisons" tab can correlate them.
-                    let vitals = (parsed.heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
-                        + parsed.spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) })
-                        .filter { validDates.contains($0.date) }
                     sleepVitals.append((sessions.map(\.endDate).max() ?? .distantPast, vitals))
                     latestMetrics?.update { $0.record(vitals) }
                     sleepIds.append(fileId)
@@ -657,9 +662,10 @@ final class BandSyncer {
                     } else {
                         await flushSleep(clearExisting: true)
                         if !ackedSleepIds.contains(delivered.id) {
-                            // Written but held (a Health type off, a failed local save): the band
-                            // stays stuck on it, so skip to the next file instead of retrying.
-                            if writtenSleepIds.contains(delivered.id) {
+                            // Written but held (a Health type off, a failed local save), or an open
+                            // night with nothing to write yet: the band stays stuck on it, so skip
+                            // to the next file instead of retrying.
+                            if writtenSleepIds.contains(delivered.id) || heldOpenSleepIds.contains(delivered.id) {
                                 log.warning("Asked for \(fileId.hexString), band is stuck on sleep file \(delivered.id.hexString), written but held un-ACKed — skipping to the next file")
                                 continue fetching
                             }
@@ -809,18 +815,183 @@ final class BandSyncer {
     /// whatever the last sync happened to capture (the band has no "fell asleep"/"woke up" push).
     func mostRecentSleepSession() -> SleepSession? {
         guard let context = modelContext else { return nil }
-        var descriptor = FetchDescriptor<SleepSession>(sortBy: [SortDescriptor(\.startDate, order: .reverse)])
+        return Self.mostRecentSleepSession(in: context)
+    }
+
+    /// Ordered by end, not start: every report of a night shares its bedtime, so a start-ordered
+    /// fetch returned an arbitrary copy. A tie goes to the latest fetch. An end past the clock is a
+    /// misread header, and sorting first it would hide every real night.
+    static func mostRecentSleepSession(in context: ModelContext, now: Date = Date()) -> SleepSession? {
+        let latest = now.addingTimeInterval(SleepStateRule.clockSkewTolerance)
+        var descriptor = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.endDate <= latest },
+                                                       sortBy: [SortDescriptor(\.endDate, order: .reverse),
+                                                                SortDescriptor(\.fetchedAt, order: .reverse)])
         descriptor.fetchLimit = 1
         return try? context.fetch(descriptor).first
     }
 
-    private func persistIfNew(_ session: SleepSession, _ context: ModelContext) -> Bool {
+    // MARK: - Stored sleep reports
+
+    static func parseSleepFile(_ data: Data, meta: XiaomiActivityFileMeta) -> ParsedSleep {
+        meta.isSleepStages ? SleepStagesParser.parse(data, meta: meta) : SleepDetailsParser.parse(data, meta: meta)
+    }
+
+    /// An open night with nothing to write is held un-ACKed: an ACK makes the band delete it, and
+    /// the same file closed is the one that carries the nap.
+    static func shouldHoldOpenSleepFile(_ parsed: ParsedSleep, inRange sessions: [SleepSession]) -> Bool {
+        sessions.isEmpty && parsed.awakeFlag == 0
+    }
+
+    /// Inserts a new report, or refreshes the stored one with the same bytes: its phases take the
+    /// current parse, and its fetch time moves while its end doesn't — the night stopped growing,
+    /// which is how the sleep intent tells the user woke up.
+    func storeReport(_ session: SleepSession, raw: Data, awakeFlag: Int?, fetchedAt: Date,
+                     _ context: ModelContext) {
         let hash = session.rawDataHash
-        let dup = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.rawDataHash == hash })
-        guard (try? context.fetch(dup))?.isEmpty ?? true else { return false }
-        session.device = currentDevice
-        context.insert(session)
-        return true
+        let sameHash = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.rawDataHash == hash })
+        // The hash is 64-bit, so a stored length that differs is a collision, not the same file.
+        // A pruned report has no bytes left to compare and is taken as the same.
+        let sameBytes = ((try? context.fetch(sameHash)) ?? []).first { ($0.rawData?.count ?? raw.count) == raw.count }
+        let report: SleepSession
+        if let existing = sameBytes {
+            existing.startDate = session.startDate
+            existing.endDate = session.endDate
+            existing.phases = session.phases
+            report = existing
+        } else {
+            session.device = currentDevice
+            context.insert(session)
+            report = session
+        }
+        report.awakeFlag = awakeFlag
+        report.fetchedAt = fetchedAt
+        if report.rawData == nil { report.rawData = raw }
+        Self.pruneRawData(around: report, in: context)
+    }
+
+    /// A long night is ~140 KB and every sync of it stores another report, so only the report
+    /// reaching furthest keeps its bytes. Earlier cuts of the same file share its bedtime and
+    /// subtype; an overlapping report without both is another file, whose bytes nothing else holds.
+    static func pruneRawData(around report: SleepSession, in context: ModelContext) {
+        guard let subtype = rawSubtype(report) else { return }
+        let start = report.startDate
+        let sameBedtime = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.startDate == start })
+        // Filtered here, not in the predicate: an external-storage attribute may live outside the row.
+        let holders = ((try? context.fetch(sameBedtime)) ?? []).filter { rawSubtype($0) == subtype }
+        guard let keep = SleepSession.furthest(holders) else { return }
+        for other in holders where other !== keep { other.rawData = nil }
+    }
+
+    private static func rawSubtype(_ report: SleepSession) -> Int? {
+        report.rawData.flatMap { XiaomiActivityFileMeta(Data($0.prefix(7)))?.subtype }
+    }
+
+    static let rawSleepRetention: TimeInterval = 90 * 86_400
+    private static let rawSleepExpiryKey = "rawSleepExpiryLastRun"
+
+    static func dropExpiredRawData(in context: ModelContext, now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-rawSleepRetention)
+        let old = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.endDate < cutoff })
+        for report in (try? context.fetch(old)) ?? [] where report.rawData != nil { report.rawData = nil }
+    }
+
+    /// Reading each old report's external bytes costs more than a background wake should spend.
+    private func dropExpiredRawDataDaily(context: ModelContext, now: Date = Date()) {
+        #if canImport(UIKit)
+        guard UIApplication.shared.applicationState != .background else { return }
+        #endif
+        if let last = UserDefaults.standard.object(forKey: Self.rawSleepExpiryKey) as? Date,
+           now.timeIntervalSince(last) < 86_400 { return }
+        Self.dropExpiredRawData(in: context, now: now)
+        try? context.save()
+        UserDefaults.standard.set(now, forKey: Self.rawSleepExpiryKey)
+    }
+
+    // MARK: - Re-reading stored sleep files
+    //
+    // Bump when SleepDetailsParser/SleepStagesParser read the same bytes differently: the next
+    // foreground, unlocked sync re-parses every stored file and rewrites its night in Apple Health.
+    // Nights stored before raw files were kept have nothing to re-read and are left as they are.
+    static let sleepParserRevision = 1
+    private static let sleepParserRevisionKey = "sleepParserRevisionApplied"
+
+    private func reparseStoredSleepIfParserChanged(context: ModelContext) async {
+        guard UserDefaults.standard.integer(forKey: Self.sleepParserRevisionKey) != Self.sleepParserRevision,
+              Self.healthReadable else { return }
+        #if canImport(UIKit)
+        guard UIApplication.shared.applicationState != .background else { return }
+        #endif
+        // Every night would be held back for permission; retried once sleep is switched back on.
+        guard HealthKitManager.shared.canShareSleep else {
+            log.notice("Sleep re-parse (revision \(Self.sleepParserRevision)) skipped — sleep is switched off for My Band in Health")
+            return
+        }
+        let result = await reparseStoredSleep(context)
+        try? context.save()
+        guard result.failed == 0 else {
+            log.error("Sleep re-parse (revision \(Self.sleepParserRevision)): \(result.failed) of \(result.nights) night(s) failed, retrying next sync")
+            return
+        }
+        log.notice("Sleep re-parse (revision \(Self.sleepParserRevision)): \(result.nights) night(s) rewritten")
+        UserDefaults.standard.set(Self.sleepParserRevision, forKey: Self.sleepParserRevisionKey)
+    }
+
+    /// Each night is written on its own, so one that fails is retried without holding back the rest.
+    private func reparseStoredSleep(_ context: ModelContext) async -> (nights: Int, failed: Int) {
+        let all = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
+        let validDates = HealthKitManager.validDateRange()
+        var vitals: [ObjectIdentifier: [ActivityMinuteSample]] = [:]
+        var oldWindows: [ObjectIdentifier: (start: Date, end: Date)] = [:]
+        for report in all {
+            oldWindows[ObjectIdentifier(report)] = (report.startDate, report.endDate)
+            guard let raw = report.rawData, let meta = XiaomiActivityFileMeta(Data(raw.prefix(7))), meta.isSleep else { continue }
+            let parsed = Self.parseSleepFile(raw, meta: meta)
+            let fresh = parsed.inRange(validDates)
+            vitals[ObjectIdentifier(report)] = fresh.vitals
+            // A file the current parser makes no valid night of keeps its old record.
+            guard let session = fresh.sessions.first else { continue }
+            report.startDate = session.startDate
+            report.endDate = session.endDate
+            report.phases = session.phases
+            report.awakeFlag = parsed.awakeFlag
+        }
+        let nights = HealthKitManager.groupOverlapping(all).filter { night in
+            night.contains { vitals[ObjectIdentifier($0)] != nil }
+        }
+        var failed = 0
+        // All windows, old and new, are cleared before any night is written: a night's old window
+        // can reach into a neighbour's new one, and clearing it later would erase that rewrite.
+        var uncleared = Set<Int>()
+        for (index, night) in nights.enumerated() {
+            let starts = night.flatMap { [$0.startDate, oldWindows[ObjectIdentifier($0)]?.start].compactMap { $0 } }
+            let ends = night.flatMap { [$0.endDate, oldWindows[ObjectIdentifier($0)]?.end].compactMap { $0 } }
+            guard let start = starts.min(), let end = ends.max(), end > start else { continue }
+            do {
+                try await HealthKitManager.shared.clearSleep(overlapping: start, to: end)
+            } catch {
+                failed += 1
+                uncleared.insert(index)
+                log.error("Sleep re-parse: clearing the night from \(start.description) failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        for (index, night) in nights.enumerated() where !uncleared.contains(index) {
+            let nightVitals = night.flatMap { vitals[ObjectIdentifier($0)] ?? [] }
+            let from = night.map(\.startDate).min()?.description ?? "?"
+            _ = HealthKitManager.shared.takeSkippedForPermission()
+            do {
+                _ = try await HealthKitManager.shared.writeSleep(night)
+                if !nightVitals.isEmpty { _ = try await HealthKitManager.shared.writeMinuteSamples(nightVitals) }
+            } catch {
+                failed += 1
+                log.error("Sleep re-parse: night from \(from) failed: \(error.localizedDescription, privacy: .public)")
+                continue
+            }
+            if HealthKitManager.shared.takeSkippedForPermission() {
+                failed += 1
+                log.warning("Sleep re-parse: night from \(from) dropped samples for permission — retrying next sync")
+            }
+        }
+        return (nights.count, failed)
     }
 
     private func persistActivityDay(_ summary: DailySummary, _ context: ModelContext) {
