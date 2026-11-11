@@ -183,7 +183,7 @@ enum XiaomiProto {
         command(type: XiaomiScheduleCmd.cmdType, subtype: XiaomiScheduleCmd.remindersGet) { _ in }
     }
 
-    /// CMD_REMINDERS_CREATE — adds one reminder. `repeatMode` 0=once; `repeatFlags` 64 = unset.
+    /// CMD_REMINDERS_CREATE — adds one reminder. `repeatMode` 0=once; see `reminderDetails` for `repeatFlags`.
     static func reminderCreateCommand(_ details: Xiaomi_ReminderDetails) -> Data {
         var schedule = Xiaomi_Schedule()
         schedule.createReminder = details
@@ -225,9 +225,11 @@ enum XiaomiProto {
         details.date        = d
         details.time        = t
         details.repeatMode  = repeatMode
-        // Weekly carries the weekday, Mon = 1 … Sun = 7, as GadgetBridge sends it; 64 is its "unset".
+        // Weekly carries the weekday as the alarms' bitmask (Mon = 1 … Sun = 64), not GadgetBridge's
+        // weekday number: the band fired a Saturday sent as 6 on Tuesday and Wednesday. Other modes
+        // send GadgetBridge's 64, which the band ignores there (daily reminders fire every day).
         details.repeatFlags = repeatMode == weeklyRepeatMode
-            ? UInt32((Calendar.current.component(.weekday, from: date) + 5) % 7 + 1)
+            ? AlarmService.dayBit(Calendar.current.component(.weekday, from: date))
             : 64
         details.title       = title
         return details

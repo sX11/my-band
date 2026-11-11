@@ -15,12 +15,15 @@ struct ReminderDetailsTests {
         #expect(ReminderService.Repeat(mode: 42) == .once)
     }
 
-    @Test func weeklyCarriesTheWeekdayMondayFirst() {
-        let monday = XiaomiProto.reminderDetails(date: date(5), title: "Gym", repeatMode: ReminderService.Repeat.weekly.mode)
-        let sunday = XiaomiProto.reminderDetails(date: date(11), title: "Gym", repeatMode: ReminderService.Repeat.weekly.mode)
+    @Test func weeklyCarriesTheWeekdayAsTheAlarmBitmask() {
+        let weekly = ReminderService.Repeat.weekly.mode
+        let monday = XiaomiProto.reminderDetails(date: date(5), title: "Gym", repeatMode: weekly)
+        let saturday = XiaomiProto.reminderDetails(date: date(10), title: "Gym", repeatMode: weekly)
+        let sunday = XiaomiProto.reminderDetails(date: date(11), title: "Gym", repeatMode: weekly)
         #expect(monday.repeatMode == 5)
         #expect(monday.repeatFlags == 1)
-        #expect(sunday.repeatFlags == 7)
+        #expect(saturday.repeatFlags == 32)
+        #expect(sunday.repeatFlags == 64)
     }
 
     @Test func otherRepeatsLeaveTheFlagsUnset() {

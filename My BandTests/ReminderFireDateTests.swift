@@ -124,6 +124,30 @@ struct ReminderFireDateTests {
         #expect(CalendarSyncService.reminderKey(echoed) == CalendarSyncService.reminderKey(pushed))
     }
 
+    @Test func repeatingReminderKeyIgnoresTheDateTheBandMovesOn() {
+        let weekly = ReminderService.Repeat.weekly.mode
+        let pushed = XiaomiProto.reminderDetails(date: date("2026-10-17 10:00"), title: "Душ", repeatMode: weekly)
+        let listed = XiaomiProto.reminderDetails(date: date("2026-10-24 10:00"), title: "Душ", repeatMode: weekly)
+        let otherDay = XiaomiProto.reminderDetails(date: date("2026-10-18 10:00"), title: "Душ", repeatMode: weekly)
+        let daily = ReminderService.Repeat.daily.mode
+        #expect(CalendarSyncService.reminderKey(listed) == CalendarSyncService.reminderKey(pushed))
+        #expect(CalendarSyncService.reminderKey(otherDay) != CalendarSyncService.reminderKey(pushed))
+        #expect(CalendarSyncService.reminderKey(XiaomiProto.reminderDetails(date: date("2026-10-17 16:00"), title: "капли", repeatMode: daily))
+            == CalendarSyncService.reminderKey(XiaomiProto.reminderDetails(date: date("2026-11-11 16:00"), title: "капли", repeatMode: daily)))
+    }
+
+    @Test func storedKeyGivesBackItsTitleInBothFormats() {
+        let weekly = XiaomiProto.reminderDetails(date: date("2026-10-17 10:00"), title: "a|b", repeatMode: ReminderService.Repeat.weekly.mode)
+        #expect(CalendarSyncService.title(ofKey: CalendarSyncService.reminderKey(weekly)) == "a|b")
+        #expect(CalendarSyncService.title(ofKey: "Душ|2026-10-17 10:0") == "Душ")
+    }
+
+    @Test func oneOffReminderKeyKeepsTheDate() {
+        let a = XiaomiProto.reminderDetails(date: date("2026-10-17 10:00"), title: "Call")
+        let b = XiaomiProto.reminderDetails(date: date("2026-10-18 10:00"), title: "Call")
+        #expect(CalendarSyncService.reminderKey(a) != CalendarSyncService.reminderKey(b))
+    }
+
     private func bandReminder(_ id: UInt32, _ title: String, _ at: String) -> Xiaomi_Reminder {
         var r = Xiaomi_Reminder()
         r.id = id

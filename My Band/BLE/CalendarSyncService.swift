@@ -27,7 +27,7 @@ final class CalendarSyncService {
     private let maxReminders = 20
     private static let createdReminderIDsKey = "myband.createdReminderIDs"
     private static let pushedRemindersKey = "myband.pushedReminders"
-    private static let titleCleanupDoneKey = "myband.reminderTitleCleanupDone"
+    private static let titleCleanupDoneKey = "myband.reminderTitleCleanupDone.2"
     static let pushCalendarKey = "myband.pushCalendar"
     static let pushRemindersKey = "myband.pushReminders"
 
@@ -147,7 +147,7 @@ final class CalendarSyncService {
 
         // Skip the delete+recreate churn when the upcoming set hasn't changed since the last push.
         // The version prefix makes the first sync on this build push, so the title cleanup below runs.
-        let sig = "2|" + signature(upcoming.map { "\($0.title)|\($0.fires.timeIntervalSince1970)|\($0.repeats.mode)" }
+        let sig = "3|" + signature(upcoming.map { "\($0.title)|\($0.fires.timeIntervalSince1970)|\($0.repeats.mode)" }
             .joined(separator: ";"))
         guard UserDefaults.standard.string(forKey: Self.lastRemindersKey) != sig else {
             log.debug("Reminders unchanged — skipping push")
@@ -163,14 +163,15 @@ final class CalendarSyncService {
 
         // Only this push's reminders are deleted: an id acked on a previous push, or one whose title
         // and time match what was pushed (its create-ack was missed, so its id was never known).
-        // Once per install, any reminder titled like an iPhone reminder being pushed too: copies
-        // pushed before ownership was kept are recognisable by nothing else. Only once, because a
-        // title alone also matches a reminder the band or another app created.
+        // Once per install, any reminder titled like one the last push sent too: copies pushed before
+        // repeating ones were keyed without their date are recognisable by nothing else, including
+        // those of iPhone reminders since completed. Only once, because a title alone also matches
+        // a reminder the band or another app created.
         // One added on the Reminders screen is never this push's, even with the same title and time.
         let previousIDs = Set((UserDefaults.standard.array(forKey: Self.createdReminderIDsKey) as? [Int] ?? []).map { UInt32($0) })
         let previousKeys = Set(UserDefaults.standard.stringArray(forKey: Self.pushedRemindersKey) ?? [])
         let titleCleanup = !UserDefaults.standard.bool(forKey: Self.titleCleanupDoneKey)
-        let pushedTitles = titleCleanup ? Set(upcoming.map(\.title)) : []
+        let pushedTitles = titleCleanup ? Set(previousKeys.map(Self.title(ofKey:))) : []
         let protected = reminders.protectedIDs
         let stale = onBand.reminder
             .filter { !protected.contains($0.id) }
@@ -250,8 +251,13 @@ final class CalendarSyncService {
         }
     }
 
-    /// Title and local wall time, the only fields the band echoes back that identify a reminder.
+    /// How a reminder is recognised on the band's list; see `ReminderService.key`.
     static func reminderKey(_ d: Xiaomi_ReminderDetails) -> String { ReminderService.key(d) }
+
+    /// The title a stored key starts with; the part after its last `|` never holds one.
+    static func title(ofKey key: String) -> String {
+        key.range(of: "|", options: .backwards).map { String(key[..<$0.lowerBound]) } ?? key
+    }
 
     /// Makes the next sync push the iPhone's reminders even if they haven't changed: one was
     /// deleted on the Reminders screen.
