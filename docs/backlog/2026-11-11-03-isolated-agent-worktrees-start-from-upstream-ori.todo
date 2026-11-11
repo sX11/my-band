@@ -1,0 +1,5 @@
+- [ ] Isolated agent worktrees start from upstream origin/main, not local main #tooling #worth(yes) #where(.git/config) #added(2026-11-11)
+	> Local main tracks origin/main (the upstream fork), so an Agent with worktree
+	> isolation was cut at 722c7b4 (upstream v1.4) instead of main; the PR 2 agent caught
+	> it and re-based. Fix: git branch -u fork/main main. Cost: ahead/behind then reports
+	> against the fork, and upstream comparisons need an explicit origin/main.
