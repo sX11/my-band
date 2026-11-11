@@ -1,0 +1,7 @@
+- [ ] HealthKit may refuse to link post-workout heart rate dated after a strength workout's end #workouts #health #worth(later) #where(My Band/Health/HealthKitManager.swift:537) #added(2026-11-11)
+	> @anchor: store.add(hkSamples, to: workout) { _, error in
+	> writeRecoveryHR saves the 3-minute capture and then calls add(_:to:) with samples
+	> past the workout's end, since the window is no longer extended (upstream extended it
+	> 180 s for this). The samples stay saved standalone either way. Undecided: one real
+	> strength workout settles it; a refusal shows as 'Recovery HR saved but not linked to
+	> its workout' in the log.

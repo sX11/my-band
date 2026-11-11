@@ -1,0 +1,7 @@
+- [ ] An unlocked rewrite of a locked-written strength workout may drop its recovery-HR link and, after a relaunch, its phone route #workouts #health #worth(later) #where(My Band/BLE/BandSyncer.swift:795) #added(2026-11-11)
+	> @anchor: let held = recoveryPairing.workoutSaved(start: key, saved) else { continue }
+	> RecoveryPairing links the post-workout heart rate to the first HKWorkout only, and
+	> the route stash and pairing live in memory: a workout written with the iPhone locked
+	> and rewritten unlocked (same sync id) may lose the link, and after a relaunch its
+	> route too. Undecided: depends on whether a same-id, same-version save replaces the
+	> workout object; check on hardware before persisting the state like WorkoutWindows.
