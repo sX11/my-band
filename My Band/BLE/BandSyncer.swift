@@ -274,6 +274,8 @@ final class BandSyncer {
         var workouts = 0
         var healthSamplesWritten = 0
         var deferredForLock = false
+        /// The band was stuck on a sleep file that couldn't be written, so later files went unfetched.
+        var fetchStopped = false
     }
 
     @discardableResult
@@ -311,7 +313,8 @@ final class BandSyncer {
             try await processActivityFiles(fileIds, manager: manager, context: context)
         }
         filesAwaitingUnlock = outcome.deferredForLock
-        markSynced(context)
+        // Left unmarked so the background-wake throttle doesn't hold off the retry for 15 min.
+        if outcome.fetchStopped { try? context.save() } else { markSynced(context) }
 
         log.info("Health sync done — \(outcome.healthSamplesWritten) samples written")
 
@@ -457,7 +460,9 @@ final class BandSyncer {
                 addingToLast: addingToLastReport)
         }
         var sleepToWrite: [SleepSession] = []
-        var sleepVitals: [ActivityMinuteSample] = []
+        /// Per sleep file, keyed by how far into the night it reaches, so the newest report's
+        /// reading wins a repeated minute.
+        var sleepVitals: [(reach: Date, samples: [ActivityMinuteSample])] = []
         var manualToWrite: [ManualSample] = []
         var workoutsToWrite: [WorkoutSummary] = []
         var workoutRoutes: [Int: [WorkoutTrackPoint]] = [:]
@@ -517,7 +522,11 @@ final class BandSyncer {
                         : SleepDetailsParser.parse(fileData, meta: meta)
                     let phaseCount = parsed.sessions.reduce(0) { $0 + $1.phases.count }
                     log.info("Sleep file \(fileId.hexString) (subtype=\(meta.subtype) v\(meta.version)): \(parsed.sessions.count) session(s), \(phaseCount) phase(s), \(parsed.heartRates.count) HR, \(parsed.spo2.count) SpO₂")
-                    for session in parsed.sessions {
+                    // A corrupt header never reaches the local store either: GetSleepStateIntent and
+                    // the Health sheet read it, not just Apple Health.
+                    let validDates = HealthKitManager.validDateRange()
+                    let sessions = parsed.sessions.filter { validDates.contains($0.startDate) && validDates.contains($0.endDate) }
+                    for session in sessions {
                         // Always (re)write to HealthKit — its sync-identifier dedup makes this
                         // idempotent, so data deleted from Apple Health is restored on re-sync.
                         // SwiftData insertion is still gated to avoid duplicate local records.
@@ -526,9 +535,10 @@ final class BandSyncer {
                     }
                     // HR/SpO₂ recorded during sleep — written within the sleep window so
                     // Apple Health's sleep "Comparisons" tab can correlate them.
-                    let vitals = parsed.heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
-                        + parsed.spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) }
-                    sleepVitals += vitals
+                    let vitals = (parsed.heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
+                        + parsed.spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) })
+                        .filter { validDates.contains($0.date) }
+                    sleepVitals.append((sessions.map(\.endDate).max() ?? .distantPast, vitals))
                     latestMetrics?.update { $0.record(vitals) }
                     sleepIds.append(fileId)
                 } else if meta.isDailySummary {
@@ -564,13 +574,63 @@ final class BandSyncer {
             }
         }
 
+        var ackedSleepIds = Set<Data>()
+        var writtenSleepIds = Set<Data>()
+        // writeSleep clears each night's window before writing, so a later flush rewrites the
+        // sessions an earlier one wrote together with its own, or the night would lose them.
+        var sleepWritten: [SleepSession] = []
+
+        /// Writes the pending sleep batch, then ACKs its files. An ACK makes the band delete the file,
+        /// so nothing is ACKed unless the sessions are saved locally and the night is in Health.
+        func flushSleep(clearExisting: Bool) async {
+            // Local sessions reach disk first: GetSleepStateIntent reads them, and a background
+            // launch can be suspended before SwiftData's autosave runs.
+            var contextSaved = true
+            do { try context.save() } catch {
+                contextSaved = false
+                log.error("Saving local records failed: \(error.localizedDescription, privacy: .public)")
+            }
+            guard !sleepIds.isEmpty else { return }
+            defer { sleepToWrite = []; sleepVitals = []; sleepIds = [] }
+            _ = HealthKitManager.shared.takeSkippedForPermission()
+            var cleared = clearExisting
+            do {
+                if !sleepToWrite.isEmpty {
+                    let night = sleepWritten + sleepToWrite
+                    do {
+                        outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(night, clearExisting: cleared)
+                    } catch let error as HKError where error.code == .errorDatabaseInaccessible && cleared {
+                        // The phone locked after `healthReadable` was read.
+                        cleared = false
+                        outcome.deferredForLock = true
+                        outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(night, clearExisting: false)
+                    }
+                    outcome.sleepSessions += sleepToWrite.count
+                    sleepWritten = night
+                }
+                let vitals = sleepVitals.sorted { $0.reach < $1.reach }.flatMap(\.samples)
+                if !vitals.isEmpty {
+                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(vitals)
+                    outcome.minuteSamples += vitals.count
+                }
+            } catch {
+                log.error("Sleep write failed — \(sleepIds.count) sleep file(s) left un-ACKed for the next sync: \(error.localizedDescription, privacy: .public)")
+                return
+            }
+            writtenSleepIds.formUnion(sleepIds)
+            guard cleared else { return }
+            guard contextSaved else {
+                log.warning("\(sleepIds.count, privacy: .public) sleep file(s) left un-ACKed — local sessions weren't saved")
+                return
+            }
+            if ackUnlessSkipped(sleepIds, "sleep", manager: manager) { ackedSleepIds.formUnion(sleepIds) }
+        }
+
         // A fetch can come back with a different file than the one requested: the band is still
         // pushing one it hasn't had ACKed. That file is complete and CRC-valid, so it is routed like
-        // any other, then ACKed at once to unstick the band. It used to be ACKed unread, silently
-        // discarding whatever it held — a night's sleep file, the largest, is the likeliest one to be
-        // caught mid-stream. The early ACK's only exposure is a batch write failing later in this sync.
-        // With the phone locked a file whose rewrite needs an unlocked sync is not ACKed early either.
-        for fileId in fileIds where !handled.contains(fileId) {
+        // any other, then ACKed to unstick the band; a sleep file only once its night is written and
+        // saved. With the phone locked, a file whose rewrite needs an unlocked sync is not ACKed.
+        fetching: for fileId in fileIds where !handled.contains(fileId) {
             for _ in 0 ..< 3 {
                 let delivered: (id: Data, data: Data)
                 do {
@@ -591,6 +651,27 @@ final class BandSyncer {
                     outcome.deferredForLock = true
                     break
                 }
+                if XiaomiActivityFileMeta(delivered.id)?.isSleep == true {
+                    if ackedSleepIds.contains(delivered.id) {
+                        sendAck(fileId: delivered.id, manager: manager)
+                    } else {
+                        await flushSleep(clearExisting: true)
+                        if !ackedSleepIds.contains(delivered.id) {
+                            // Written but held (a Health type off, a failed local save): the band
+                            // stays stuck on it, so skip to the next file instead of retrying.
+                            if writtenSleepIds.contains(delivered.id) {
+                                log.warning("Asked for \(fileId.hexString), band is stuck on sleep file \(delivered.id.hexString), written but held un-ACKed — skipping to the next file")
+                                continue fetching
+                            }
+                            // Unwritten: the band would only push the same file again.
+                            log.warning("Asked for \(fileId.hexString), band is stuck on sleep file \(delivered.id.hexString), which wasn't written — stopping the fetch, it stays un-ACKed for the next sync")
+                            outcome.fetchStopped = true
+                            break fetching
+                        }
+                    }
+                    log.warning("Asked for \(fileId.hexString), band sent sleep file \(delivered.id.hexString) — wrote it, ACKed to unstick, retrying")
+                    continue
+                }
                 log.warning("Asked for \(fileId.hexString), band sent \(delivered.id.hexString) — routed it, ACKing to unstick, retrying")
                 sendAck(fileId: delivered.id, manager: manager)
             }
@@ -604,34 +685,10 @@ final class BandSyncer {
             log.notice("Phone locked — sleep, workout and daily detail files left un-ACKed for a sync after unlock")
             outcome.deferredForLock = !(sleepIds + workoutIds + detailIds).isEmpty
         }
-        var sleepCleared = healthReadable
 
-        // Isolated from the rest of the batch: a throwing sleep write used to propagate out of here,
-        // skipping the manual/workout/daily-detail writes and every ACK after it — so a sleep write
-        // that kept failing stalled the whole sync, every sync. Now only the sleep files stay
-        // un-ACKed (the band re-offers them) and everything else goes through.
-        _ = HealthKitManager.shared.takeSkippedForPermission()
-        do {
-            if !sleepToWrite.isEmpty {
-                do {
-                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite, clearExisting: sleepCleared)
-                } catch let error as HKError where error.code == .errorDatabaseInaccessible && sleepCleared {
-                    // The phone locked after `healthReadable` was read.
-                    sleepCleared = false
-                    outcome.deferredForLock = true
-                    outcome.healthSamplesWritten += try await HealthKitManager.shared.writeSleep(sleepToWrite, clearExisting: false)
-                }
-                outcome.sleepSessions = sleepToWrite.count
-            }
-            if !sleepVitals.isEmpty {
-                outcome.healthSamplesWritten += try await HealthKitManager.shared.writeMinuteSamples(sleepVitals)
-                outcome.minuteSamples += sleepVitals.count
-            }
-            // Sleep files ACK'd after both sessions and vitals are written.
-            if sleepCleared { ackUnlessSkipped(sleepIds, "sleep", manager: manager) }
-        } catch {
-            log.error("Sleep write failed — \(sleepIds.count) sleep file(s) left un-ACKed for the next sync: \(error.localizedDescription, privacy: .public)")
-        }
+        // Isolated from the rest of the batch: a failing sleep write leaves only the sleep files
+        // un-ACKed (the band re-offers them) and the manual/workout/daily-detail writes go through.
+        await flushSleep(clearExisting: healthReadable)
 
         // ACK every file we successfully fetched — NOT gated on the write batch being non-empty.
         // A fetched file that parsed to nothing (or whose sibling already synced) still has to be
@@ -705,13 +762,15 @@ final class BandSyncer {
 
     /// The band re-offers an un-ACKed file, so one whose samples were dropped for a Health type
     /// switched off is written on a later sync once it is on, instead of being deleted unwritten.
-    private func ackUnlessSkipped(_ ids: [Data], _ kind: String, manager: BandManager) {
-        guard !ids.isEmpty else { return }
+    @discardableResult
+    private func ackUnlessSkipped(_ ids: [Data], _ kind: String, manager: BandManager) -> Bool {
+        guard !ids.isEmpty else { return true }
         if HealthKitManager.shared.takeSkippedForPermission() {
             log.warning("\(ids.count, privacy: .public) \(kind, privacy: .public) file(s) left un-ACKed — a Health type is switched off for My Band")
-            return
+            return false
         }
         ids.forEach { sendAck(fileId: $0, manager: manager) }
+        return true
     }
 
     // MARK: - One-time sleep history repair

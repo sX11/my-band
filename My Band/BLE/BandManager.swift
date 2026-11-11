@@ -606,6 +606,23 @@ final class BandManager: NSObject {
         flushPendingWrites()
     }
 
+    /// Waits for queued fragments to reach CoreBluetooth and its write-without-response buffer to have
+    /// room, then `grace` more: CoreBluetooth never reports the buffer empty, and the last ACKs of a
+    /// sync are fire-and-forget writes a disconnect would drop. Never longer than `ceiling`.
+    func drainWrites(grace: Duration = .milliseconds(750), ceiling: Duration = .seconds(3)) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now + ceiling
+        // writeSPP falls back to withResponse, where this flag never has to turn true.
+        let withoutResponse = cmdWriteChar?.properties.contains(.writeWithoutResponse) == true
+        while let p = peripheral, p.state == .connected, clock.now < deadline, !Task.isCancelled,
+              !pendingWrites.isEmpty || (withoutResponse && !p.canSendWriteWithoutResponse) {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard peripheral?.state == .connected, !Task.isCancelled else { return }
+        let remaining = deadline - clock.now
+        try? await Task.sleep(for: min(grace, max(.zero, remaining)))
+    }
+
     private func flushPendingWrites() {
         guard let char = cmdWriteChar, let p = peripheral, p.state == .connected else { return }
         while !pendingWrites.isEmpty, p.canSendWriteWithoutResponse {
