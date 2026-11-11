@@ -341,10 +341,10 @@ final class HealthKitManager {
     func writeWorkouts(_ workouts: [WorkoutSummary],
                        routes: [Int: [WorkoutTrackPoint]],
                        heartRates: [Int: [WorkoutHRSample]] = [:],
-                       weather: [Int: WorkoutWeather] = [:],
-                       endExtension: [Int: TimeInterval] = [:]) async throws -> (written: Int, saved: [Int: HKWorkout]) {
+                       weather: [Int: WorkoutWeather] = [:]) async throws -> (written: Int, saved: [Int: HKWorkout], routed: Set<Int>) {
         var written = 0
         var saved: [Int: HKWorkout] = [:]
+        var routed = Set<Int>()
         let bpm = HKUnit.count().unitDivided(by: .minute())
         // Weight (average METs) and age (max-HR estimate behind the effort score) are fetched once
         // per batch; both degrade gracefully when absent.
@@ -356,7 +356,7 @@ final class HealthKitManager {
                 skippedForPermission = true
                 log.warning("Not allowed to write workouts — skipped \(workouts.count, privacy: .public)")
             }
-            return (0, [:])
+            return (0, [:], [])
         }
 
         let validDates = Self.validDateRange()
@@ -368,10 +368,6 @@ final class HealthKitManager {
             }
             let key = Int(w.startDate.timeIntervalSince1970)
             let track = Self.route(forWorkoutStart: w.startDate, in: routes)
-            // A strength workout with a pending cooldown extends its window by the cooldown length so
-            // the folded-in cooldown route (attached later) falls inside [start, end]. Samples still
-            // span only the real workout window.
-            let workoutEnd = w.endDate.addingTimeInterval(endExtension[key] ?? 0)
 
             let config = HKWorkoutConfiguration()
             config.activityType = Self.activityType(w.kind)
@@ -464,7 +460,7 @@ final class HealthKitManager {
             }
             try await builder.addMetadata(metadata)
 
-            try await builder.endCollection(at: workoutEnd)
+            try await builder.endCollection(at: w.endDate)
             guard let workout = try await builder.finishWorkout() else { continue }
             written += 1
             // Only now are the builder's samples in Apple Health.
@@ -509,42 +505,56 @@ final class HealthKitManager {
             // whole batch — the workout is already saved, so log it and move on; the file still
             // gets ACKed and the workout itself is intact in Apple Health.
             if let track = Self.route(forWorkoutStart: w.startDate, in: routes) {
-                do { try await attachRoute(track, to: workout) }
+                do { try await attachRoute(track, to: workout); routed.insert(key) }
                 catch { log.error("Workout route attach failed (start \(key)): \(error.localizedDescription)") }
             } else if w.kind.usesGps {
                 // The GPS file came in another sync, or the band recorded none (no fix at the start).
                 log.notice("Outdoor workout at \(key, privacy: .public) has no GPS track in this sync (\(routes.count, privacy: .public) track(s))")
             }
         }
-        return (written, saved)
+        return (written, saved, routed)
     }
 
     // MARK: - HR recovery (post-strength)
 
-    /// Writes the 3-minute post-workout heart-rate recovery samples. When `workout` is given (the
-    /// usual case), they're saved and then associated with it via `add(_:to:)` so they extend the
-    /// workout's HR graph into the recovery period; the workout's window was extended by the recovery
-    /// length at write time so the samples fall inside it. When it's nil (the workout didn't sync in
-    /// time), the samples are still saved as standalone heart rate so the recovery curve isn't lost.
-    /// Sync-ids keep re-writes idempotent.
-    func writeRecoveryHR(_ samples: [WorkoutHRSample], toWorkout workout: HKWorkout?) async throws -> Int {
-        let validDates = Self.validDateRange()
-        let samples = samples.filter { validDates.contains($0.date) }
-        guard !samples.isEmpty else { return 0 }
-        let bpm = HKUnit.count().unitDivided(by: .minute())
-        let hkSamples = samples.map { s in
-            quantity(heartRate, bpm, Double(s.bpm), start: s.date, end: s.date,
-                     id: "mb-recovery-\(Int(s.date.timeIntervalSince1970))")
-        }
-        try await save(hkSamples)
+    /// Writes the 3-minute post-workout heart rate the phone captured from the band's realtime stats,
+    /// and associates it with `workout` when given. The workout's window isn't extended, so these
+    /// samples sit just past its end. Per-second sync ids: writing the same capture again replaces it.
+    /// `tallied`: false outside a sync, or the samples land in whichever sync's report is open.
+    /// A failed association is logged, not thrown: the samples are already saved.
+    func writeRecoveryHR(_ samples: [WorkoutHRSample], toWorkout workout: HKWorkout?,
+                         tallied: Bool) async throws -> Int {
+        // Checked here, not left to `save`: its permission flag would leak into whichever sync write
+        // group runs next, since this write runs outside them.
+        guard canShare(heartRate) else { return 0 }
+        let hkSamples = recoverySamples(samples)
+        guard !hkSamples.isEmpty else { return 0 }
+        try await store.save(hkSamples)
+        if tallied { count(hkSamples) }
         if let workout {
-            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                store.add(hkSamples, to: workout) { _, error in
-                    if let error { cont.resume(throwing: error) } else { cont.resume() }
+            do {
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    store.add(hkSamples, to: workout) { _, error in
+                        if let error { cont.resume(throwing: error) } else { cont.resume() }
+                    }
                 }
+            } catch {
+                log.error("Recovery HR saved but not linked to its workout: \(error.localizedDescription, privacy: .public)")
             }
         }
         return hkSamples.count
+    }
+
+    /// Only these are saved and associated: `add(_:to:)` fails on a sample that was never saved, so
+    /// the date filter and the per-second dedup run before both, not inside `save`.
+    func recoverySamples(_ samples: [WorkoutHRSample], now: Date = Date()) -> [HKQuantitySample] {
+        let validDates = Self.validDateRange(now: now)
+        let bpm = HKUnit.count().unitDivided(by: .minute())
+        let all: [HKSample] = samples.filter { validDates.contains($0.date) }.map { s in
+            quantity(heartRate, bpm, Double(s.bpm), start: s.date, end: s.date,
+                     id: "mb-recovery-\(Int(s.date.timeIntervalSince1970))")
+        }
+        return Self.deduplicatingBySyncIdentifier(all).compactMap { $0 as? HKQuantitySample }
     }
 
     // MARK: - GPS route
