@@ -1,0 +1,6 @@
+- [ ] Nights synced before the sleep-parser fix keep the first scoring and no SpO2 #sleep #health #worth(yes) #where(My Band/BLE/BandSyncer.swift:758) #added(2026-11-11)
+	> @anchor: private func persistIfNew(_ session: SleepSession, _ context: ModelContext) -> Bool {
+	> SleepSession stores only parsed phases, never the raw file, so the v5 SpO2 and
+	> re-scoring fixes (a9b7703) reach only nights synced after them. Upstream v1.3 keeps
+	> the furthest raw file per night and re-parses whenever the parser revision changes;
+	> planned as the next sleep PR.

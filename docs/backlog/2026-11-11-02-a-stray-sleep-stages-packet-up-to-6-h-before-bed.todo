@@ -1,0 +1,7 @@
+- [ ] A stray sleep stages packet up to 6 h before bedtime widens the session and inflates Time in Bed #sleep #worth(later) #where(My Band/BLE/PacketParser/SleepPacketParser.swift:127) #added(2026-11-11)
+	> @anchor: let plausible = sessionStart.addingTimeInterval(-6 * 3600) ... sessionEnd.addingTimeInterval(6 * 3600)
+	> A non-empty type-17 stamped within 6 h before bedTime is kept and the session widens
+	> to enclose it, so the in-bed sample grows and writeSleep clears that whole range,
+	> including a separately synced nap. No capture shows such a packet yet; a tighter
+	> window needs one. Undecided: the window was taken from upstream without evidence for
+	> its width.
