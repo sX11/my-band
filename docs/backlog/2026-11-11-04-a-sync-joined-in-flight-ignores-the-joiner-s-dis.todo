@@ -1,0 +1,6 @@
+- [ ] A sync joined in flight ignores the joiner's disconnectWhenDone, so the battery intent can lose its link #sync #intents #worth(later) #where(My Band/BLE/BackgroundSyncManager.swift:217) #added(2026-11-11)
+	> @anchor: log.debug("Sync already in flight — coalescing")
+	> syncNow returns the in-flight task, so a battery intent (disconnectWhenDone: false)
+	> that joins a Dashboard or wake sync gets that run's release, and its CMD_BATTERY goes
+	> to a dropped link and answers with the stale level. Undecided: a per-caller release
+	> needs the run to track every joiner; not seen on hardware.
