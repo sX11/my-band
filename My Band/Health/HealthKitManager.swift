@@ -96,7 +96,8 @@ final class HealthKitManager {
     // hours apart — never get sanitized *against each other*. The old per-phase/per-inBed identifier
     // also baked in `endDate`, which is exactly what changes between resyncs of an ongoing night, so
     // HealthKit's sync-identifier dedup (see header comment) never recognized them as updates.
-    // Fixed by: (1) pooling and re-sanitizing phases across every session whose window overlaps,
+    // Fixed by: (1) merging every session whose window overlaps, the furthest-reaching report
+    // winning each overlap (`SleepDetailsParser.mergeReports`),
     // (2) keying identifiers on the phase's own start + type only (stable across a growing end),
     // and (3) clearing whatever this app already wrote for the window as a backstop, so a
     // reclassified stage (same start, different type — not caught by a stable id alone) still gets
@@ -120,8 +121,7 @@ final class HealthKitManager {
                 metadata: syncMetadata(inBedId)
             ))
 
-            let sanitized = SleepDetailsParser.sanitizeStages(group.flatMap(\.phases))
-            for phase in sanitized {
+            for phase in SleepDetailsParser.mergeReports(group) {
                 guard phase.endDate > phase.startDate, let value = Self.sleepValue(phase.type) else { continue }
                 let id = "mb-sleep-\(Int(phase.startDate.timeIntervalSince1970))-\(phase.type.rawValue)"
                 samples.append(HKCategorySample(

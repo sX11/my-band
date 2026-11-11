@@ -54,8 +54,7 @@ struct LatestMetricsView: View {
         guard let group = HealthKitManager.groupOverlapping(sessions).last,
               let start = group.map(\.startDate).min(), let end = group.map(\.endDate).max(),
               end > start else { return nil }
-        return Night(start: start, end: end,
-                     phases: SleepDetailsParser.sanitizeStages(group.flatMap(\.phases)))
+        return Night(start: start, end: end, phases: SleepDetailsParser.mergeReports(group))
     }
 
     private var m: LatestMetrics { store.metrics }
