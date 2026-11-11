@@ -73,6 +73,7 @@ My Band/
 │   ├── LatestMetrics.swift       # Snapshot of the latest value of each reading, for the Health sheet (ADR 0006)
 │   ├── HealthSyncLog.swift       # What each sync sent to Apple Health, per type, for the Health sheet
 │   ├── WorkoutWindows.swift      # Windows of recorded workouts, so the daily detail excludes distance/energy (ADR 0007)
+│   ├── StrengthWorkoutExtras.swift # Matches the phone's strength route and post-workout HR to the band's workout
 │   └── HeartRateSample.swift     # SwiftData model of HR samples
 │
 └── UI/
@@ -340,7 +341,8 @@ Ports `PasswordXiaomiCloudConnector` from `token_extractor/token_extractor.py` �
 | Cycling / swimming distance (workout) | `HKQuantityTypeIdentifier.distanceCycling` / `.distanceSwimming` |
 | Strokes (swimming) | `HKQuantityTypeIdentifier.swimmingStrokeCount` |
 | Workout | `HKObjectType.workoutType()` via `HKWorkoutBuilder` (mapped to `HKWorkoutActivityType`) |
-| Workout route (GPS) | `HKSeriesType.workoutRoute()` via `HKWorkoutRouteBuilder` |
+| Workout route (GPS) | `HKSeriesType.workoutRoute()` via `HKWorkoutRouteBuilder` (strength: the phone's sparse track, see below) |
+| Post-strength heart rate (3 min, phone-captured from realtime stats) | `HKQuantityTypeIdentifier.heartRate` (`mb-recovery-<sec>`), associated with the workout |
 | Weight (BLE scale) | `HKQuantityTypeIdentifier.bodyMass` (+ `.bodyMassIndex` derived from `.height` read from Health) |
 | Physical effort (METs/min: band active kcal ÷ weight from Health) | `HKQuantityTypeIdentifier.physicalEffort` |
 | Workout effort, 1–10 scale (average HR ÷ age-based max HR, Tanaka) | `.estimatedWorkoutEffortScore` (iOS 18+, via `relateWorkoutEffortSample`) |
@@ -352,6 +354,8 @@ Ports `PasswordXiaomiCloudConnector` from `token_extractor/token_extractor.py` �
 > **`appleStandHour` is NOT writable.** `HKCategoryTypeIdentifier.appleStandHour` is reserved (the system derives it from the Apple Watch). Including it in `requestAuthorization(toShare:)` throws `NSInvalidArgumentException`. The band's stand-hours mask stays local only — there is no "stand hour" type writable by third-party apps. The same goes for `appleExerciseTime`, `appleMoveTime`, `appleStandTime` (activity rings) and `walkingHeartRateAverage` — all read-only for third parties, no workaround.
 >
 > **Heart rate recovery runs on the daily file path, not in `writeWorkouts`.** The workout's 1 Hz series ends exactly at the end of the workout (count == duration), so the end+60 s reading only arrives in the following daily detail file. `writeHeartRateRecoveries` queries the **app's own** recent workouts in Health (independent of which sync recorded the workout), matches the peak of the last minute (1 Hz series, `HKStatisticsQuery` discreteMax) with the per-minute reading closest to end+60 s (±30 s) and writes the delta. Best-effort in `BandSyncer` — it does not block the files' ACKs.
+>
+> **Strength workouts get two phone-side extras** (`WorkoutGpsService`, matched in `StrengthWorkoutExtras`). The band records no GPS for strength, so the phone keeps a sparse track (one point per 10 min, plus the end) and `processActivityFiles` hands it to `writeWorkouts` as the route, only when the band's files carried no track within ±2 min; the stash entry is dropped once the workout files are ACKed with the route attached, so a workout written with the iPhone locked gets its route again on the unlocked rewrite. After the workout the phone records 3 min of realtime HR (`onRecoveryHRRecorded`); `BandSyncer` saves it as `heartRate` the moment the capture ends and associates it with the workout (`RecoveryPairing`): with the one already written, else held and linked when the workout is written. Both are in memory only, aged out after 48 h and cleared by `Forget band`; an aged-out entry loses only the link, the samples are already in Health. This is **not** heart rate recovery: it writes plain `heartRate` points after the workout's end (the window is not extended), never `heartRateRecoveryOneMinute`, which stays with `writeHeartRateRecoveries` and its per-minute reading. Both best-effort; neither holds an ACK. **Not yet validated on hardware**, including whether `add(_:to:)` accepts samples outside the workout's window.
 >
 > **Mobility stays iPhone-exclusive.** `walkingSpeed`/`walkingStepLength` are writable, but they would feed the Mobility metrics, which stay iPhone-exclusive on purpose — that is why the speed series is only written for running/cycling (`speedType(_:)` returns nil for walking/hiking) and the stride uses `runningStrideLength`, not `walkingStepLength`.
 

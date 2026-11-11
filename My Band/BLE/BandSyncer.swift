@@ -140,6 +140,7 @@ final class BandSyncer {
     private let findPhone    = FindPhoneService()
     private let calendarSync = CalendarSyncService()
     private let weatherSync  = WeatherSyncService()
+    private var recoveryPairing = RecoveryPairing<HKWorkout>()
 
     /// Live only while a command/response exchange is pending; BandManager.onSessionRestart yields
     /// into it so the exchange fails fast instead of waiting out its timeout.
@@ -180,6 +181,46 @@ final class BandSyncer {
         }
         workoutGps.onLocationStreamed = { [weak self] loc in
             self?.workoutLive?.ingest(fix: loc)
+        }
+        workoutGps.onRecoveryHRRecorded = { [weak self] strengthStart, samples in
+            // Taken here, synchronously: the capture stops location updates, the app's keep-alive,
+            // right after this returns.
+            guard let self, !samples.isEmpty else { return }
+            let bg = self.beginBackgroundAssertion(name: "recovery-hr")
+            Task { @MainActor in
+                defer { self.endBackgroundAssertion(bg) }
+                await self.handleRecoveryHR(strengthStart: strengthStart, samples)
+            }
+        }
+    }
+
+    func forgetBand() {
+        workoutGps.forgetBand()
+        recoveryPairing.reset()
+    }
+
+    // MARK: - Post-strength recovery heart rate
+    //
+    // Saved as soon as the capture ends, linked to its workout if one is already written; otherwise
+    // the samples are held and linked when the workout is (processActivityFiles). The capture ends
+    // with location updates stopped, which kept the app alive until then, hence the assertion.
+
+    private func handleRecoveryHR(strengthStart: Date?, _ samples: [WorkoutHRSample]) async {
+        let workout = strengthStart.flatMap {
+            recoveryPairing.recoveryRecorded(strengthStart: Int($0.timeIntervalSince1970), samples)
+        }
+        _ = await saveRecoveryHR(samples, to: workout, tallied: false)
+    }
+
+    /// Best-effort, like the cardio-recovery write: never fails a sync or holds an ACK.
+    private func saveRecoveryHR(_ samples: [WorkoutHRSample], to workout: HKWorkout?, tallied: Bool) async -> Int {
+        do {
+            let written = try await HealthKitManager.shared.writeRecoveryHR(samples, toWorkout: workout, tallied: tallied)
+            log.info("Recovery HR: \(written, privacy: .public) sample(s) written (linked to workout: \(workout != nil, privacy: .public))")
+            return written
+        } catch {
+            log.error("Recovery HR write failed: \(error.localizedDescription, privacy: .public)")
+            return 0
         }
     }
 
@@ -708,10 +749,22 @@ final class BandSyncer {
         ackUnlessSkipped(manualIds, "manual", manager: manager)
 
         _ = HealthKitManager.shared.takeSkippedForPermission()
+        // A strength workout's band files carry no GPS track; the phone's sparse one stands in.
+        let phoneRoutes = StrengthWorkoutExtras.phoneRoutes(workoutGps.recordedStrengthRoutes,
+                                                            for: workoutsToWrite, bandRoutes: workoutRoutes)
+        var savedWorkouts: [Int: HKWorkout] = [:]
+        var routedWorkouts = Set<Int>()
         if !workoutsToWrite.isEmpty {
             outcome.workouts = workoutsToWrite.count
-            let result = try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: workoutRoutes, heartRates: workoutHeartRates)
+            var routes = workoutRoutes
+            for (key, phone) in phoneRoutes {
+                routes[key] = phone.track
+                log.notice("Strength workout at \(key, privacy: .public): attaching the phone's GPS track (\(phone.track.count, privacy: .public) point(s))")
+            }
+            let result = try await HealthKitManager.shared.writeWorkouts(workoutsToWrite, routes: routes, heartRates: workoutHeartRates)
             outcome.healthSamplesWritten += result.written
+            savedWorkouts = result.saved
+            routedWorkouts = result.routed
             workoutWindows.record(workoutsToWrite
                 .filter { result.saved[Int($0.startDate.timeIntervalSince1970)] != nil }
                 .map { .init(start: $0.startDate, end: $0.endDate) })
@@ -730,7 +783,18 @@ final class BandSyncer {
         }
         // Workout summary + GPS files: a GPS file can be pending without a parseable summary (its
         // summary was ACKed in an earlier sync), which used to leave it dangling forever.
-        if healthReadable { ackUnlessSkipped(workoutIds.filter { !heldGpsIds.contains($0) }, "workout", manager: manager) }
+        let workoutsAcked = healthReadable
+            && ackUnlessSkipped(workoutIds.filter { !heldGpsIds.contains($0) }, "workout", manager: manager)
+        if workoutsAcked {
+            // A failed attach keeps its entry, so a later rewrite of the workout can try again.
+            workoutGps.discardStrengthRoutes(phoneRoutes.filter { routedWorkouts.contains($0.key) }.map(\.value.stashKey))
+        }
+        for workout in workoutsToWrite where workout.kind == .strengthTraining {
+            let key = Int(workout.startDate.timeIntervalSince1970)
+            guard let saved = savedWorkouts[key],
+                  let held = recoveryPairing.workoutSaved(start: key, saved) else { continue }
+            outcome.healthSamplesWritten += await saveRecoveryHR(held, to: saved, tallied: true)
+        }
 
         // Daily details last: HR/SpO₂ and steps/distance/energy per minute, leaving out distance and
         // energy inside a workout, which the workout samples above already contribute.

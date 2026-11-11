@@ -30,13 +30,8 @@ final class WorkoutGpsService: NSObject {
 
     /// Fired ~3 minutes after a strength workout finishes, carrying the strength workout's start (to
     /// correlate with the workout) plus the continuously-measured post-workout heart-rate recovery
-    /// samples. BandSyncer appends them to the (window-extended) strength workout's HR graph.
+    /// samples. BandSyncer saves them as heart rate and associates them with that workout.
     var onRecoveryHRRecorded: ((_ strengthStart: Date?, _ samples: [WorkoutHRSample]) -> Void)?
-
-    /// The just-finished strength workout's start, set at finish and cleared when the recovery
-    /// capture completes. BandSyncer reads it during the post-workout sync to extend that workout's
-    /// window by the recovery length, so the recovery HR (appended later) falls inside it.
-    private(set) var recoveryPendingStrengthStart: Date?
 
     private weak var bandManager: BandManager?
     private let locationManager = CLLocationManager()
@@ -44,6 +39,8 @@ final class WorkoutGpsService: NSObject {
 
     private var gpsFixAcquired = false
     private var workoutStarted = false
+    /// When the band last said "started"; it can arrive before the strength open and is never repeated.
+    private var bandStartedAt: Date?
     /// Answers "GPS disabled" when no fix arrives in time, so the band never waits on silence.
     private var fixTimeout: Task<Void, Never>?
     private let fixWait: Duration = .seconds(60)
@@ -73,6 +70,7 @@ final class WorkoutGpsService: NSObject {
     /// The sparse-GPS cadence for strength: one recorded point every 10 minutes.
     private let strengthFixInterval: TimeInterval = 600
     private let recoveryDuration: TimeInterval = 180
+    private let earlyStartMaxAge: TimeInterval = 600
 
     // MARK: - Setup
 
@@ -191,6 +189,7 @@ final class WorkoutGpsService: NSObject {
             } else {
                 log.notice("Workout started/resumed (status \(status, privacy: .public), GPS fix \(self.gpsFixAcquired, privacy: .public)) — GPS stream active")
                 workoutStarted = true
+                if status == 0 { bandStartedAt = Date() }
             }
         case 2:
             // Paused — keep CoreLocation running so a resume gets an instant fix, but stop
@@ -231,7 +230,11 @@ final class WorkoutGpsService: NSObject {
 
     private func beginStrengthRecording() {
         localMode = .strength
-        localStart = nil                 // set at status=started
+        // The band can send "started" before this open request and never repeats it (hardware log
+        // 2026-11-01). Only a recent one counts: a lost "finished" can leave an old one behind.
+        localStart = bandStartedAt.flatMap { Date().timeIntervalSince($0) < earlyStartMaxAge ? $0 : nil }
+        bandStartedAt = nil
+        workoutStarted = false
         localRoute = []
         // Continuous updates — NOT requestLocation. One-shot requestLocation doesn't deliver reliably
         // in the background (phone in pocket during the workout), which left the route with a single
@@ -257,15 +260,13 @@ final class WorkoutGpsService: NSObject {
                                                 speed: last.speed >= 0 ? last.speed : nil))
         }
         if let start = strengthStart, localRoute.count >= 2 {
+            recordedStrengthRoutes = StrengthWorkoutExtras.pruned(recordedStrengthRoutes)
             recordedStrengthRoutes[Int(start.timeIntervalSince1970)] = localRoute
             log.info("Strength GPS: stashed \(self.localRoute.count) point(s) for the workout")
         } else {
             log.info("Strength GPS: \(self.localRoute.count) point(s) — too few for a route (no fix / very short)")
         }
 
-        // recoveryPendingStrengthStart lets the post-workout sync extend this workout's window so the
-        // recovery HR (appended when the capture completes) falls inside it.
-        recoveryPendingStrengthStart = strengthStart
         onWorkoutFinished?(fileIds)
         startRecoveryCapture(strengthStart: strengthStart)
     }
@@ -285,11 +286,12 @@ final class WorkoutGpsService: NSObject {
             try? await Task.sleep(for: .seconds(self?.recoveryDuration ?? 180))
             guard let self, !Task.isCancelled else { return }
             let samples = self.recoveryHR
+            self.log.info("HR recovery done — \(samples.count) sample(s)")
+            // Before stopping location: it keeps the app alive, and the handler takes its own
+            // background assertion synchronously.
+            self.onRecoveryHRRecorded?(strengthStart, samples)
             self.bandManager?.setRealtimeStats(enabled: false, holder: .hrRecovery)
             self.stopLocalRecording()
-            self.recoveryPendingStrengthStart = nil
-            self.log.info("HR recovery done — \(samples.count) sample(s)")
-            self.onRecoveryHRRecorded?(strengthStart, samples)
         }
     }
 
@@ -323,11 +325,17 @@ final class WorkoutGpsService: NSObject {
         recoveryHR = []
     }
 
-    /// Hands the stashed strength routes to BandSyncer and clears them (one-shot).
-    func consumeStrengthRoutes() -> [Int: [WorkoutTrackPoint]] {
-        let routes = recordedStrengthRoutes
+    /// Called once the workout a route went onto is ACKed, not when the route is read: a workout
+    /// written with the phone locked stays un-ACKed and a later sync rewrites it, route included.
+    func discardStrengthRoutes(_ keys: some Sequence<Int>) {
+        for key in keys { recordedStrengthRoutes[key] = nil }
+    }
+
+    func forgetBand() {
         recordedStrengthRoutes = [:]
-        return routes
+        guard localMode != .none else { return }
+        if localMode == .recovery { bandManager?.setRealtimeStats(enabled: false, holder: .hrRecovery) }
+        stopLocalRecording()
     }
 
     // MARK: - GPS reply helpers
@@ -356,6 +364,7 @@ final class WorkoutGpsService: NSObject {
         isActive       = false
         gpsFixAcquired = false
         workoutStarted = false
+        bandStartedAt  = nil
         locationManager.stopUpdatingLocation()
     }
 }

@@ -113,6 +113,7 @@ struct RootView: View {
         AppServices.shared.workoutLive.reset()
         AppServices.shared.latestMetrics.reset()
         AppServices.shared.syncLog.reset()
+        AppServices.shared.bandSyncer.forgetBand()
         CalendarSyncService.forgetBand()
         AuthKeyStore.delete()
         page = 1
