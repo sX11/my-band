@@ -102,8 +102,23 @@ final class ReminderService {
         manager.onScheduleAck = { [weak self] id in self?.handleAck(id) }
     }
 
-    /// Title and local wall time, the only fields the band echoes back that identify a reminder.
+    /// Title, repeat and local wall time, the only fields the band echoes back that identify a
+    /// reminder. A repeating one keys only the date parts its repeat keeps: the band lists it with
+    /// the date moved on to its next firing, so a full date would stop matching after it first fires.
     static func key(_ d: Xiaomi_ReminderDetails) -> String {
+        let when: String
+        switch Repeat(mode: d.repeatMode) {
+        case .once: when = "\(d.date.year)-\(d.date.month)-\(d.date.day)"
+        case .daily: when = "daily"
+        case .weekly: when = "weekly \(d.repeatFlags)"
+        case .monthly: when = "monthly \(d.date.day)"
+        case .yearly: when = "yearly \(d.date.month)-\(d.date.day)"
+        }
+        return "\(d.title)|\(when) \(d.time.hour):\(d.time.minute)"
+    }
+
+    /// The key format before the repeat was part of it, still held by reminders added on earlier builds.
+    private static func legacyKey(_ d: Xiaomi_ReminderDetails) -> String {
         "\(d.title)|\(d.date.year)-\(d.date.month)-\(d.date.day) \(d.time.hour):\(d.time.minute)"
     }
 
@@ -144,13 +159,15 @@ final class ReminderService {
         for date in dates {
             let details = XiaomiProto.reminderDetails(date: date, title: title, repeatMode: repeatRule.mode)
             let key = Self.key(details)
-            addedHere[key] = false
+            // A repeating key carries no date, so an identical reminder may already hold it.
+            let claimsKey = addedHere[key] == nil
+            if claimsKey { addedHere[key] = false }
             create(details) { [weak self] id in
                 answered += 1
                 if id != nil { acked += 1 }
                 // Unacked and never listed: the create most likely didn't land, so don't keep a key
                 // that would protect a future reminder with the same title and time.
-                guard let self, id == nil, self.addedHere[key] == false else { return }
+                guard let self, id == nil, claimsKey, self.addedHere[key] == false else { return }
                 self.addedHere[key] = nil
                 self.saveAddedHere()
             }
@@ -256,19 +273,29 @@ final class ReminderService {
     private func handleList(_ list: Xiaomi_Reminders) {
         maxReminders = list.hasMaxReminders && list.maxReminders > 0 ? Int(list.maxReminders) : nil
         let onBand = Set(list.reminder.map { Self.key($0.reminderDetails) })
+        // A one-off's legacy key is its current key, so one still listed keeps its own entry.
+        for r in list.reminder {
+            let legacy = Self.legacyKey(r.reminderDetails)
+            guard !onBand.contains(legacy), let seen = addedHere.removeValue(forKey: legacy) else { continue }
+            addedHere[Self.key(r.reminderDetails)] = seen
+        }
         // A reminder added here that the band listed and then dropped was deleted on the band;
         // one not listed yet may still be on its way.
         addedHere = addedHere.filter { key, seen in !seen || onBand.contains(key) }
         for key in addedHere.keys where onBand.contains(key) { addedHere[key] = true }
         saveAddedHere()
-        reminders = list.reminder.map { r in
+        // Only the oldest reminder per key is the one added here: a pushed copy with the same title,
+        // repeat and time would otherwise be protected too, and the push could never delete it.
+        var claimed = Set<String>()
+        reminders = list.reminder.sorted { $0.id < $1.id }.map { r in
             let d = r.reminderDetails
-            if d.repeatMode == XiaomiProto.weeklyRepeatMode {
-                // Unconfirmed whether the band reads weekly flags as a weekday (GadgetBridge) or a bitmask.
-                log.info("Weekly reminder id=\(r.id, privacy: .public) repeatFlags=\(d.repeatFlags, privacy: .public)")
+            let key = Self.key(d)
+            if d.repeatMode != Repeat.once.mode {
+                // Whether the band echoes the flags and day it was sent is unconfirmed; the key relies on it.
+                log.debug("Reminder id=\(r.id, privacy: .public) mode=\(d.repeatMode, privacy: .public) flags=\(d.repeatFlags, privacy: .public) day=\(d.date.day, privacy: .public)")
             }
-            return Reminder(id: r.id, title: d.title, date: Self.date(of: d),
-                            repeatRule: Repeat(mode: d.repeatMode), addedHere: addedHere[Self.key(d)] != nil)
+            return Reminder(id: r.id, title: d.title, date: Self.date(of: d), repeatRule: Repeat(mode: d.repeatMode),
+                            addedHere: addedHere[key] != nil && claimed.insert(key).inserted)
         }
         .sorted { $0.date < $1.date }
         ackedCreates = 0
