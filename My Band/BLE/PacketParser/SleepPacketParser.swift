@@ -42,6 +42,17 @@ struct ParsedSleep {
     var sessions: [SleepSession] = []
     var heartRates: [(date: Date, bpm: Int)] = []
     var spo2: [(date: Date, pct: Int)] = []
+    /// isAwake header byte (0x08 only): 0 while the night is open, non-zero once the band closed it.
+    var awakeFlag: Int?
+
+    /// The sessions and sleep HR/SpO₂ dated inside `range`; a corrupt header stamps them outside it.
+    func inRange(_ range: ClosedRange<Date>) -> (sessions: [SleepSession], vitals: [ActivityMinuteSample]) {
+        let sessions = sessions.filter { range.contains($0.startDate) && range.contains($0.endDate) }
+        let vitals = (heartRates.map { ActivityMinuteSample(date: $0.date, heartRate: $0.bpm) }
+            + spo2.map { ActivityMinuteSample(date: $0.date, spo2: $0.pct) })
+            .filter { range.contains($0.date) }
+        return (sessions, vitals)
+    }
 }
 
 enum SleepDetailsParser {
@@ -70,7 +81,7 @@ enum SleepDetailsParser {
         for _ in 0 ..< headerSize { header.append(r.u8()) }
 
         var headerIdx = 0
-        _ = r.u8(); headerIdx += 1             // isAwake
+        result.awakeFlag = Int(r.u8()); headerIdx += 1   // isAwake
         let bedTime = Int(r.i32()); headerIdx += 1
         let wakeupTime = Int(r.i32()); headerIdx += 1
 
@@ -120,7 +131,7 @@ enum SleepDetailsParser {
         let sessionEnd   = Date(timeIntervalSince1970: TimeInterval(wakeupTime))
 
         var revisions: [Revision] = []
-        var summaryMinutes: (deep: Int, light: Int, rem: Int, wake: Int)?
+        var summaryMinutes: (sleep: Int, deep: Int, light: Int, rem: Int, wake: Int)?
         // A stage packet stamped far outside the night is a misread (an empty one was seen stamped
         // three days early); widening the session to enclose it would make writeSleep clear the gap.
         // Dropped whole before reconciling, so it never claims a stretch from a valid revision.
@@ -159,11 +170,18 @@ enum SleepDetailsParser {
                                             endDate: max(sessionEnd, last.endDate),
                                             phases: stages, rawDataHash: hashOf(data))]
         } else if let s = summaryMinutes {
-            let phases = buildPhasesFromSummary(start: sessionStart,
+            var phases = buildPhasesFromSummary(start: sessionStart,
                                                 deepMin: s.deep, lightMin: s.light,
                                                 remMin: s.rem, wakeMin: s.wake)
-            if !phases.isEmpty {
-                result.sessions = [SleepSession(startDate: sessionStart, endDate: sessionEnd,
+            // A short nap the band closed carries only its total, unstaged; while the night is still
+            // open the same shape is a night not yet scored, so it stays without a session.
+            if phases.isEmpty, s.sleep > 0, result.awakeFlag != 0 {
+                phases = [SleepPhase(startDate: sessionStart,
+                                     endDate: sessionStart.addingTimeInterval(TimeInterval(s.sleep * 60)),
+                                     type: .unspecified)]
+            }
+            if let last = phases.last {
+                result.sessions = [SleepSession(startDate: sessionStart, endDate: max(sessionEnd, last.endDate),
                                                 phases: phases, rawDataHash: hashOf(data))]
             }
         }
@@ -260,9 +278,10 @@ enum SleepDetailsParser {
     //   [7..8]:    rem_duration
     //   [9..10]:   deep_duration
 
-    private static func parseSleepSummary(_ data: Data) -> (deep: Int, light: Int, rem: Int, wake: Int)? {
+    private static func parseSleepSummary(_ data: Data) -> (sleep: Int, deep: Int, light: Int, rem: Int, wake: Int)? {
         guard data.count >= 11 else { return nil }
         return (
+            sleep: Int(data.readUInt16BE(at: 1)),
             deep:  Int(data.readUInt16BE(at: 9)),
             light: Int(data.readUInt16BE(at: 5)),
             rem:   Int(data.readUInt16BE(at: 7)),
@@ -370,7 +389,7 @@ enum SleepDetailsParser {
     }
 
     /// FNV-1a 64-bit over the whole file. The previous XOR-fold collapsed to a single byte
-    /// (0–255), so distinct nights collided and `persistIfNew` silently dropped legitimate new
+    /// (0–255), so distinct nights collided and the store's dedup silently dropped legitimate new
     /// sessions from SwiftData (Apple Health was unaffected — it always rewrites).
     fileprivate static func hashOf(_ data: Data) -> Int {
         var hash: UInt64 = 0xcbf2_9ce4_8422_2325

@@ -40,7 +40,7 @@ struct LatestMetricsView: View {
         func duration(_ type: SleepPhaseType) -> TimeInterval {
             phases.filter { $0.type == type }.reduce(0) { $0 + $1.duration }
         }
-        var asleep: TimeInterval { duration(.light) + duration(.deep) + duration(.rem) }
+        var asleep: TimeInterval { duration(.light) + duration(.deep) + duration(.rem) + duration(.unspecified) }
         var efficiency: Double {
             let inBed = end.timeIntervalSince(start)
             return inBed > 0 ? min(asleep / inBed, 1) : 0
@@ -145,6 +145,7 @@ struct LatestMetricsView: View {
                 row("Deep", Self.duration(s.duration(.deep)))
                 row("REM", Self.duration(s.duration(.rem)))
                 row("Light", Self.duration(s.duration(.light)))
+                if s.duration(.unspecified) > 0 { row("Unstaged", Self.duration(s.duration(.unspecified))) }
                 row("Awake", Self.duration(s.duration(.awake)))
                 row("Efficiency", "\(Int((s.efficiency * 100).rounded()))%")
             }

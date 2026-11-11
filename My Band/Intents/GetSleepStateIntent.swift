@@ -26,11 +26,6 @@ struct GetSleepStateIntent: AppIntent {
     // Runs in the background without bringing the app to the foreground.
     static var openAppWhenRun = false
 
-    /// Beyond this age, the last known sleep window is treated as over rather than ongoing —
-    /// matches the background-sync cadence closely enough that "stale" really does mean "probably
-    /// woke up since", not just "hasn't synced in a while".
-    private static let staleAfter: TimeInterval = 60 * 60
-
     private static let log = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "SleepIntent"
     )
@@ -58,9 +53,9 @@ struct GetSleepStateIntent: AppIntent {
             )
         }
 
-        let age = Date().timeIntervalSince(session.endDate)
-        let lastPhaseIsAwake = session.phases.sorted { $0.startDate < $1.startDate }.last?.type == .awake
-        let sleeping = age < Self.staleAfter && !lastPhaseIsAwake
+        let verdict = SleepStateRule.evaluate(session, now: Date())
+        let sleeping = verdict.asleep
+        Self.log.info("Sleep intent → \(sleeping ? "asleep" : "awake", privacy: .public) (\(verdict.reason, privacy: .public))")
 
         let freshness = RelativeDateTimeFormatter()
         freshness.locale = Locale(identifier: "en_US")
@@ -72,5 +67,43 @@ struct GetSleepStateIntent: AppIntent {
             ? "Yes, asleep (data from \(asOf)\(caveat))."
             : "No, awake (data from \(asOf)\(caveat))."
         return .result(value: sleeping, dialog: IntentDialog(stringLiteral: dialog))
+    }
+}
+
+// MARK: - SleepStateRule
+//
+// While the band has a night open (awakeFlag 0) the report's end keeps pace with each sync, and it
+// freezes once the user wakes; the flag only turns 1 an hour or more later (upstream hardware log,
+// 2026-10-01). So the gap between end and fetch answers sooner than the flag.
+
+enum SleepStateRule {
+
+    /// End this far behind the fetch means the night stopped growing: the band reports whole
+    /// minutes, and the sync itself adds some latency.
+    static let stoppedGrowingAfter: TimeInterval = 5 * 60
+    /// A report older than this says nothing about now — the sync that would refresh it failed.
+    static let staleAfter: TimeInterval = 60 * 60
+    /// An end further ahead of the clock than this is a misread header, not a night in progress.
+    static let clockSkewTolerance: TimeInterval = 5 * 60
+
+    static func evaluate(_ session: SleepSession, now: Date) -> (asleep: Bool, reason: String) {
+        let untrusted = (false, "end date ahead of the clock — untrusted")
+        if session.endDate > now.addingTimeInterval(clockSkewTolerance) { return untrusted }
+        if let fetched = session.fetchedAt, session.endDate > fetched.addingTimeInterval(clockSkewTolerance) { return untrusted }
+
+        let lastPhase = session.phases.max { $0.startDate < $1.startDate }?.type
+        if lastPhase == .awake { return (false, "last phase awake") }
+
+        // Reports stored before the flag and fetch time were kept.
+        guard let flag = session.awakeFlag, let fetched = session.fetchedAt else {
+            let age = now.timeIntervalSince(session.endDate)
+            return (age >= 0 && age < staleAfter, "no flag: ended \(Int(age / 60)) min ago")
+        }
+        if flag != 0 { return (false, "band closed the night") }
+        let lag = fetched.timeIntervalSince(session.endDate)
+        if lag > stoppedGrowingAfter { return (false, "night stopped growing \(Int(lag / 60)) min before the fetch") }
+        let age = now.timeIntervalSince(fetched)
+        if age >= staleAfter { return (false, "open night, but fetched \(Int(age / 60)) min ago") }
+        return (true, "open night, growing at the fetch")
     }
 }

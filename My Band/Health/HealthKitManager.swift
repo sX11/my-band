@@ -163,6 +163,13 @@ final class HealthKitManager {
         return groups
     }
 
+    var canShareSleep: Bool { canShare(sleepType) }
+
+    /// For a re-parse that moved a night's window: writeSleep clears only the new one.
+    func clearSleep(overlapping start: Date, to end: Date) async throws {
+        try await deleteExistingSleep(overlapping: start, to: end)
+    }
+
     private func deleteExistingSleep(overlapping start: Date, to end: Date) async throws {
         let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
         let time = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
@@ -181,6 +188,7 @@ final class HealthKitManager {
         case .light: .asleepCore
         case .deep:  .asleepDeep
         case .rem:   .asleepREM
+        case .unspecified: .asleepUnspecified
         }
     }
 
