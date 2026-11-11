@@ -239,7 +239,26 @@ final class BackgroundSyncManager {
         let shouldDisconnect = disconnectWhenDone ?? !wasConnected
         // userInitiated: false — releasing the active link must NOT stop auto-reconnect, or the band
         // could never wake us again. BandManager re-arms a standing connect on the resulting drop.
-        defer { if shouldDisconnect { manager.disconnect(userInitiated: false) } }
+        // On both paths: a sync that throws late has usually ACKed files already, and a file whose
+        // ACK never leaves CoreBluetooth's queue comes back next sync, rewritten for nothing.
+        do {
+            let outcome = try await syncWithStaleLinkRetry(manager: manager, syncer: syncer, id: id,
+                                                           wasConnected: wasConnected)
+            if shouldDisconnect { await releaseLink(manager) }
+            return outcome
+        } catch {
+            if shouldDisconnect { await releaseLink(manager) }
+            throw error
+        }
+    }
+
+    private func releaseLink(_ manager: BandManager) async {
+        await manager.drainWrites()
+        manager.disconnect(userInitiated: false)
+    }
+
+    private func syncWithStaleLinkRetry(manager: BandManager, syncer: BandSyncer, id: String,
+                                        wasConnected: Bool) async throws -> BandSyncer.HealthSyncOutcome {
         do {
             return try await syncer.syncToHealth()
         } catch SyncError.timeout where wasConnected && staleLinkRetryAllowed {

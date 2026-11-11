@@ -57,6 +57,15 @@ final class HealthKitManager {
     private static let metUnit = HKUnit.kilocalorie()
         .unitDivided(by: HKUnit.gramUnit(with: .kilo).unitMultiplied(by: .hour()))
 
+    /// Band timestamps outside this window are corrupt headers (epoch zero, 1928, far future), not
+    /// readings. `save` drops them; writers that bypass it (workout builders, routes, sleep windows)
+    /// filter on their own.
+    static let minValidDate = Date(timeIntervalSince1970: 1_577_836_800)   // 2020-01-01 UTC
+
+    static func validDateRange(now: Date = Date()) -> ClosedRange<Date> {
+        minValidDate ... now.addingTimeInterval(86_400)
+    }
+
     private var shareTypes: Set<HKSampleType> {
         var types: Set<HKSampleType> = [sleepType, heartRate, stepCount, distance, activeEnergy, spo2,
          bodyTemp, restingHR, vo2Max, distanceCycling, distanceSwimming, swimStrokes,
@@ -105,6 +114,9 @@ final class HealthKitManager {
     /// `clearExisting: false` skips the backstop delete, which a locked phone refuses — the caller
     /// then leaves the file un-ACKed so an unlocked sync clears and rewrites the night.
     func writeSleep(_ sessions: [SleepSession], clearExisting: Bool = true) async throws -> Int {
+        let validDates = Self.validDateRange()
+        // Dropped before grouping, so one corrupt session can't stretch a real night's window.
+        let sessions = sessions.filter { validDates.contains($0.startDate) && validDates.contains($0.endDate) }
         guard !sessions.isEmpty else { return 0 }
         var samples: [HKSample] = []
         for group in Self.groupOverlapping(sessions) {
@@ -122,7 +134,8 @@ final class HealthKitManager {
             ))
 
             for phase in SleepDetailsParser.mergeReports(group) {
-                guard phase.endDate > phase.startDate, let value = Self.sleepValue(phase.type) else { continue }
+                guard phase.endDate > phase.startDate, validDates.contains(phase.startDate),
+                      validDates.contains(phase.endDate), let value = Self.sleepValue(phase.type) else { continue }
                 let id = "mb-sleep-\(Int(phase.startDate.timeIntervalSince1970))-\(phase.type.rawValue)"
                 samples.append(HKCategorySample(
                     type: sleepType, value: value.rawValue,
@@ -183,9 +196,9 @@ final class HealthKitManager {
         // daily-details file carries the same totals (writeActivity), and a day-long sample would
         // win or lose the whole day against the iPhone instead of minute by minute.
         let bpm = HKUnit.count().unitDivided(by: .minute())
-        let validDateRange: ClosedRange<Date> = Date(timeIntervalSince1970: 1_600_000_000)...Date().addingTimeInterval(86400)
+        let validDateRange = Self.validDateRange()
 
-        if let resting = s.restingHR, (35...150).contains(resting) {
+        if let resting = s.restingHR, (35...150).contains(resting), validDateRange.contains(dayStart) {
             samples.append(quantity(restingHR, bpm, Double(resting),
                                     start: dayStart, end: dayEnd, id: "mb-hrresting-\(dayKey)"))
         }
@@ -338,8 +351,13 @@ final class HealthKitManager {
             return (0, [:])
         }
 
+        let validDates = Self.validDateRange()
         for w in workouts {
             guard w.endDate > w.startDate else { continue }
+            guard validDates.contains(w.startDate), validDates.contains(w.endDate) else {
+                log.warning("Workout at \(w.startDate.description, privacy: .public) is outside the valid date range — skipped")
+                continue
+            }
             let key = Int(w.startDate.timeIntervalSince1970)
             let track = Self.route(forWorkoutStart: w.startDate, in: routes)
             // A strength workout with a pending cooldown extends its window by the cooldown length so
@@ -401,7 +419,7 @@ final class HealthKitManager {
                 }
                 log.info("Workout \(key): attaching \(attached) in-workout HR sample(s) to HKWorkout")
             }
-            samples = shareable(samples)
+            samples = shareable(Self.deduplicatingBySyncIdentifier(samples))
             if !samples.isEmpty {
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                     builder.add(samples) { _, error in
@@ -502,6 +520,8 @@ final class HealthKitManager {
     /// time), the samples are still saved as standalone heart rate so the recovery curve isn't lost.
     /// Sync-ids keep re-writes idempotent.
     func writeRecoveryHR(_ samples: [WorkoutHRSample], toWorkout workout: HKWorkout?) async throws -> Int {
+        let validDates = Self.validDateRange()
+        let samples = samples.filter { validDates.contains($0.date) }
         guard !samples.isEmpty else { return 0 }
         let bpm = HKUnit.count().unitDivided(by: .minute())
         let hkSamples = samples.map { s in
@@ -554,7 +574,9 @@ final class HealthKitManager {
     /// hdop is mapped to a positive metre estimate.
     private func attachRoute(_ track: [WorkoutTrackPoint], to workout: HKWorkout) async throws {
         var lastTime = -Double.greatestFiniteMagnitude
+        let validDates = Self.validDateRange()
         let locations: [CLLocation] = track
+            .filter { validDates.contains($0.date) }
             .sorted { $0.date < $1.date }
             .compactMap { p in
                 let t = p.date.timeIntervalSince1970
@@ -728,9 +750,10 @@ final class HealthKitManager {
 
     func writeHeartRateRecoveries(minutes: [ActivityMinuteSample]) async throws -> Int {
         guard canShare(hrRecovery) else { return 0 }
+        let validDates = Self.validDateRange()
         let hrMinutes = minutes
             .compactMap { m in m.heartRate.map { (date: m.date, bpm: $0) } }
-            .filter { (30...250).contains($0.bpm) }
+            .filter { (30...250).contains($0.bpm) && validDates.contains($0.date) }
             .sorted { $0.date < $1.date }
         guard let first = hrMinutes.first?.date, let last = hrMinutes.last?.date else { return 0 }
 
@@ -1114,11 +1137,28 @@ final class HealthKitManager {
     @discardableResult
     /// `tallied: false` for the scale and profile, whose writes can land mid-sync but aren't the band's.
     private func save(_ samples: [HKSample], tallied: Bool = true) async throws -> Int {
-        let allowed = shareable(samples)
+        let validDates = Self.validDateRange()
+        let dated = samples.filter { validDates.contains($0.startDate) && validDates.contains($0.endDate) }
+        let allowed = shareable(Self.deduplicatingBySyncIdentifier(dated))
         guard !allowed.isEmpty else { return 0 }
         try await store.save(allowed)
         if tallied { count(allowed) }
         return allowed.count
+    }
+
+    /// Two samples sharing a sync identifier in one `store.save` can fail the whole batch — re-scored
+    /// reports of the same night repeat `mb-hr-<sec>`. The last occurrence wins, order otherwise kept.
+    static func deduplicatingBySyncIdentifier(_ samples: [HKSample]) -> [HKSample] {
+        var lastIndex: [String: Int] = [:]
+        for (i, sample) in samples.enumerated() {
+            if let id = sample.metadata?[HKMetadataKeySyncIdentifier] as? String { lastIndex[id] = i }
+        }
+        let tagged = samples.filter { $0.metadata?[HKMetadataKeySyncIdentifier] is String }.count
+        guard lastIndex.count < tagged else { return samples }
+        return samples.enumerated().compactMap { i, sample in
+            guard let id = sample.metadata?[HKMetadataKeySyncIdentifier] as? String else { return sample }
+            return lastIndex[id] == i ? sample : nil
+        }
     }
 
     // MARK: - Per-type tally for the sync report
