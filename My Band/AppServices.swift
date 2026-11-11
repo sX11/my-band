@@ -36,8 +36,8 @@ final class AppServices {
 
     private init() {}
 
-    /// Wires the managers and kicks off a reconnect to the known device. Idempotent — safe to call
-    /// from both the AppDelegate and the App initializer, in any order, on any launch.
+    /// Wires the managers and kicks off a reconnect to the known device. Idempotent — the launch path,
+    /// each intent and each sync call it, in any order, on any launch.
     func bootstrap(container: ModelContainer) {
         guard !didBootstrap else { return }
         didBootstrap = true

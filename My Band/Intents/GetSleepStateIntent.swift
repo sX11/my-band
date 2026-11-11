@@ -32,13 +32,14 @@ struct GetSleepStateIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog & ReturnsValue<Bool> {
+        AppServices.shared.bootstrap(container: My_BandApp.sharedModelContainer)
         // Best-effort refresh so the answer isn't working off hours-old data. A failure here (band
-        // out of range, already mid-sync, etc.) isn't fatal — fall through to the last local sync,
+        // out of range, still syncing at the deadline, etc.) isn't fatal — fall through to the last local sync,
         // but it IS reported: an answer built on a sync that never happened is exactly the silent
         // staleness this intent exists to avoid.
         var syncFailed = false
         do {
-            _ = try await BackgroundSyncManager.shared.syncNow(retryStaleLink: false)
+            _ = try await BackgroundSyncManager.value(of: BackgroundSyncManager.shared.startIntentSync())
         } catch {
             syncFailed = true
             Self.log.error("Sync do intent de sono falhou: \(error.localizedDescription)")
