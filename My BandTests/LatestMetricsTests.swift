@@ -74,6 +74,19 @@ struct LatestMetricsTests {
         #expect(night.end == t0.addingTimeInterval(300 * 60))
     }
 
+    @Test func lastNightTakesTheFurthestReportsScoringWhereReportsDisagree() throws {
+        let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+        func phase(_ from: Int, _ to: Int, _ type: SleepPhaseType) -> SleepPhase {
+            SleepPhase(startDate: t0.addingTimeInterval(Double(from) * 60), endDate: t0.addingTimeInterval(Double(to) * 60), type: type)
+        }
+        let early = SleepSession(startDate: t0, endDate: t0.addingTimeInterval(180 * 60),
+                                 phases: [phase(0, 180, .light)])
+        let resync = SleepSession(startDate: t0, endDate: t0.addingTimeInterval(300 * 60),
+                                  phases: [phase(0, 60, .light), phase(60, 120, .deep), phase(120, 300, .rem)])
+        let night = try #require(LatestMetricsView.lastNight([early, resync]))
+        #expect(night.phases == resync.phases)
+    }
+
     @Test func sleepFetchReturnsOnlyThePairedBandsSessions() throws {
         let container = try ModelContainer(for: BandDevice.self, SleepSession.self, ActivityDay.self,
                                            configurations: ModelConfiguration(isStoredInMemoryOnly: true))

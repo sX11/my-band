@@ -30,8 +30,9 @@ import Foundation
 //   [15..16] dataLen (UInt16 **big-endian**)
 //   [17..]   payload (dataLen bytes, big-endian fields)
 //
-// Stage packet types: 16 = summary, 17 = stages. Types 2/3/9/12/13/14/15 are flag-only
+// Stage packet types: 16 = summary, 17 = stages. Types 2/3/9/12/13/14/15/18 are flag-only
 // (no payload). Type 1 (RR intervals) is ignored — HR comes from the header HR section.
+// A file carries one 16 + 17 pair per re-scoring of the night; see `latestRevisionWins`.
 //
 // Type 17 entries are UInt16 BE: bits[15:12] = stage, bits[11:0] = duration_minutes of
 // that stage. The stage starts at the running cursor; the cursor advances by the duration.
@@ -81,7 +82,8 @@ enum SleepDetailsParser {
             r.skip(9)
             _ = r.i32()                        // bedTime2
             _ = r.i32()                        // wakeupTime2
-            headerIdx += 5
+            // Takes bits 4..7 of header[0]; HR is bit 8, SpO₂ bit 9, snore bit 10 (real header DF C0).
+            headerIdx += 4
         }
 
         // Heart-rate samples recorded during sleep — the data Apple Health's sleep
@@ -117,8 +119,12 @@ enum SleepDetailsParser {
         let sessionStart = Date(timeIntervalSince1970: TimeInterval(bedTime))
         let sessionEnd   = Date(timeIntervalSince1970: TimeInterval(wakeupTime))
 
-        var stages: [SleepPhase] = []
+        var revisions: [Revision] = []
         var summaryMinutes: (deep: Int, light: Int, rem: Int, wake: Int)?
+        // A stage packet stamped far outside the night is a misread (an empty one was seen stamped
+        // three days early); widening the session to enclose it would make writeSleep clear the gap.
+        // Dropped whole before reconciling, so it never claims a stretch from a valid revision.
+        let plausible = sessionStart.addingTimeInterval(-6 * 3600) ... sessionEnd.addingTimeInterval(6 * 3600)
 
         while r.remaining >= stagePacketLen {
             guard scanForStageMagic(r) else { break }   // leaves cursor after the 4 magic bytes
@@ -131,21 +137,27 @@ enum SleepDetailsParser {
             let dataLen = (Int(r.u8()) << 8) | Int(r.u8())   // big-endian
 
             // Flag-only packets: the dataLen bytes are flags, no payload follows.
-            if [0x2, 0x3, 0x9, 0xC, 0xD, 0xE, 0xF].contains(type) { continue }
+            if [0x2, 0x3, 0x9, 0xC, 0xD, 0xE, 0xF, 0x12].contains(type) { continue }
             guard dataLen >= 0, r.remaining >= dataLen else { break }
             let payload = r.read(dataLen)
 
             switch type {
             case 16: summaryMinutes = parseSleepSummary(payload)
-            case 17: stages.append(contentsOf: parseSleepStages(payload, base: TimeInterval(ts)))
+            case 17:
+                let revision = parseSleepStages(payload, base: TimeInterval(ts))
+                guard !revision.phases.isEmpty, plausible.contains(revision.start) else { break }
+                revisions.append(revision)
             default: break                      // type 1 (RR intervals) etc. — ignored
             }
         }
 
-        if !stages.isEmpty {
-            let sanitized = sanitizeStages(stages)
-            result.sessions = [SleepSession(startDate: sessionStart, endDate: sessionEnd,
-                                            phases: sanitized, rawDataHash: hashOf(data))]
+        let stages = sanitizeStages(latestRevisionWins(revisions).compactMap { clip($0, to: plausible) })
+        if let first = stages.first, let last = stages.last {
+            // Widened to enclose every phase: the session is the range writeSleep clears, so a
+            // phase outside it would survive a rewrite next to its replacement.
+            result.sessions = [SleepSession(startDate: min(sessionStart, first.startDate),
+                                            endDate: max(sessionEnd, last.endDate),
+                                            phases: stages, rawDataHash: hashOf(data))]
         } else if let s = summaryMinutes {
             let phases = buildPhasesFromSummary(start: sessionStart,
                                                 deepMin: s.deep, lightMin: s.light,
@@ -206,8 +218,11 @@ enum SleepDetailsParser {
 
     // MARK: - Type 0x11 (17): Sleep stages
 
-    private static func parseSleepStages(_ data: Data, base: TimeInterval) -> [SleepPhase] {
-        guard data.count >= 2 else { return [] }
+    /// The revision spans every entry, including the not-sleeping ones it drops: that stretch is
+    /// still the band's latest verdict, and an older revision must not fill it.
+    private static func parseSleepStages(_ data: Data, base: TimeInterval) -> Revision {
+        let start = Date(timeIntervalSince1970: base)
+        guard data.count >= 2 else { return Revision(start: start, end: start, phases: []) }
         var phases: [SleepPhase] = []
         var cursor = base
         let count = data.count / 2
@@ -233,7 +248,7 @@ enum SleepDetailsParser {
             }
             phases.append(SleepPhase(startDate: start, endDate: end, type: stage))
         }
-        return phases
+        return Revision(start: start, end: Date(timeIntervalSince1970: cursor), phases: phases)
     }
 
     // MARK: - Type 0x10 (16): Sleep summary
@@ -275,6 +290,55 @@ enum SleepDetailsParser {
         add(.rem,   minutes: remMin)
         add(.awake, minutes: wakeMin)
         return phases
+    }
+
+    // MARK: - Re-scorings
+
+    struct Revision {
+        var start: Date
+        var end: Date
+        var phases: [SleepPhase]
+    }
+
+    /// Each type-17 packet is a full re-scoring of the night from its own start, and the band
+    /// re-classifies earlier stretches as it goes; only the latest is its verdict. Each revision
+    /// claims its whole span, so an older one survives only outside every newer revision's span.
+    /// `revisions` runs oldest first.
+    static func latestRevisionWins(_ revisions: [Revision]) -> [SleepPhase] {
+        var kept: [SleepPhase] = []
+        var claimed: [(start: Date, end: Date)] = []
+        for revision in revisions.reversed() where revision.end > revision.start {
+            kept += revision.phases.flatMap { outside($0, claimed) }
+            claimed.append((revision.start, revision.end))
+        }
+        return kept.sorted { $0.startDate < $1.startDate }
+    }
+
+    /// Several stored reports of one night (resyncs of a night in progress, or a night's stages and
+    /// details files) merged the same way: a report of an open night grows with each sync, so the
+    /// one reaching furthest is the newest, and it wins wherever it overlaps an older one.
+    static func mergeReports(_ sessions: [SleepSession]) -> [SleepPhase] {
+        let ordered = sessions.enumerated()
+            .sorted { ($0.element.endDate, $0.offset) < ($1.element.endDate, $1.offset) }
+            .map { Revision(start: $0.element.startDate, end: $0.element.endDate, phases: $0.element.phases) }
+        return sanitizeStages(latestRevisionWins(ordered))
+    }
+
+    private static func clip(_ phase: SleepPhase, to window: ClosedRange<Date>) -> SleepPhase? {
+        let start = max(phase.startDate, window.lowerBound), end = min(phase.endDate, window.upperBound)
+        return end > start ? SleepPhase(startDate: start, endDate: end, type: phase.type) : nil
+    }
+
+    private static func outside(_ phase: SleepPhase, _ claimed: [(start: Date, end: Date)]) -> [SleepPhase] {
+        claimed.reduce([phase]) { pieces, span in
+            pieces.flatMap { p -> [SleepPhase] in
+                guard span.start < p.endDate, span.end > p.startDate else { return [p] }
+                var out: [SleepPhase] = []
+                if p.startDate < span.start { out.append(SleepPhase(startDate: p.startDate, endDate: span.start, type: p.type)) }
+                if span.end < p.endDate { out.append(SleepPhase(startDate: span.end, endDate: p.endDate, type: p.type)) }
+                return out
+            }
+        }
     }
 
     // MARK: - Helpers
