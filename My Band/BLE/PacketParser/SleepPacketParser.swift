@@ -172,7 +172,11 @@ enum SleepDetailsParser {
         }
         result.beatWindows = beatBlocks.keys.sorted().compactMap { beatBlocks[$0] }
 
-        let stages = sanitizeStages(latestRevisionWins(revisions).compactMap { clip($0, to: plausible) })
+        // A re-scoring stamped before bedTime is a stray when another starts at or after it, dropped so
+        // it can't override that scoring; with none there, it is the night itself and is kept.
+        let scored = revisions.contains { $0.start >= sessionStart }
+            ? revisions.filter { $0.start >= sessionStart } : revisions
+        let stages = sanitizeStages(latestRevisionWins(scored).compactMap { clip($0, to: plausible) })
         if let first = stages.first, let last = stages.last {
             // Widened to enclose every phase: the session is the range writeSleep clears, so a
             // phase outside it would survive a rewrite next to its replacement.
@@ -432,6 +436,10 @@ enum SleepDetailsParser {
 
 enum SleepStagesParser {
 
+    /// How far before bedTime the first transition may sit (the band's "real" sleep start) and still
+    /// belong to the night when later transitions exist.
+    static let strayLead = 3600
+
     static func parse(_ data: Data, meta: XiaomiActivityFileMeta) -> ParsedSleep {
         var result = ParsedSleep()
         guard meta.version == 2, data.count > 4 else { return result }
@@ -455,6 +463,11 @@ enum SleepStagesParser {
         while r.remaining >= 5 {
             let event = (time: Int(r.u32()), code: r.u8())
             if window.contains(event.time) { events.append(event) }
+        }
+        // Over `strayLead` before bedTime an event is a stray when another falls at or after bedTime;
+        // with none there, the events are the night itself and the session widens back to them.
+        if events.contains(where: { $0.time >= bedTime }) {
+            events.removeAll { $0.time < bedTime - strayLead }
         }
         events.sort { $0.time < $1.time }
 

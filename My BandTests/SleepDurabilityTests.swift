@@ -226,6 +226,41 @@ struct SleepDurabilityTests {
         #expect(stored.map(\.endDate) == [at(3 * 3600), at(6 * 3600)])
     }
 
+    @Test func earlierCutsFollowTheirReparsedNightToItsNewStart() {
+        let holder = session(start: -3600, end: 6 * 3600, hash: 1)
+        holder.rawData = raw(1)
+        let cut = SleepSession(startDate: at(-3600), endDate: at(3 * 3600), phases: [
+            SleepPhase(startDate: at(-3600), endDate: at(-1800), type: .light),
+            SleepPhase(startDate: at(-1800), endDate: at(600), type: .awake),
+            SleepPhase(startDate: at(600), endDate: at(3 * 3600), type: .deep),
+        ], rawDataHash: 2)
+        let otherNight = session(start: 86_400 - 3600, end: 86_400 + 3600, hash: 3)
+        let otherFile = session(start: -3600, end: 2 * 3600, hash: 4)
+        otherFile.rawData = raw(subtype: 0x03, 4)
+
+        BandSyncer.moveCuts(from: at(-3600), to: at(0), among: [holder, cut, otherNight, otherFile])
+
+        #expect(cut.startDate == at(0))
+        #expect(cut.endDate == at(3 * 3600))
+        #expect(cut.phases == [
+            SleepPhase(startDate: at(0), endDate: at(600), type: .awake),
+            SleepPhase(startDate: at(600), endDate: at(3 * 3600), type: .deep),
+        ])
+        #expect(holder.startDate == at(-3600))
+        #expect(otherNight.startDate == at(86_400 - 3600))
+        #expect(otherFile.startDate == at(-3600))
+    }
+
+    @Test func aCutLyingWhollyBeforeTheNewStartKeepsASaneWindow() {
+        let cut = SleepSession(startDate: at(-3600), endDate: at(-1800),
+                               phases: [SleepPhase(startDate: at(-3600), endDate: at(-1800), type: .light)],
+                               rawDataHash: 2)
+        BandSyncer.moveCuts(from: at(-3600), to: at(0), among: [cut])
+        #expect(cut.startDate == at(0))
+        #expect(cut.endDate == at(0))
+        #expect(cut.phases.isEmpty)
+    }
+
     @Test func rawFilesOlderThanTheRetentionAreDropped() throws {
         let context = try makeContext()
         let old = session(start: 0, end: 3600, hash: 1)
