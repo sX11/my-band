@@ -1,0 +1,6 @@
+- [ ] Fallback morning notification can't follow Apple Health's sleep schedule: no public API #notifications #worth(later) #added(2026-11-12)
+	> The fixed-time morning summary uses the band alarm + 30 min or a picked time. Apple
+	> Health's sleep schedule (bedtime, wake-up) exists in the iOS 27.2 SDK only as private
+	> symbols (SleepDaySummary.UserSettings.Schedule in HealthKit.tbd, absent from the
+	> public Swift interface). Undecided: revisit if Apple publishes an API; private API
+	> was rejected.
