@@ -1,10 +1,12 @@
 import SwiftUI
+import UserNotifications
 
 // MARK: - BandSettingsView
 //
 // The band's own settings: heart-rate, SpO₂ and stress monitoring, activity reminders, and the
 // screen on notifications, alert vibration, and the way into watch faces and apps. Every change goes straight to the band and is re-read from it (see
-// BandSettingsService); a section appears once the band has reported it.
+// BandSettingsService); a section appears once the band has reported it. The morning sleep summary
+// is the iPhone's own and stays usable with the band away.
 
 struct BandSettingsView: View {
 
@@ -14,32 +16,40 @@ struct BandSettingsView: View {
     @State private var showCustomize = false
     @AppStorage(CalendarSyncService.pushCalendarKey) private var pushCalendar = true
     @AppStorage(CalendarSyncService.pushRemindersKey) private var pushReminders = true
+    @AppStorage(MorningSleepNotifier.enabledKey) private var morningSummary = true
+    @AppStorage(MorningSleepNotifier.fallbackEnabledKey) private var morningFallback = true
+    @AppStorage(MorningSleepNotifier.fallbackTimeKey) private var morningFallbackMinutes = MorningSleepNotifier.defaultFallbackMinutes
+    @State private var notificationsDenied = false
 
     private var connected: Bool { band.connectionState.isConnected }
 
     var body: some View {
         NavigationStack {
             List {
-                if !connected {
-                    Section {
-                        Text("Connect the band to change its settings.")
-                            .font(.mbFootnote).foregroundStyle(MB.textTertiary)
+                Group {
+                    if !connected {
+                        Section {
+                            Text("Connect the band to change its settings.")
+                                .font(.mbFootnote).foregroundStyle(MB.textTertiary)
+                        }
+                        .listRowBackground(MB.surfaceCard)
+                    } else if !settings.loaded {
+                        Section {
+                            Text("Loading…").font(.mbSubhead).foregroundStyle(MB.textTertiary)
+                        }
+                        .listRowBackground(MB.surfaceCard)
                     }
-                    .listRowBackground(MB.surfaceCard)
-                } else if !settings.loaded {
-                    Section {
-                        Text("Loading…").font(.mbSubhead).foregroundStyle(MB.textTertiary)
-                    }
-                    .listRowBackground(MB.surfaceCard)
+                    heartRateSection
+                    spo2Section
+                    stressSection
+                    activitySection
+                    displaySection
+                    vibrationSection
+                    if connected { customizeSection }
+                    fromIPhoneSection
                 }
-                heartRateSection
-                spo2Section
-                stressSection
-                activitySection
-                displaySection
-                vibrationSection
-                if connected { customizeSection }
-                fromIPhoneSection
+                .disabled(!connected)
+                morningSection
             }
             .scrollContentBackground(.hidden)
             .background(MB.bgApp.ignoresSafeArea())
@@ -49,11 +59,11 @@ struct BandSettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .disabled(!connected)
             .tint(MB.accent)
         }
         .preferredColorScheme(.dark)
         .onAppear { if connected { settings.requestAll() } }
+        .task { notificationsDenied = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus == .denied }
         .sheet(isPresented: $showCustomize) { CustomizeView() }
     }
 
@@ -242,6 +252,54 @@ struct BandSettingsView: View {
             Text("The band keeps its own copy and alerts even away from the iPhone. Turn off if the iPhone's notification already buzzes the band. Applied on the next sync; reminders added on the Reminders page stay.")
         }
         .listRowBackground(MB.surfaceCard)
+    }
+
+    // MARK: - Morning sleep summary
+
+    private var morningSection: some View {
+        Section {
+            toggle("After a sync", detail: "When a sync brings in last night, with how long you slept",
+                   isOn: morningSummary) { morningSummary = $0; replanMorning() }
+            if morningSummary {
+                toggle("Also at a set time", detail: "For mornings no sync runs",
+                       isOn: morningFallback) { morningFallback = $0; replanMorning() }
+                if morningFallback {
+                    HStack {
+                        Text("With a band alarm").font(.mbSubhead).foregroundStyle(MB.textPrimary)
+                        Spacer()
+                        Text("Alarm + \(MorningSleepNotifier.alarmDelayMinutes) min").font(.mbSubhead).foregroundStyle(MB.textSecondary)
+                    }
+                    DatePicker(selection: Binding(
+                        get: { Self.date(minutes: morningFallbackMinutes) },
+                        set: { morningFallbackMinutes = Self.minutes($0); replanMorning() }),
+                               displayedComponents: .hourAndMinute) {
+                        Text("Otherwise at").font(.mbSubhead).foregroundStyle(MB.textPrimary)
+                    }
+                }
+            }
+            if notificationsDenied {
+                Text("Notifications are off for My Band in iOS Settings, so none of these will show.")
+                    .font(.mbFootnote).foregroundStyle(MB.warn)
+            }
+        } header: {
+            Text("Morning sleep summary")
+        } footer: {
+            Text("Opens last night on Sleep & trends, to rate it. One a morning: a sync's summary replaces the set-time one. A band alarm counts if it rings between 3 am and noon.")
+        }
+        .listRowBackground(MB.surfaceCard)
+    }
+
+    private func replanMorning() {
+        Task { await MorningSleepNotifier.replan(.change) }
+    }
+
+    private static func date(minutes: Int) -> Date {
+        Calendar.current.date(bySettingHour: minutes / 60, minute: minutes % 60, second: 0, of: .now) ?? .now
+    }
+
+    private static func minutes(_ date: Date) -> Int {
+        let c = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 
     // MARK: - Pieces

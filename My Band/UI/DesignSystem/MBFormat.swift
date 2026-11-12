@@ -29,4 +29,10 @@ enum MBFormat {
         let minutes = Int((seconds / 60).rounded())
         return "\(minutes / 60) h \(String(format: "%02d", minutes % 60)) min"
     }
+
+    /// "6 h 16 m", "18 m": for a half-width tile or a notification line.
+    static func hoursMinutesShort(_ seconds: TimeInterval) -> String {
+        let minutes = Int((seconds / 60).rounded())
+        return minutes < 60 ? "\(minutes) m" : "\(minutes / 60) h \(minutes % 60) m"
+    }
 }

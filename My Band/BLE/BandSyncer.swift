@@ -581,8 +581,8 @@ final class BandSyncer {
                         // Always (re)write to HealthKit — its sync-identifier dedup makes this
                         // idempotent, so data deleted from Apple Health is restored on re-sync.
                         // SwiftData keeps one record per distinct file.
-                        storeReport(session, raw: fileData, awakeFlag: parsed.awakeFlag, fetchedAt: Date(), context)
-                        sleepToWrite.append(session)
+                        sleepToWrite.append(storeReport(session, raw: fileData, awakeFlag: parsed.awakeFlag,
+                                                        fetchedAt: Date(), context))
                     }
                     // HR/SpO₂ recorded during sleep — written within the sleep window so
                     // Apple Health's sleep "Comparisons" tab can correlate them.
@@ -669,6 +669,8 @@ final class BandSyncer {
             }
             outcome.healthSamplesWritten += await writeHRV(HeartRateVariability.nightBlocks(sleepBeats),
                                                            clearExisting: cleared)
+            // Last, so the sheet the notification opens already has the night's vitals and HRV.
+            if contextSaved, !sleepToWrite.isEmpty { await MorningSleepNotifier.notifyIfDue(sleepToWrite) }
             writtenSleepIds.formUnion(sleepIds)
             guard cleared else { return }
             guard contextSaved else {
@@ -964,9 +966,10 @@ final class BandSyncer {
 
     /// Inserts a new report, or refreshes the stored one with the same bytes: its phases take the
     /// current parse, and its fetch time moves while its end doesn't — the night stopped growing,
-    /// which is how the sleep intent tells the user woke up.
+    /// which is how the sleep intent tells the user woke up. Returns the stored record.
+    @discardableResult
     func storeReport(_ session: SleepSession, raw: Data, awakeFlag: Int?, fetchedAt: Date,
-                     _ context: ModelContext) {
+                     _ context: ModelContext) -> SleepSession {
         let hash = session.rawDataHash
         let sameHash = FetchDescriptor<SleepSession>(predicate: #Predicate { $0.rawDataHash == hash })
         // The hash is 64-bit, so a stored length that differs is a collision, not the same file.
@@ -987,6 +990,7 @@ final class BandSyncer {
         report.fetchedAt = fetchedAt
         if report.rawData == nil { report.rawData = raw }
         Self.pruneRawData(around: report, in: context)
+        return report
     }
 
     /// A long night is ~140 KB and every sync of it stores another report, so only the report

@@ -49,6 +49,7 @@ final class AppServices {
         bandSyncer.setup(manager: bandManager, context: container.mainContext)
         customization.setup(manager: bandManager)
         alarms.setup(manager: bandManager)
+        alarms.onListLoaded = { Task { await MorningSleepNotifier.replan(.change) } }
         reminders.setup(manager: bandManager)
         bandSettings.setup(manager: bandManager)
         todayActivity.setup(manager: bandManager)
