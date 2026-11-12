@@ -1056,6 +1056,33 @@ final class HealthKitManager {
         return SleepTrend.nights(intervals, days: days, today: now, calendar: cal)
     }
 
+    /// Heart rate, HRV and SpO₂ inside each night's main sleep, every source, as raw samples: a
+    /// median and the sparklines need the points, which statistics queries don't give.
+    func nightVitals(spans: [Date: DateInterval]) async throws -> [Date: NightVitals] {
+        guard !spans.isEmpty else { return [:] }
+        let time = NSCompoundPredicate(orPredicateWithSubpredicates: spans.values.map {
+            HKQuery.predicateForSamples(withStart: $0.start, end: $0.end)
+        })
+        async let hrPoints = vitalPoints(heartRate, unit: .count().unitDivided(by: .minute()), in: time)
+        async let hrvPoints = vitalPoints(Self.hrv, unit: .secondUnit(with: .milli), in: time)
+        async let spo2Points = vitalPoints(spo2, unit: .percent(), in: time)
+        let points: [VitalKind: [VitalPoint]] = [
+            .heartRate: try await hrPoints,
+            .hrv: try await hrvPoints,
+            .spo2: try await spo2Points.map { VitalPoint(date: $0.date, value: $0.value * 100) },
+        ]
+        return NightVitals.split(points, spans: spans)
+    }
+
+    private func vitalPoints(_ type: HKQuantityType, unit: HKUnit, in time: NSPredicate) async throws -> [VitalPoint] {
+        let descriptor = HKSampleQueryDescriptor(
+            predicates: [.quantitySample(type: type, predicate: time)],
+            sortDescriptors: [SortDescriptor(\.startDate)])
+        return try await descriptor.result(for: store).map {
+            VitalPoint(date: $0.startDate, value: $0.quantity.doubleValue(for: unit))
+        }
+    }
+
     /// In bed is dropped; awake is kept only to override other sources in the merge.
     private static func trendStage(_ value: Int) -> SleepTrend.Stage? {
         switch HKCategoryValueSleepAnalysis(rawValue: value) {

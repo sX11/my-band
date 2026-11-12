@@ -84,6 +84,7 @@ struct My_BandApp: App {
                 AppServices.shared.reconnectIfNeeded()
                 // iOS only starts a Live Activity in the foreground; a workout begun in the pocket waits for this.
                 AppServices.shared.workoutActivity.retryIfNeeded()
+                Task { await MorningSleepNotifier.replan(.foreground) }
             default:
                 break
             }

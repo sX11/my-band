@@ -5,7 +5,8 @@ import HealthKit
 // MARK: - TrendsView
 //
 // The page left of the Dashboard (ADR 0010): seven days of sleep, resting heart rate, steps,
-// SpO₂ and weight read back from Apple Health each time the page appears. Nothing read here is stored.
+// SpO₂ and weight read back from Apple Health each time the page appears, and the night sheet's
+// vitals with them. Nothing read here is stored.
 
 struct TrendsView: View {
 
@@ -15,9 +16,12 @@ struct TrendsView: View {
 
     @State private var trends: Trends?
     @State private var errorText: String?
+    @State private var openNight: OpenNight?
+    private let navigation = AppNavigation.shared
 
     struct Trends {
         var sleep: [SleepTrend.Night] = []
+        var vitals: [Date: NightVitals] = [:]
         var restingHR: [DayValue] = []
         var steps: [DayValue] = []
         var spo2: [DayValue] = []
@@ -31,7 +35,7 @@ struct TrendsView: View {
                     if let errorText {
                         MBCard { Text(errorText).font(.mbFootnote).foregroundStyle(MB.textTertiary) }
                     } else if let trends {
-                        SleepTrendCard(nights: trends.sleep)
+                        SleepTrendCard(nights: trends.sleep, vitals: trends.vitals) { openNight = OpenNight(day: $0) }
                         DayTrendCard(title: "Resting heart rate", icon: "heart.fill", tint: MB.hr,
                                      values: trends.restingHR, style: .line, format: { "\(Int($0.rounded()))" }, unit: "bpm")
                         DayTrendCard(title: "Steps", icon: "figure.walk", tint: MB.steps,
@@ -59,9 +63,27 @@ struct TrendsView: View {
             guard isActive else { return }
             await load()
         }
+        // An inactive page loads, and so consumes the request, once RootView turns to it.
+        .onChange(of: navigation.openNight) { _, night in
+            if night != nil, isActive { Task { await load() } }
+        }
+        .sheet(item: $openNight) { opened in
+            NightDetailSheet(nights: trends?.sleep ?? [], vitals: trends?.vitals ?? [:],
+                             day: Binding(get: { openNight?.day ?? opened.day }, set: { openNight?.day = $0 }))
+        }
+    }
+
+    /// A notification tap's night, opened by a load that began after the tap, so a night the sync
+    /// just wrote is in. One Health doesn't hold yet opens the latest night instead.
+    private func consumeOpenNight(_ request: Date?, in trends: Trends) {
+        guard let request, navigation.openNight == request else { return }
+        navigation.openNight = nil
+        let day = trends.sleep.contains(where: { $0.day == request }) ? request : trends.sleep.last?.day
+        if let day { openNight = OpenNight(day: day) }
     }
 
     private func load() async {
+        let request = navigation.openNight
         let hk = HealthKitManager.shared
         do {
             // A no-op once answered; asks only if this page opens before any sync did.
@@ -71,11 +93,15 @@ struct TrendsView: View {
             async let steps = hk.dailyTrend(.stepCount, unit: .count())
             async let spo2 = hk.dailyTrend(.oxygenSaturation, unit: .percent())
             async let weight = hk.dailyTrend(.bodyMass, unit: .gramUnit(with: .kilo))
-            var t = Trends(sleep: try await sleep, restingHR: try await resting, steps: try await steps,
+            let nights = try await sleep
+            // The spans come from the nights, so this waits on sleep while the other reads run on.
+            let vitals = try await hk.nightVitals(spans: Dictionary(uniqueKeysWithValues: nights.map { ($0.day, $0.span) }))
+            var t = Trends(sleep: nights, vitals: vitals, restingHR: try await resting, steps: try await steps,
                            spo2: try await spo2, weight: try await weight)
             t.spo2 = t.spo2.map { DayValue(day: $0.day, value: $0.value * 100) }
             trends = t
             errorText = nil
+            consumeOpenNight(request, in: t)
         } catch is CancellationError {
             return
         } catch let error as HKError where error.code == .errorDatabaseInaccessible {
@@ -86,10 +112,18 @@ struct TrendsView: View {
     }
 }
 
+/// Its own id, so switching nights inside the sheet doesn't present it again.
+private struct OpenNight: Identifiable {
+    let id = UUID()
+    var day: Date
+}
+
 // MARK: - Sleep trend
 
 private struct SleepTrendCard: View {
     let nights: [SleepTrend.Night]
+    let vitals: [Date: NightVitals]
+    let onOpen: (Date) -> Void
 
     private struct Bar: Identifiable {
         let day: Date
@@ -120,17 +154,55 @@ private struct SleepTrendCard: View {
                             .foregroundStyle(by: .value("Stage", b.stage.title))
                     }
                     .chartForegroundStyleScale([
-                        SleepTrend.Stage.deep.title: MB.sleepDeep,
-                        SleepTrend.Stage.rem.title: MB.sleepREM,
-                        SleepTrend.Stage.core.title: MB.sleepLight,
-                        SleepTrend.Stage.unspecified.title: MB.accent,
+                        SleepTrend.Stage.deep.title: SleepTrend.Stage.deep.color,
+                        SleepTrend.Stage.rem.title: SleepTrend.Stage.rem.color,
+                        SleepTrend.Stage.core.title: SleepTrend.Stage.core.color,
+                        SleepTrend.Stage.unspecified.title: SleepTrend.Stage.unspecified.color,
                     ])
                     .chartXScale(domain: TrendFormat.weekDomain)
                     .trendAxes()
+                    // A tap only, no drag, so a horizontal swipe still reaches the page view.
+                    .chartOverlay { proxy in
+                        GeometryReader { geo in
+                            Rectangle().fill(.clear).contentShape(Rectangle())
+                                .gesture(SpatialTapGesture().onEnded { tap in
+                                    guard let plot = proxy.plotFrame,
+                                          let at: Date = proxy.value(atX: tap.location.x - geo[plot].origin.x)
+                                    else { return }
+                                    let day = Calendar.current.startOfDay(for: at)
+                                    if nights.contains(where: { $0.day == day }) { onOpen(day) }
+                                })
+                        }
+                    }
                     .frame(height: 140)
+                    if let latest = nights.last {
+                        Divider().overlay(MB.hairline)
+                        Button { onOpen(latest.day) } label: {
+                            HStack {
+                                Text(latestLine(latest)).font(.mbFootnote).monospacedDigit().foregroundStyle(MB.textSecondary)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(MB.textTertiary)
+                            }
+                            .frame(minHeight: MB.Space.rowMinHeight)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Opens the night's stages, vitals and rating")
+                    }
                 }
             }
         }
+    }
+}
+
+private extension SleepTrendCard {
+    /// "Tue 11 Nov · 6 h 16 m asleep · HRV 22 ms".
+    func latestLine(_ night: SleepTrend.Night) -> String {
+        var parts = [night.day.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated).locale(MBFormat.locale)),
+                     "\(MBFormat.hoursMinutesShort(Double(night.mainAsleep) * 60)) asleep"]
+        if let hrv = vitals[night.day]?.hrvMedian { parts.append("HRV \(Int(hrv.rounded())) ms") }
+        return parts.joined(separator: " · ")
     }
 }
 

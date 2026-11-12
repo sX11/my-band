@@ -42,6 +42,9 @@ final class AlarmService {
     /// Unknown until the list is read, so adding waits for it rather than overfilling the band.
     var canAdd: Bool { loaded && alarms.count + pendingCreates.count + ackedCreates < capacity }
 
+    /// Each time the band's list arrives; the morning fallback follows the alarms.
+    var onListLoaded: (() -> Void)?
+
     private weak var bandManager: BandManager?
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Alarms")
 
@@ -154,6 +157,7 @@ final class AlarmService {
             loaded = true
             ackedCreates = 0
             log.info("Alarms: \(self.alarms.count, privacy: .public) of max \(self.maxAlarms ?? -1, privacy: .public)")
+            onListLoaded?()
         case XiaomiScheduleCmd.alarmCreate:
             if !pendingCreates.isEmpty {
                 pendingCreates.removeFirst()

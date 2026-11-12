@@ -24,6 +24,7 @@ struct RootView: View {
     private enum Phase { case setup, connecting, ready }
     @State private var phase: Phase = .setup
     @State private var page = 1
+    private let navigation = AppNavigation.shared
 
     var body: some View {
         Group {
@@ -68,6 +69,10 @@ struct RootView: View {
             }
         }
         .animation(.easeOut(duration: MB.Motion.durBase), value: phase)
+        // Initial too: a tap that cold-launched the app set it before this view existed.
+        .onChange(of: navigation.openNight, initial: true) { _, night in
+            if night != nil { page = 0 }
+        }
         .preferredColorScheme(.dark)
         .onAppear(perform: bootstrap)
     }

@@ -1,6 +1,6 @@
 # CLAUDE.md — My Band
 
-Architecture guide and guidelines for the **My Band** project: a universal iOS/macOS app that connects to the Mi Band 10 over BLE using the AuthKey, syncs health data to Apple Health and supports Shortcuts through App Intents. Health data lives in Apple Health; the exceptions are the Dashboard's Today card, with the band's live counters (ADR 0005), the live workout card, while the band records a workout (ADR 0008), the Health sheet, with the latest value of each reading from the last sync (ADR 0006), the Workouts screen, with the latest workouts the app itself recorded, read back from Apple Health (ADR 0009), and the Sleep & trends page, with seven days of trends read from Apple Health (ADR 0010).
+Architecture guide and guidelines for the **My Band** project: a universal iOS/macOS app that connects to the Mi Band 10 over BLE using the AuthKey, syncs health data to Apple Health and supports Shortcuts through App Intents. Health data lives in Apple Health; the exceptions are the Dashboard's Today card, with the band's live counters (ADR 0005), the live workout card, while the band records a workout (ADR 0008), the Health sheet, with the latest value of each reading from the last sync (ADR 0006), the Workouts screen, with the latest workouts the app itself recorded, read back from Apple Health (ADR 0009), and the Sleep & trends page, with seven days of trends read from Apple Health and a sheet per night with its stages and vitals (ADR 0010). The one health-like value the app stores is that sheet's night rating, in `UserDefaults` (ADR 0010 addendum).
 
 ---
 
@@ -13,7 +13,7 @@ Architecture guide and guidelines for the **My Band** project: a universal iOS/m
 | UI | SwiftUI, Liquid Glass on chrome/status (`MBStatusPill` etc.) |
 | Persistence | SwiftData |
 | Bluetooth | CoreBluetooth (BLE only — the Mi Band 10 does not use Classic BT) |
-| Health | HealthKit — the only surface for stored data; the Dashboard shows the day's live counters (ADR 0005) and the latest value of each reading from the last sync (ADR 0006); the Workouts screen reads back the workouts the app itself recorded (ADR 0009); the Sleep & trends page reads seven days of trends (ADR 0010) |
+| Health | HealthKit — the only surface for stored data; the Dashboard shows the day's live counters (ADR 0005) and the latest value of each reading from the last sync (ADR 0006); the Workouts screen reads back the workouts the app itself recorded (ADR 0009); the Sleep & trends page reads seven days of trends and each night's vitals for its night sheet (ADR 0010) |
 | Automation | App Intents + Shortcuts |
 | Distribution | Personal use — sideloaded via a personal Apple Developer Program account (no App Store) |
 
@@ -25,7 +25,9 @@ Architecture guide and guidelines for the **My Band** project: a universal iOS/m
 My Band/
 ├── App/
 │   ├── My_BandApp.swift          # Entry point, global dependency injection
-│   └── AppDelegate.swift         # BLE background lifecycle on iOS
+│   ├── AppNavigation.swift       # Where a notification tap sends the UI (the night to open)
+│   ├── NotificationRouter.swift  # UNUserNotificationCenter delegate: routes the morning summary's tap
+│   └── AppDelegate.swift         # BLE background lifecycle on iOS; sets the notification delegate
 │
 ├── BLE/
 │   ├── BandManager.swift         # Central BLE orchestrator (@Observable @MainActor NSObject)
@@ -55,7 +57,8 @@ My Band/
 │
 ├── Health/
 │   ├── HealthKitManager.swift    # Authorization and writes to Apple Health
-│   └── HealthSyncService.swift  # Conversion of Mi Band data → HealthKit types
+│   ├── HealthSyncService.swift  # Conversion of Mi Band data → HealthKit types
+│   └── MorningSleepNotifier.swift # Morning sleep summary after a sync, plus the fixed-time fallback
 │
 ├── Intents/
 │   ├── SyncBandIntent.swift      # App Intent: sync data now
@@ -72,6 +75,7 @@ My Band/
 │   ├── ActivityDay.swift         # SwiftData model of daily activity
 │   ├── LatestMetrics.swift       # Snapshot of the latest value of each reading, for the Health sheet (ADR 0006)
 │   ├── HealthSyncLog.swift       # What each sync sent to Apple Health, per type, for the Health sheet
+│   ├── NightRatings.swift        # 0–5 night ratings in UserDefaults, 90 days (ADR 0010 addendum)
 │   ├── WorkoutWindows.swift      # Windows of recorded workouts, so the daily detail excludes distance/energy (ADR 0007)
 │   ├── StrengthWorkoutExtras.swift # Matches the phone's strength route and post-workout HR to the band's workout
 │   └── HeartRateSample.swift     # SwiftData model of HR samples
@@ -83,7 +87,7 @@ My Band/
     ├── Profile/                  # BodySection: height and weight in the Health sheet (→ BMI in Apple Health)
     ├── Customize/                # Watch faces and RPK apps (opened from Band settings)
     ├── Workouts/                 # List of workouts read from Apple Health (ADR 0009)
-    ├── Trends/                   # 7-day trends from Apple Health (ADR 0010)
+    ├── Trends/                   # 7-day trends from Apple Health and the night sheet (ADR 0010)
     ├── Reminders/                # Page to the right of Workouts: band reminders, create/delete (ReminderService)
     ├── Settings/                 # General settings
     └── LiveActivity/             # WorkoutActivityController: workout Live Activity (ADR 0008)
@@ -193,7 +197,7 @@ Some features are **push** from the band: it sends the command and the app react
 
 > **The end of a workout triggers an automatic, targeted sync.** `workoutStatusWatch` status=finished **carries the `activityFileIds`** of the just-recorded workout (summary + GPS route). `BandManager` passes them on in the callback (`onWorkoutStatusWatch(status, fileIds)`) → `WorkoutGpsService.onWorkoutFinished(fileIds)` → `BandSyncer` waits ~8 s (for the band to flush the file) and runs `syncWorkoutFiles(_:)` if still connected, fetching/parsing/writing/ACKing **exactly** those files — without re-listing the backlog (FETCH_TODAY/PAST). Firmware that omits the ids falls back to the full `syncToHealth()`. The per-file processing loop is shared in `BandSyncer.processActivityFiles`. Daily totals, which the workout also updates, are left for the next regular sync.
 >
-> **There is no equivalent trigger for "woke up".** The Mi Band 10 does not send an end-of-sleep event; sleep is only fetched when the app runs the fetch (foreground or `BackgroundSyncManager`). Outside the end of a workout, the model remains **pull**: the app reconnects and fetches the pending file-ids.
+> **There is no equivalent trigger for "woke up".** The Mi Band 10 does not send an end-of-sleep event; sleep is only fetched when the app runs the fetch (foreground or `BackgroundSyncManager`). Outside the end of a workout, the model remains **pull**: the app reconnects and fetches the pending file-ids. The morning sleep summary (`MorningSleepNotifier`) therefore fires only when a sync brings in a closed night of at least 3 h that began before 03:00 and ended between 03:00 and 12:00 today, posted once the night, its vitals and HRV are in Apple Health; a fixed-time fallback, planned 7 mornings ahead under the same `morningSleep-<day>` identifier, covers mornings with no sync, and a sync's summary replaces it, silently if it already showed (ADR 0010 addendum).
 
 ### Configuration sent to the band (app → band)
 
@@ -422,7 +426,7 @@ NSHealthShareUsageDescription
 
 The UI is built from the **Claude Design** handoff (`My Band — Design System`, a bundle exported from claude.ai/design). Recreate it faithfully in SwiftUI — copy the **visual result**, not the HTML/JSX structure of the prototypes.
 
-> **Apple Health is the surface for health data** (ADR 0005, which supersedes 0001). The Dashboard shows connection state, sync freshness, battery, alarms, band settings and the Today card — steps, kcal and HR read once from the band's realtime stats and never stored; stand hours come from the last sync's daily summary. The Health card opens the Health sheet with the latest value of each reading (HR, SpO₂, stress, temperature, day summary, last night), kept as a single overwritten snapshot, plus height and weight to edit and the log of what the syncs sent to Apple Health (ADR 0006 and its addendum). The history shown lives on two side pages, nothing stored: Workouts, with the app's own latest workouts (ADR 0009), and Sleep & trends, with 7-day charts of sleep, resting HR, steps, SpO₂ and weight (ADR 0010). Outside them, no history and no charts.
+> **Apple Health is the surface for health data** (ADR 0005, which supersedes 0001). The Dashboard shows connection state, sync freshness, battery, alarms, band settings and the Today card — steps, kcal and HR read once from the band's realtime stats and never stored; stand hours come from the last sync's daily summary. The Health card opens the Health sheet with the latest value of each reading (HR, SpO₂, stress, temperature, day summary, last night), kept as a single overwritten snapshot, plus height and weight to edit and the log of what the syncs sent to Apple Health (ADR 0006 and its addendum). The history shown lives on two side pages, nothing stored: Workouts, with the app's own latest workouts (ADR 0009), and Sleep & trends, with 7-day charts of sleep, resting HR, steps, SpO₂ and weight, and a sheet per night with its stages, HR, HRV and SpO₂ and a rating of how it felt, the one value kept, in `UserDefaults` (ADR 0010 and its addendum). Outside them, no history and no charts.
 
 **The maker's fixed principles:**
 1. **Dark-mode first** — "I like night mode".
@@ -439,7 +443,7 @@ The UI is built from the **Claude Design** handoff (`My Band — Design System`,
 - **Continuous corners**: cards 16, sheets 20, hero/modal 28, round pills. **4-pt grid**, gutter 20, hit target ≥44.
 - **Icons**: SF Symbols (the web kit uses Lucide as a stand-in). Status is always color + symbol, never color alone.
 
-**Voice & copy (English):** sentence case, no emoji, address the user as **you**, device = "the band". Calm, factual tone ("Synced 2 min ago", "42 samples in Apple Health"). Health metrics only on the Today card (ADR 0005), on the Health card/sheet (ADR 0006), on the workout card and in the Live Activity while the band records a workout (ADR 0008), on the Workouts screen, with the workouts the app itself recorded (ADR 0009), and on the Sleep & trends page (ADR 0010); outside them a number is always about status/sync. Technical honesty: AuthKey/BLE shown in mono, AuthKey masked by default.
+**Voice & copy (English):** sentence case, no emoji, address the user as **you**, device = "the band". Calm, factual tone ("Synced 2 min ago", "42 samples in Apple Health"). Health metrics only on the Today card (ADR 0005), on the Health card/sheet (ADR 0006), on the workout card and in the Live Activity while the band records a workout (ADR 0008), on the Workouts screen, with the workouts the app itself recorded (ADR 0009), and on the Sleep & trends page and its night sheet (ADR 0010), and in the morning sleep notification that opens it; outside them a number is always about status/sync. Technical honesty: AuthKey/BLE shown in mono, AuthKey masked by default.
 
 **Screens (`ui_kits/app/`):** `Dashboard` (connection status, sync freshness, battery, sync, alarms, band settings, the Today card — ADR 0005 —, the Health sheet — ADR 0006 — the live workout card — ADR 0008 — and, one swipe to the left, the Workouts page with the latest workouts read from Apple Health — ADR 0009 —, and, one swipe to the right, the Sleep & trends page — ADR 0010 —, and, after Workouts, the Reminders page), `Setup` (AuthKey + scan/connection), `Settings`. Connection status + sync freshness are first-class on every screen.
 

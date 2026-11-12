@@ -221,7 +221,10 @@ final class BackgroundSyncManager {
         staleLinkRetryAllowed = retryStaleLink
         let task = Task { @MainActor in try await self.performSync(disconnectWhenDone: disconnectWhenDone) }
         inFlight = task
-        defer { inFlight = nil }
+        defer {
+            inFlight = nil
+            Task { await MorningSleepNotifier.replan(.sync) }
+        }
         return try await task.value
     }
 
