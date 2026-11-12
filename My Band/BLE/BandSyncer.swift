@@ -923,6 +923,18 @@ final class BandSyncer {
         return blocks.filter { block in sessions.contains { block.start < $0.endDate && block.end > $0.startDate } }
     }
 
+    /// A night's blocks overlapping none of `sessions` (its files' own and every other stored night's),
+    /// whose values an older parse may have written. Deleted by sync id: a time span could reach a
+    /// neighbouring nap's values. An open night's withheld last block overlaps its session, so it stays.
+    static func staleBeats(_ files: [ParsedSleep], sessions: [SleepSession]) -> [BeatWindow] {
+        var byStart: [Date: BeatWindow] = [:]
+        for block in files.flatMap(\.beatWindows)
+        where !sessions.contains(where: { block.start < $0.endDate && block.end > $0.startDate }) {
+            byStart[block.start] = block
+        }
+        return byStart.values.sorted { $0.start < $1.start }
+    }
+
     /// Best-effort, and never a reason to hold a sleep file. Without the permission it re-arms the
     /// stored-night pass, which backfills once HRV is granted; a failed night is queued for that pass.
     private func writeHRV(_ blocks: [BeatWindow], clearExisting: Bool) async -> Int {
@@ -1020,7 +1032,7 @@ final class BandSyncer {
     // Bump when SleepDetailsParser/SleepStagesParser read the same bytes differently: the next
     // foreground, unlocked sync re-parses every stored file and rewrites its night in Apple Health.
     // Nights stored before raw files were kept have nothing to re-read and are left as they are.
-    static let sleepParserRevision = 1
+    static let sleepParserRevision = 2
     private static let sleepParserRevisionKey = "sleepParserRevisionApplied"
 
     private func reparseStoredSleepIfParserChanged(context: ModelContext) async {
@@ -1044,6 +1056,19 @@ final class BandSyncer {
         UserDefaults.standard.set(Self.sleepParserRevision, forKey: Self.sleepParserRevisionKey)
     }
 
+    /// Earlier cuts of a night keep no bytes (`pruneRawData`), so they can't be re-parsed: they follow
+    /// the report holding the file to its new start, or `mergeReports` would bring back what it dropped.
+    static func moveCuts(from oldStart: Date, to newStart: Date, among reports: [SleepSession]) {
+        for cut in reports where cut.startDate == oldStart && cut.rawData == nil {
+            cut.phases = cut.phases.compactMap { phase in
+                let start = max(phase.startDate, newStart)
+                return phase.endDate > start ? SleepPhase(startDate: start, endDate: phase.endDate, type: phase.type) : nil
+            }
+            cut.startDate = newStart
+            cut.endDate = max(cut.endDate, newStart)
+        }
+    }
+
     /// Each night is written on its own, so one that fails is retried without holding back the rest.
     private func reparseStoredSleep(_ context: ModelContext) async -> (nights: Int, failed: Int) {
         let all = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
@@ -1051,6 +1076,7 @@ final class BandSyncer {
         let stored = Self.parseStoredFiles(all)
         var vitals: [ObjectIdentifier: [ActivityMinuteSample]] = [:]
         var oldWindows: [ObjectIdentifier: (start: Date, end: Date)] = [:]
+        var moved: [(from: Date, to: Date)] = []
         for report in all {
             oldWindows[ObjectIdentifier(report)] = (report.startDate, report.endDate)
             guard let parsed = stored.parsed[ObjectIdentifier(report)] else { continue }
@@ -1058,11 +1084,13 @@ final class BandSyncer {
             vitals[ObjectIdentifier(report)] = fresh.vitals
             // A file the current parser makes no valid night of keeps its old record.
             guard let session = fresh.sessions.first else { continue }
+            if session.startDate != report.startDate { moved.append((report.startDate, session.startDate)) }
             report.startDate = session.startDate
             report.endDate = session.endDate
             report.phases = session.phases
             report.awakeFlag = parsed.awakeFlag
         }
+        for move in moved { Self.moveCuts(from: move.from, to: move.to, among: all) }
         let nights = HealthKitManager.groupOverlapping(all).filter { night in
             night.contains { vitals[ObjectIdentifier($0)] != nil }
         }
@@ -1220,9 +1248,15 @@ final class BandSyncer {
                         Self.writableBeats(parsed, inRange: sessions, settled: night.settled))
             }
             let blocks = HeartRateVariability.nightBlocks(beats)
+            let inNight = Set(night.reports.map(ObjectIdentifier.init))
+            let files = night.reports.filter { stored.firstHolders.contains(ObjectIdentifier($0)) }
+                .compactMap { stored.parsed[ObjectIdentifier($0)] }
+            let stale = Self.staleBeats(files, sessions: files.flatMap { $0.inRange(validDates).sessions }
+                                            + recent.filter { !inNight.contains(ObjectIdentifier($0)) })
             do {
-                if !blocks.isEmpty {
-                    written += try await HealthKitManager.shared.writeHeartRateVariability(blocks, clearExisting: true).written
+                if !blocks.isEmpty || !stale.isEmpty {
+                    written += try await HealthKitManager.shared.writeHeartRateVariability(blocks, clearExisting: true,
+                                                                                          stale: stale).written
                 }
                 if night.settled, let furthest = SleepSession.furthest(night.reports) {
                     settledDone.insert(furthest.rawDataHash)

@@ -183,6 +183,17 @@ final class HealthKitManager {
         }
     }
 
+    private func deleteOwn(_ type: HKSampleType, syncIdentifiers: [String]) async throws {
+        let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
+        let ids = HKQuery.predicateForObjects(withMetadataKey: HKMetadataKeySyncIdentifier, allowedValues: syncIdentifiers)
+        let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [mine, ids])
+        do {
+            _ = try await store.deleteObjects(of: type, predicate: predicate)
+        } catch let error as HKError where error.code == .errorNoData {
+            // None of those values was ever written.
+        }
+    }
+
     private static func sleepValue(_ type: SleepPhaseType) -> HKCategoryValueSleepAnalysis? {
         switch type {
         case .awake: .awake
@@ -759,9 +770,9 @@ final class HealthKitManager {
 
     // MARK: - Heart rate variability (sleep beat-to-beat intervals)
 
-    /// Bump when HeartRateVariability changes how a block's value is computed: it is also the HRV
+    /// Bump when the values written change, how a block's is computed or which blocks give one: it is also the HRV
     /// backfill's revision, so the next foreground sync rewrites every stored night at this version.
-    static let hrvAlgorithmVersion = 1
+    static let hrvAlgorithmVersion = 2
 
     /// The band measured these, not the phone: `.local()` would credit the iPhone.
     static let bandDevice = HKDevice(name: "Xiaomi Smart Band 10", manufacturer: "Xiaomi", model: "Smart Band 10",
@@ -769,7 +780,11 @@ final class HealthKitManager {
                                      localIdentifier: nil, udiDeviceIdentifier: nil)
 
     static func hrvSyncIdentifier(_ value: HeartRateVariability.BlockValue) -> String {
-        "mb-hrv-\(Int(value.blockStart.timeIntervalSince1970))"
+        hrvSyncIdentifier(blockStart: value.blockStart)
+    }
+
+    static func hrvSyncIdentifier(blockStart: Date) -> String {
+        "mb-hrv-\(Int(blockStart.timeIntervalSince1970))"
     }
 
     /// One SDNN value per block, keyed by the block's start so a rewrite replaces it in place.
@@ -794,15 +809,20 @@ final class HealthKitManager {
 
     /// Optional enrichment: without permission it writes nothing and flags no skip, so it can't hold sleep
     /// files un-ACKed. `clearExisting` first deletes this app's values in each night's span (a locked phone
-    /// refuses it), so a block that stopped yielding a value doesn't keep its old one.
-    func writeHeartRateVariability(_ blocks: [BeatWindow],
-                                   clearExisting: Bool) async throws -> (written: Int, medianMs: Double?) {
-        guard canShareHRV, !blocks.isEmpty else { return (0, nil) }
+    /// refuses it), so a block that stopped yielding a value doesn't keep its old one, and then the values
+    /// of `stale`, blocks that no longer overlap a night, by their sync ids.
+    func writeHeartRateVariability(_ blocks: [BeatWindow], clearExisting: Bool,
+                                   stale: [BeatWindow] = []) async throws -> (written: Int, medianMs: Double?) {
+        guard canShareHRV else { return (0, nil) }
         if clearExisting {
             for span in HeartRateVariability.nightSpans(blocks) {
                 try await deleteOwn(Self.hrv, overlapping: span.lowerBound, to: span.upperBound)
             }
+            if !stale.isEmpty {
+                try await deleteOwn(Self.hrv, syncIdentifiers: stale.map { Self.hrvSyncIdentifier(blockStart: $0.start) })
+            }
         }
+        guard !blocks.isEmpty else { return (0, nil) }
         let (samples, median) = Self.hrvToWrite(blocks)
         return (try await save(samples, filtered: true), median)
     }

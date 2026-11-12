@@ -116,6 +116,36 @@ struct SleepParserTests {
         #expect(session?.startDate == at(0))
     }
 
+    @Test func aStrayStagesPacketHoursBeforeBedtimeDoesNotWidenTheSession() {
+        let bytes = detailsFile(packets: stages(ts: bed - 4 * 3600, [(1, 60)])
+                                       + stages(ts: bed, [(2, 30)]))
+        let session = SleepDetailsParser.parse(Data(bytes), meta: meta(bytes)).sessions.first
+        #expect(session?.startDate == at(0))
+        #expect(session?.endDate == at(3 * 3600))
+        #expect(session?.phases == [SleepPhase(startDate: at(0), endDate: at(1800), type: .deep)])
+    }
+
+    @Test func aLaterRescoringStampedBeforeBedtimeDoesNotOverrideTheNight() {
+        let bytes = detailsFile(packets: stages(ts: bed, [(2, 60)])
+                                       + stages(ts: bed - 1800, [(1, 60)]))
+        let session = SleepDetailsParser.parse(Data(bytes), meta: meta(bytes)).sessions.first
+        #expect(session?.startDate == at(0))
+        #expect(session?.phases == [SleepPhase(startDate: at(0), endDate: at(3600), type: .deep)])
+    }
+
+    @Test func aNightWhoseEveryRescoringPrecedesBedtimeKeepsItsSession() {
+        let bytes = detailsFile(packets: stages(ts: bed - 1800, [(1, 60)])
+                                       + stages(ts: bed - 1200, [(2, 30)]))
+        let session = SleepDetailsParser.parse(Data(bytes), meta: meta(bytes)).sessions.first
+        #expect(session?.startDate == at(-1800))
+        #expect(session?.endDate == at(3 * 3600))
+        #expect(session?.phases == [
+            SleepPhase(startDate: at(-1800), endDate: at(-1200), type: .light),
+            SleepPhase(startDate: at(-1200), endDate: at(600), type: .deep),
+            SleepPhase(startDate: at(600), endDate: at(1800), type: .light),
+        ])
+    }
+
     @Test func aRescoringClaimsTheStretchItMarksNotSleeping() {
         let bytes = detailsFile(packets: stages(ts: bed, [(1, 90)])
                                        + stages(ts: bed + 600, [(2, 30), (4, 50)]))
@@ -219,6 +249,27 @@ struct SleepParserTests {
         // Widened to enclose the early awake phase.
         #expect(session.startDate == at(-600))
         #expect(session.endDate == at(3 * 3600))
+    }
+
+    @Test func stagesParserDropsATransitionHoursBeforeBedtimeWhenTheNightHasLaterOnes() {
+        let bytes = stagesFile(events: [(-3 * 3600, 3), (-600, 5), (0, 3), (3600, 2)])
+        let session = SleepStagesParser.parse(Data(bytes), meta: meta(bytes)).sessions.first
+        #expect(session?.startDate == at(-600))
+        #expect(session?.phases == [
+            SleepPhase(startDate: at(-600), endDate: at(0), type: .awake),
+            SleepPhase(startDate: at(0), endDate: at(3600), type: .light),
+            SleepPhase(startDate: at(3600), endDate: at(3 * 3600), type: .deep),
+        ])
+    }
+
+    @Test func stagesParserKeepsANightWhoseEveryTransitionPrecedesBedtime() {
+        let bytes = stagesFile(events: [(-3 * 3600, 3), (-2 * 3600, 2)])
+        let session = SleepStagesParser.parse(Data(bytes), meta: meta(bytes)).sessions.first
+        #expect(session?.startDate == at(-3 * 3600))
+        #expect(session?.phases == [
+            SleepPhase(startDate: at(-3 * 3600), endDate: at(-2 * 3600), type: .light),
+            SleepPhase(startDate: at(-2 * 3600), endDate: at(3 * 3600), type: .deep),
+        ])
     }
 
     @Test func stagesParserFallsBackToTheSummaryDurationsWithoutTransitions() {

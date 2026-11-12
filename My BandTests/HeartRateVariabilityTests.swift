@@ -149,6 +149,28 @@ struct HeartRateVariabilityTests {
         #expect(BandSyncer.writableBeats(closed, inRange: []).isEmpty)
     }
 
+    @Test func blocksOverlappingNoNightAreStale() {
+        let night = SleepSession(startDate: t0, endDate: t0.addingTimeInterval(3600), phases: [])
+        let nap = SleepSession(startDate: t0.addingTimeInterval(-4 * 3600), endDate: t0.addingTimeInterval(-3 * 3600), phases: [])
+        let beforeBed = block(start: t0.addingTimeInterval(-1800), minutes: 10)
+        let inTheNap = block(start: t0.addingTimeInterval(-3.5 * 3600), minutes: 10)
+        let acrossBedtime = block(start: t0.addingTimeInterval(-300), minutes: 10)
+        let asleep = block(start: t0.addingTimeInterval(1200), minutes: 10)
+        let afterWaking = block(start: t0.addingTimeInterval(7200), minutes: 10)
+        var earlier = ParsedSleep()
+        earlier.beatWindows = [inTheNap, beforeBed, acrossBedtime]
+        var later = ParsedSleep()
+        later.beatWindows = [beforeBed, acrossBedtime, asleep, afterWaking]
+        #expect(BandSyncer.staleBeats([earlier, later], sessions: [night, nap]) == [beforeBed, afterWaking])
+    }
+
+    @Test func anOpenNightsWithheldLastBlockIsNotStale() {
+        let open = realNight()
+        let sessions = open.inRange(HealthKitManager.validDateRange()).sessions
+        #expect(!sessions.isEmpty)
+        #expect(BandSyncer.staleBeats([open], sessions: sessions).isEmpty)
+    }
+
     // MARK: - Reports of one night
 
     @Test func furthestReportWinsARepeatedBlockWhateverTheOrder() {
