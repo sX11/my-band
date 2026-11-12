@@ -1,5 +1,9 @@
-- [ ] Isolated agent worktrees start from upstream origin/main, not local main #tooling #worth(yes) #where(.git/config) #added(2026-11-11)
-	> Local main tracks origin/main (the upstream fork), so an Agent with worktree
-	> isolation was cut at 722c7b4 (upstream v1.4) instead of main; the PR 2 agent caught
-	> it and re-based. Fix: git branch -u fork/main main. Cost: ahead/behind then reports
-	> against the fork, and upstream comparisons need an explicit origin/main.
+- [x] Isolated agent worktrees start from upstream origin/main, not local main #tooling #where(.git/config) #added(2026-11-11) #done(2026-11-12)
+	> Local main tracks origin/main (the upstream fork), and an Agent with worktree
+	> isolation is cut at origin/main (722c7b4, upstream v1.4) instead of local main; every
+	> agent prompt has to start with 'git checkout -B <branch> main'. Setting main's
+	> upstream to fork/main does not help (probed 2026-11-11: a worktree agent still
+	> started at 722c7b4; origin/HEAD -> origin/main). Likely fix: rename the remotes so
+	> origin is the fork (sX11/my-band) and upstream is matheusdanoite/my-band. Cost: every
+	> upstream comparison (git show origin/main:..., the port workflow) and gh's default
+	> repo change names.
