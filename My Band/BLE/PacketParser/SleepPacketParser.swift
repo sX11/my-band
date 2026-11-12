@@ -31,8 +31,10 @@ import Foundation
 //   [17..]   payload (dataLen bytes, big-endian fields)
 //
 // Stage packet types: 16 = summary, 17 = stages. Types 2/3/9/12/13/14/15/18 are flag-only
-// (no payload). Type 1 (RR intervals) is ignored — HR comes from the header HR section.
-// A file carries one 16 + 17 pair per re-scoring of the night; see `latestRevisionWins`.
+// (no payload). Type 1 is beat-to-beat intervals (`HeartRateVariability`): ts in milliseconds = the
+// block's first beat, then one u8 per interval in 10 ms units; a block spans ~600 s. HR still comes
+// from the header HR section. A file carries one 16 + 17 pair per re-scoring of the night; see
+// `latestRevisionWins`.
 //
 // Type 17 entries are UInt16 BE: bits[15:12] = stage, bits[11:0] = duration_minutes of
 // that stage. The stage starts at the running cursor; the cursor advances by the duration.
@@ -44,6 +46,8 @@ struct ParsedSleep {
     var spo2: [(date: Date, pct: Int)] = []
     /// isAwake header byte (0x08 only): 0 while the night is open, non-zero once the band closed it.
     var awakeFlag: Int?
+    /// Type-1 blocks, one per start, in time order.
+    var beatWindows: [BeatWindow] = []
 
     /// The sessions and sleep HR/SpO₂ dated inside `range`; a corrupt header stamps them outside it.
     func inRange(_ range: ClosedRange<Date>) -> (sessions: [SleepSession], vitals: [ActivityMinuteSample]) {
@@ -131,6 +135,7 @@ enum SleepDetailsParser {
         let sessionEnd   = Date(timeIntervalSince1970: TimeInterval(wakeupTime))
 
         var revisions: [Revision] = []
+        var beatBlocks: [Int64: BeatWindow] = [:]
         var summaryMinutes: (sleep: Int, deep: Int, light: Int, rem: Int, wake: Int)?
         // A stage packet stamped far outside the night is a misread (an empty one was seen stamped
         // three days early); widening the session to enclose it would make writeSleep clear the gap.
@@ -142,7 +147,7 @@ enum SleepDetailsParser {
             guard r.remaining >= 13 else { break }
 
             _ = r.u8()                          // headerLen (== 17)
-            let ts = r.i64()                    // seconds (LE)
+            let ts = r.i64()                    // LE; milliseconds for type 1, seconds for the others
             _ = r.u8()                          // parity
             let type = Int(r.u8())
             let dataLen = (Int(r.u8()) << 8) | Int(r.u8())   // big-endian
@@ -153,14 +158,19 @@ enum SleepDetailsParser {
             let payload = r.read(dataLen)
 
             switch type {
+            case 1:
+                let start = Date(timeIntervalSince1970: TimeInterval(ts) / 1000)
+                guard plausible.contains(start), !payload.isEmpty else { break }
+                beatBlocks[ts] = BeatWindow(start: start, intervalsMs: payload.map { Int($0) * 10 })
             case 16: summaryMinutes = parseSleepSummary(payload)
             case 17:
                 let revision = parseSleepStages(payload, base: TimeInterval(ts))
                 guard !revision.phases.isEmpty, plausible.contains(revision.start) else { break }
                 revisions.append(revision)
-            default: break                      // type 1 (RR intervals) etc. — ignored
+            default: break
             }
         }
+        result.beatWindows = beatBlocks.keys.sorted().compactMap { beatBlocks[$0] }
 
         let stages = sanitizeStages(latestRevisionWins(revisions).compactMap { clip($0, to: plausible) })
         if let first = stages.first, let last = stages.last {

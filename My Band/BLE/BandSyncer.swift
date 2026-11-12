@@ -371,6 +371,7 @@ final class BandSyncer {
         // Last, so FETCH_TODAY isn't held behind a rewrite of every stored night.
         dropExpiredRawDataDaily(context: context)
         await reparseStoredSleepIfParserChanged(context: context)
+        await rewriteStoredHRVIfNeeded(context: context)
 
         return outcome
     }
@@ -508,6 +509,7 @@ final class BandSyncer {
         /// Per sleep file, keyed by how far into the night it reaches, so the newest report's
         /// reading wins a repeated minute.
         var sleepVitals: [(reach: Date, samples: [ActivityMinuteSample])] = []
+        var sleepBeats: [(reach: Date, windows: [BeatWindow])] = []
         var manualToWrite: [ManualSample] = []
         var workoutsToWrite: [WorkoutSummary] = []
         var workoutRoutes: [Int: [WorkoutTrackPoint]] = [:]
@@ -565,7 +567,7 @@ final class BandSyncer {
                 } else if meta.isSleep {
                     let parsed = Self.parseSleepFile(fileData, meta: meta)
                     let phaseCount = parsed.sessions.reduce(0) { $0 + $1.phases.count }
-                    log.info("Sleep file \(fileId.hexString) (subtype=\(meta.subtype) v\(meta.version)): \(parsed.sessions.count) session(s), \(phaseCount) phase(s), \(parsed.heartRates.count) HR, \(parsed.spo2.count) SpO₂")
+                    log.info("Sleep file \(fileId.hexString) (subtype=\(meta.subtype) v\(meta.version)): \(parsed.sessions.count) session(s), \(phaseCount) phase(s), \(parsed.heartRates.count) HR, \(parsed.spo2.count) SpO₂, \(parsed.beatWindows.count) beat block(s), awake=\(parsed.awakeFlag.map(String.init) ?? "-")")
                     // A corrupt header never reaches the local store either: GetSleepStateIntent and
                     // the Health sheet read it, not just Apple Health.
                     let (sessions, vitals) = parsed.inRange(HealthKitManager.validDateRange())
@@ -584,7 +586,9 @@ final class BandSyncer {
                     }
                     // HR/SpO₂ recorded during sleep — written within the sleep window so
                     // Apple Health's sleep "Comparisons" tab can correlate them.
-                    sleepVitals.append((sessions.map(\.endDate).max() ?? .distantPast, vitals))
+                    let reach = sessions.map(\.endDate).max() ?? .distantPast
+                    sleepVitals.append((reach, vitals))
+                    sleepBeats.append((reach, Self.writableBeats(parsed, inRange: sessions)))
                     latestMetrics?.update { $0.record(vitals) }
                     sleepIds.append(fileId)
                 } else if meta.isDailySummary {
@@ -637,7 +641,7 @@ final class BandSyncer {
                 log.error("Saving local records failed: \(error.localizedDescription, privacy: .public)")
             }
             guard !sleepIds.isEmpty else { return }
-            defer { sleepToWrite = []; sleepVitals = []; sleepIds = [] }
+            defer { sleepToWrite = []; sleepVitals = []; sleepBeats = []; sleepIds = [] }
             _ = HealthKitManager.shared.takeSkippedForPermission()
             var cleared = clearExisting
             do {
@@ -663,6 +667,8 @@ final class BandSyncer {
                 log.error("Sleep write failed — \(sleepIds.count) sleep file(s) left un-ACKed for the next sync: \(error.localizedDescription, privacy: .public)")
                 return
             }
+            outcome.healthSamplesWritten += await writeHRV(HeartRateVariability.nightBlocks(sleepBeats),
+                                                           clearExisting: cleared)
             writtenSleepIds.formUnion(sleepIds)
             guard cleared else { return }
             guard contextSaved else {
@@ -906,6 +912,44 @@ final class BandSyncer {
         sessions.isEmpty && parsed.awakeFlag == 0
     }
 
+    /// The blocks of a file that made a night, only those overlapping its sessions: the parser keeps
+    /// blocks up to 6 h around the night, and one before bedtime or after waking isn't sleep. All of a
+    /// closed night's; an open one's last block is still growing, unless the night has settled. A
+    /// report from before `awakeFlag` was kept can't tell, so none.
+    static func writableBeats(_ parsed: ParsedSleep, inRange sessions: [SleepSession],
+                              settled: Bool = false) -> [BeatWindow] {
+        guard !sessions.isEmpty, let flag = parsed.awakeFlag else { return [] }
+        let blocks = flag != 0 || settled ? parsed.beatWindows : Array(parsed.beatWindows.dropLast())
+        return blocks.filter { block in sessions.contains { block.start < $0.endDate && block.end > $0.startDate } }
+    }
+
+    /// Best-effort, and never a reason to hold a sleep file. Without the permission it re-arms the
+    /// stored-night pass, which backfills once HRV is granted; a failed night is queued for that pass.
+    private func writeHRV(_ blocks: [BeatWindow], clearExisting: Bool) async -> Int {
+        guard !blocks.isEmpty else { return 0 }
+        guard HealthKitManager.shared.canShareHRV else {
+            UserDefaults.standard.removeObject(forKey: Self.hrvRevisionKey)
+            return 0
+        }
+        do {
+            let result: (written: Int, medianMs: Double?)
+            do {
+                result = try await HealthKitManager.shared.writeHeartRateVariability(blocks, clearExisting: clearExisting)
+            } catch let error as HKError where error.code == .errorDatabaseInaccessible && clearExisting {
+                // The phone locked after the sleep write; the delete is left to a foreground rewrite.
+                Self.queueHRVRetry(HeartRateVariability.nightSpans(blocks))
+                result = try await HealthKitManager.shared.writeHeartRateVariability(blocks, clearExisting: false)
+            }
+            let median = result.medianMs.map { "\(Int($0.rounded())) ms" } ?? "—"
+            log.info("HRV: \(result.written) SDNN value(s) from \(blocks.count) beat block(s), median \(median, privacy: .public)")
+            return result.written
+        } catch {
+            Self.queueHRVRetry(HeartRateVariability.nightSpans(blocks))
+            log.error("HRV write failed, its night(s) queued for the next foreground sync: \(error.localizedDescription, privacy: .public)")
+            return 0
+        }
+    }
+
     /// Inserts a new report, or refreshes the stored one with the same bytes: its phases take the
     /// current parse, and its fetch time moves while its end doesn't — the night stopped growing,
     /// which is how the sleep intent tells the user woke up.
@@ -1004,12 +1048,12 @@ final class BandSyncer {
     private func reparseStoredSleep(_ context: ModelContext) async -> (nights: Int, failed: Int) {
         let all = (try? context.fetch(FetchDescriptor<SleepSession>())) ?? []
         let validDates = HealthKitManager.validDateRange()
+        let stored = Self.parseStoredFiles(all)
         var vitals: [ObjectIdentifier: [ActivityMinuteSample]] = [:]
         var oldWindows: [ObjectIdentifier: (start: Date, end: Date)] = [:]
         for report in all {
             oldWindows[ObjectIdentifier(report)] = (report.startDate, report.endDate)
-            guard let raw = report.rawData, let meta = XiaomiActivityFileMeta(Data(raw.prefix(7))), meta.isSleep else { continue }
-            let parsed = Self.parseSleepFile(raw, meta: meta)
+            guard let parsed = stored.parsed[ObjectIdentifier(report)] else { continue }
             let fresh = parsed.inRange(validDates)
             vitals[ObjectIdentifier(report)] = fresh.vitals
             // A file the current parser makes no valid night of keeps its old record.
@@ -1056,6 +1100,145 @@ final class BandSyncer {
             }
         }
         return (nights.count, failed)
+    }
+
+    // MARK: - HRV of stored nights
+    //
+    // Rewrites stored nights' HRV from their raw files, apart from the sleep re-parse, whose phases don't
+    // change with HRV: every night when `HealthKitManager.hrvAlgorithmVersion` differs from the one
+    // applied, otherwise only the nights a failed write queued and the open nights that settled.
+    private static let hrvRevisionKey = "hrvBackfillRevisionApplied"
+    private static let hrvSkipLoggedKey = "hrvBackfillSkipLogged"
+    private static let hrvRetryKey = "hrvRetrySpans"
+    private static let hrvSettledKey = "hrvSettledReports"
+
+    /// An open night whose report the band last sent this long ago has stopped growing: the band closes
+    /// a night about an hour after waking, and a closed report would have come by now. One that comes
+    /// anyway rewrites the night under the same sync ids.
+    static let openNightSettle: TimeInterval = 3 * 3600
+
+    struct StoredHRVNight {
+        var reports: [SleepSession]
+        var window: ClosedRange<Date>
+        /// An open night that settled: its last block is written too.
+        var settled: Bool
+    }
+
+    /// The nights the pass rewrites. `settledDone` holds the furthest report of each settled night
+    /// already written with its last block.
+    static func storedHRVNights(_ nights: [[SleepSession]], full: Bool, retry: [ClosedRange<Date>],
+                                settledDone: Set<Int>, now: Date) -> [StoredHRVNight] {
+        nights.compactMap { reports in
+            guard let furthest = SleepSession.furthest(reports), let start = reports.map(\.startDate).min(),
+                  let end = reports.map(\.endDate).max(), end >= start else { return nil }
+            let window = start ... end
+            let settled = furthest.awakeFlag == 0
+                && furthest.fetchedAt.map { now.timeIntervalSince($0) >= openNightSettle } == true
+            let due = full || retry.contains { $0.overlaps(window) }
+                || (settled && !settledDone.contains(furthest.rawDataHash))
+            return due ? StoredHRVNight(reports: reports, window: window, settled: settled) : nil
+        }
+    }
+
+    static func hrvRetrySpans(_ defaults: UserDefaults = .standard) -> [ClosedRange<Date>] {
+        ((defaults.array(forKey: hrvRetryKey) as? [[Double]]) ?? []).compactMap { pair in
+            guard pair.count == 2, pair[0] <= pair[1] else { return nil }
+            return Date(timeIntervalSince1970: pair[0]) ... Date(timeIntervalSince1970: pair[1])
+        }
+    }
+
+    static func setHRVRetrySpans(_ spans: [ClosedRange<Date>], _ defaults: UserDefaults = .standard) {
+        let pairs = spans.map { [$0.lowerBound.timeIntervalSince1970, $0.upperBound.timeIntervalSince1970] }
+        if pairs.isEmpty { defaults.removeObject(forKey: hrvRetryKey) } else { defaults.set(pairs, forKey: hrvRetryKey) }
+    }
+
+    static func queueHRVRetry(_ spans: [ClosedRange<Date>], _ defaults: UserDefaults = .standard) {
+        var queued = hrvRetrySpans(defaults)
+        for span in spans where !queued.contains(where: { $0.lowerBound <= span.lowerBound && span.upperBound <= $0.upperBound }) {
+            queued.append(span)
+        }
+        setHRVRetrySpans(queued, defaults)
+    }
+
+    /// Each stored file parsed once, told apart by hash and byte count as `storeReport` does. Every
+    /// report holding it gets the parse, but its blocks come only from the first (`firstHolders`), or a
+    /// file kept on two records would be written twice.
+    static func parseStoredFiles(_ reports: [SleepSession])
+        -> (parsed: [ObjectIdentifier: ParsedSleep], firstHolders: Set<ObjectIdentifier>) {
+        var byFile: [String: ParsedSleep] = [:]
+        var parsed: [ObjectIdentifier: ParsedSleep] = [:]
+        var firstHolders = Set<ObjectIdentifier>()
+        for report in reports {
+            guard let raw = report.rawData, let meta = XiaomiActivityFileMeta(Data(raw.prefix(7))), meta.isSleep else { continue }
+            let key = "\(report.rawDataHash):\(raw.count)"
+            if let known = byFile[key] {
+                parsed[ObjectIdentifier(report)] = known
+                continue
+            }
+            let fresh = parseSleepFile(raw, meta: meta)
+            byFile[key] = fresh
+            parsed[ObjectIdentifier(report)] = fresh
+            firstHolders.insert(ObjectIdentifier(report))
+        }
+        return (parsed, firstHolders)
+    }
+
+    private func rewriteStoredHRVIfNeeded(context: ModelContext, now: Date = Date()) async {
+        guard Self.healthReadable else { return }
+        #if canImport(UIKit)
+        guard UIApplication.shared.applicationState != .background else { return }
+        #endif
+        let defaults = UserDefaults.standard
+        let version = HealthKitManager.hrvAlgorithmVersion
+        guard HealthKitManager.shared.canShareHRV else {
+            // Re-armed so a later grant backfills; logged once, not on every sync until then.
+            defaults.removeObject(forKey: Self.hrvRevisionKey)
+            if !defaults.bool(forKey: Self.hrvSkipLoggedKey) {
+                log.notice("HRV of stored nights skipped — heart rate variability isn't granted to My Band in Health")
+                defaults.set(true, forKey: Self.hrvSkipLoggedKey)
+            }
+            return
+        }
+        defaults.removeObject(forKey: Self.hrvSkipLoggedKey)
+        let full = defaults.integer(forKey: Self.hrvRevisionKey) != version
+        let cutoff = now.addingTimeInterval(-Self.rawSleepRetention)
+        let recent = (try? context.fetch(FetchDescriptor<SleepSession>(predicate: #Predicate { $0.endDate >= cutoff }))) ?? []
+        var settledDone = Set(defaults.array(forKey: Self.hrvSettledKey) as? [Int] ?? [])
+            .intersection(recent.map(\.rawDataHash))
+        let nights = Self.storedHRVNights(HealthKitManager.groupOverlapping(recent), full: full,
+                                          retry: Self.hrvRetrySpans(), settledDone: settledDone, now: now)
+        let stored = Self.parseStoredFiles(nights.flatMap(\.reports))
+        let validDates = HealthKitManager.validDateRange()
+        var written = 0
+        var failed: [ClosedRange<Date>] = []
+        for night in nights {
+            let beats = night.reports.compactMap { report -> (reach: Date, windows: [BeatWindow])? in
+                guard stored.firstHolders.contains(ObjectIdentifier(report)),
+                      let parsed = stored.parsed[ObjectIdentifier(report)] else { return nil }
+                let sessions = parsed.inRange(validDates).sessions
+                return (sessions.map(\.endDate).max() ?? .distantPast,
+                        Self.writableBeats(parsed, inRange: sessions, settled: night.settled))
+            }
+            let blocks = HeartRateVariability.nightBlocks(beats)
+            do {
+                if !blocks.isEmpty {
+                    written += try await HealthKitManager.shared.writeHeartRateVariability(blocks, clearExisting: true).written
+                }
+                if night.settled, let furthest = SleepSession.furthest(night.reports) {
+                    settledDone.insert(furthest.rawDataHash)
+                }
+            } catch {
+                failed.append(night.window)
+                log.error("HRV of stored nights: night from \(night.window.lowerBound.description) failed, queued for the next sync: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        // A queued span that matched no stored file has nothing left to rebuild from.
+        Self.setHRVRetrySpans(failed)
+        defaults.set(Array(settledDone), forKey: Self.hrvSettledKey)
+        if full { defaults.set(version, forKey: Self.hrvRevisionKey) }
+        guard !nights.isEmpty else { return }
+        let scope = full ? "every night (revision \(version))" : "queued and settled nights"
+        log.notice("HRV of stored nights, \(scope, privacy: .public): \(written) value(s) across \(nights.count) night(s), \(failed.count) queued")
     }
 
     private func persistActivityDay(_ summary: DailySummary, _ context: ModelContext) {
