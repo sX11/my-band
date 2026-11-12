@@ -1,0 +1,7 @@
+- [ ] A stray sleep stages packet stamped after wakeup still widens the session by up to 6 h #sleep #worth(later) #where(My Band/BLE/PacketParser/SleepPacketParser.swift:143) #added(2026-11-12)
+	> @anchor: let plausible = sessionStart.addingTimeInterval(-6 * 3600) ... sessionEnd.addingTimeInterval(6 * 3600)
+	> Past wakeup the session widens to enclose every phase within the 6 h plausible
+	> window, so a misread packet stamped after waking inflates Time in Bed and widens what
+	> writeSleep clears. Undecided: an open night's header wakeTime lags its latest
+	> re-scoring, and no capture shows by how much, so a tighter bound could cut a real
+	> tail.
