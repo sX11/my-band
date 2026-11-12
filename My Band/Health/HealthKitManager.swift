@@ -21,7 +21,7 @@ final class HealthKitManager {
     private let store = HKHealthStore()
     private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myband", category: "Health")
 
-    private let syncVersion = 1
+    private static let syncVersion = 1
 
     var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
@@ -50,6 +50,7 @@ final class HealthKitManager {
     private let runningStride    = HKQuantityType(.runningStrideLength)
     private let cyclingSpeedType = HKQuantityType(.cyclingSpeed)
     private let hrRecovery       = HKQuantityType(.heartRateRecoveryOneMinute)
+    private static let hrv       = HKQuantityType(.heartRateVariabilitySDNN)
     private let workoutType      = HKObjectType.workoutType()
     private let routeType        = HKSeriesType.workoutRoute()
 
@@ -71,7 +72,7 @@ final class HealthKitManager {
          bodyTemp, restingHR, vo2Max, distanceCycling, distanceSwimming, swimStrokes,
          distanceRowing, distanceSnow, distanceSkating, distancePaddle,
          bodyMass, bodyMassIndex, height, workoutType, routeType,
-         physicalEffort, runningSpeed, runningStride, cyclingSpeedType, hrRecovery]
+         physicalEffort, runningSpeed, runningStride, cyclingSpeedType, hrRecovery, Self.hrv]
         if #available(iOS 18.0, *) {
             types.insert(HKQuantityType(.estimatedWorkoutEffortScore))
         }
@@ -123,14 +124,14 @@ final class HealthKitManager {
             guard let start = group.map(\.startDate).min(), let end = group.map(\.endDate).max(),
                   end > start else { continue }
 
-            if clearExisting { try await deleteExistingSleep(overlapping: start, to: end) }
+            if clearExisting { try await deleteOwn(sleepType, overlapping: start, to: end) }
 
             // Enclosing in-bed window so Apple Health reports "Time in Bed" alongside the stages.
             let inBedId = "mb-inbed-\(Int(start.timeIntervalSince1970))"
             samples.append(HKCategorySample(
                 type: sleepType, value: HKCategoryValueSleepAnalysis.inBed.rawValue,
                 start: start, end: end,
-                metadata: syncMetadata(inBedId)
+                metadata: Self.syncMetadata(inBedId)
             ))
 
             for phase in SleepDetailsParser.mergeReports(group) {
@@ -140,7 +141,7 @@ final class HealthKitManager {
                 samples.append(HKCategorySample(
                     type: sleepType, value: value.rawValue,
                     start: phase.startDate, end: phase.endDate,
-                    metadata: syncMetadata(id)
+                    metadata: Self.syncMetadata(id)
                 ))
             }
         }
@@ -167,15 +168,15 @@ final class HealthKitManager {
 
     /// For a re-parse that moved a night's window: writeSleep clears only the new one.
     func clearSleep(overlapping start: Date, to end: Date) async throws {
-        try await deleteExistingSleep(overlapping: start, to: end)
+        try await deleteOwn(sleepType, overlapping: start, to: end)
     }
 
-    private func deleteExistingSleep(overlapping start: Date, to end: Date) async throws {
+    private func deleteOwn(_ type: HKSampleType, overlapping start: Date, to end: Date) async throws {
         let mine = HKQuery.predicateForObjects(from: [HKSource.default()])
         let time = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
         let predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [mine, time])
         do {
-            _ = try await store.deleteObjects(of: sleepType, predicate: predicate)
+            _ = try await store.deleteObjects(of: type, predicate: predicate)
         } catch let error as HKError where error.code == .errorNoData {
             // Nothing of ours in the window yet — a night's first write. Letting this throw would
             // fail the save that follows, every time a new night shows up.
@@ -434,7 +435,7 @@ final class HealthKitManager {
 
             var metadata: [String: Any] = [
                 HKMetadataKeySyncIdentifier: "mb-workout-\(key)",
-                HKMetadataKeySyncVersion: syncVersion,
+                HKMetadataKeySyncVersion: Self.syncVersion,
                 HKMetadataKeyIndoorWorkout: Self.swimmingLocation(w.kind) == nil && Self.isIndoor(w.kind),
             ]
             if let avg = w.hrAvg { metadata["MiBandAverageHeartRate"] = avg }
@@ -474,7 +475,7 @@ final class HealthKitManager {
             if let vo2 = w.vo2Max, (10...90).contains(vo2) {
                 let unit = HKUnit.literUnit(with: .milli)
                     .unitDivided(by: HKUnit.gramUnit(with: .kilo).unitMultiplied(by: .minute()))
-                var meta = syncMetadata("mb-vo2-\(key)")
+                var meta = Self.syncMetadata("mb-vo2-\(key)")
                 meta[HKMetadataKeyVO2MaxTestType] = HKVO2MaxTestType.predictionSubMaxExercise.rawValue
                 try await save([HKQuantitySample(type: vo2Max, quantity: HKQuantity(unit: unit, doubleValue: vo2),
                                                  start: w.endDate, end: w.endDate, metadata: meta)])
@@ -492,7 +493,7 @@ final class HealthKitManager {
                     type: HKQuantityType(.estimatedWorkoutEffortScore),
                     quantity: HKQuantity(unit: .appleEffortScore(), doubleValue: score),
                     start: w.startDate, end: w.endDate,
-                    metadata: syncMetadata("mb-weffort-\(key)"))
+                    metadata: Self.syncMetadata("mb-weffort-\(key)"))
                 do {
                     try await save([sample])
                     _ = try await store.relateWorkoutEffortSample(sample, with: workout, activity: nil)
@@ -754,6 +755,56 @@ final class HealthKitManager {
         case .outdoorCycling:     HKQuantityType(.cyclingSpeed)
         default:                  nil
         }
+    }
+
+    // MARK: - Heart rate variability (sleep beat-to-beat intervals)
+
+    /// Bump when HeartRateVariability changes how a block's value is computed: it is also the HRV
+    /// backfill's revision, so the next foreground sync rewrites every stored night at this version.
+    static let hrvAlgorithmVersion = 1
+
+    /// The band measured these, not the phone: `.local()` would credit the iPhone.
+    static let bandDevice = HKDevice(name: "Xiaomi Smart Band 10", manufacturer: "Xiaomi", model: "Smart Band 10",
+                                     hardwareVersion: nil, firmwareVersion: nil, softwareVersion: nil,
+                                     localIdentifier: nil, udiDeviceIdentifier: nil)
+
+    static func hrvSyncIdentifier(_ value: HeartRateVariability.BlockValue) -> String {
+        "mb-hrv-\(Int(value.blockStart.timeIntervalSince1970))"
+    }
+
+    /// One SDNN value per block, keyed by the block's start so a rewrite replaces it in place.
+    static func hrvSamples(_ blocks: [BeatWindow]) -> [HKQuantitySample] {
+        blocks.compactMap(HeartRateVariability.blockSDNN).map { value in
+            HKQuantitySample(type: hrv,
+                             quantity: HKQuantity(unit: .secondUnit(with: .milli), doubleValue: value.minute.sdnnMs),
+                             start: value.minute.start, end: value.minute.end, device: bandDevice,
+                             metadata: syncMetadata(hrvSyncIdentifier(value), version: hrvAlgorithmVersion))
+        }
+    }
+
+    /// The samples `save` keeps, and their median: the logged value describes what reaches Health.
+    static func hrvToWrite(_ blocks: [BeatWindow]) -> (samples: [HKSample], medianMs: Double?) {
+        let samples = savable(hrvSamples(blocks))
+        let values = samples.compactMap { ($0 as? HKQuantitySample)?.quantity.doubleValue(for: .secondUnit(with: .milli)) }
+            .sorted()
+        return (samples, values.isEmpty ? nil : values[values.count / 2])
+    }
+
+    var canShareHRV: Bool { canShare(Self.hrv) }
+
+    /// Optional enrichment: without permission it writes nothing and flags no skip, so it can't hold sleep
+    /// files un-ACKed. `clearExisting` first deletes this app's values in each night's span (a locked phone
+    /// refuses it), so a block that stopped yielding a value doesn't keep its old one.
+    func writeHeartRateVariability(_ blocks: [BeatWindow],
+                                   clearExisting: Bool) async throws -> (written: Int, medianMs: Double?) {
+        guard canShareHRV, !blocks.isEmpty else { return (0, nil) }
+        if clearExisting {
+            for span in HeartRateVariability.nightSpans(blocks) {
+                try await deleteOwn(Self.hrv, overlapping: span.lowerBound, to: span.upperBound)
+            }
+        }
+        let (samples, median) = Self.hrvToWrite(blocks)
+        return (try await save(samples, filtered: true), median)
     }
 
     // MARK: - Cardio Recovery (heartRateRecoveryOneMinute)
@@ -1143,25 +1194,29 @@ final class HealthKitManager {
     private func quantity(_ type: HKQuantityType, _ unit: HKUnit, _ value: Double,
                           start: Date, end: Date, id: String, version: Int? = nil) -> HKQuantitySample {
         HKQuantitySample(type: type, quantity: HKQuantity(unit: unit, doubleValue: value),
-                         start: start, end: end, metadata: syncMetadata(id, version: version))
+                         start: start, end: end, metadata: Self.syncMetadata(id, version: version))
     }
 
     /// `version` defaults to the constant syncVersion — fine for immutable data (sleep, manual,
     /// workout). writeActivity passes a monotonic version so re-syncs can replace.
-    private func syncMetadata(_ id: String, version: Int? = nil) -> [String: Any] {
+    private static func syncMetadata(_ id: String, version: Int? = nil) -> [String: Any] {
         [HKMetadataKeySyncIdentifier: id, HKMetadataKeySyncVersion: version ?? syncVersion]
     }
 
     @discardableResult
     /// `tallied: false` for the scale and profile, whose writes can land mid-sync but aren't the band's.
-    private func save(_ samples: [HKSample], tallied: Bool = true) async throws -> Int {
-        let validDates = Self.validDateRange()
-        let dated = samples.filter { validDates.contains($0.startDate) && validDates.contains($0.endDate) }
-        let allowed = shareable(Self.deduplicatingBySyncIdentifier(dated))
+    /// `filtered: true` for samples that already went through `savable`.
+    private func save(_ samples: [HKSample], tallied: Bool = true, filtered: Bool = false) async throws -> Int {
+        let allowed = shareable(filtered ? samples : Self.savable(samples))
         guard !allowed.isEmpty else { return 0 }
         try await store.save(allowed)
         if tallied { count(allowed) }
         return allowed.count
+    }
+
+    static func savable(_ samples: [HKSample]) -> [HKSample] {
+        let validDates = validDateRange()
+        return deduplicatingBySyncIdentifier(samples.filter { validDates.contains($0.startDate) && validDates.contains($0.endDate) })
     }
 
     /// Two samples sharing a sync identifier in one `store.save` can fail the whole batch — re-scored

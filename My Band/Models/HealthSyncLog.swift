@@ -122,6 +122,7 @@ final class HealthSyncLog {
         "HKQuantityTypeIdentifierHeartRate": "Heart rate",
         "HKQuantityTypeIdentifierRestingHeartRate": "Resting heart rate",
         "HKQuantityTypeIdentifierHeartRateRecoveryOneMinute": "Cardio recovery",
+        "HKQuantityTypeIdentifierHeartRateVariabilitySDNN": "Heart rate variability",
         "HKQuantityTypeIdentifierOxygenSaturation": "Blood oxygen",
         "HKQuantityTypeIdentifierStepCount": "Steps",
         "HKQuantityTypeIdentifierDistanceWalkingRunning": "Walking + running distance",
